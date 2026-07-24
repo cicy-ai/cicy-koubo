@@ -90,10 +90,37 @@ def plog(msg):
 @app.get("/api/logs")
 def api_logs():
     try:
-        lines = open(PLOG, encoding="utf-8").readlines()[-150:]
-        return Response("".join(lines), mimetype="text/plain")
+        lines = open(PLOG, encoding="utf-8").readlines()[-300:]
+        return Response("".join(lines), mimetype="text/plain; charset=utf-8")
     except Exception:
-        return Response("(暂无日志)", mimetype="text/plain")
+        return Response("(暂无日志)", mimetype="text/plain; charset=utf-8")
+
+
+# GPU 侧安装进度也汇入唯一日志:后台每分钟拉一次 mt/cosy/hg 的关键行,没见过的追加进 pipeline.log
+_PROV_SEEN = set()
+
+
+def _provision_log_pump():
+    while True:
+        try:
+            r = run(SSH + ["for f in mt cosy hg; do echo \"##$f\"; "
+                           "grep -E '^===|^!!!' /content/$f/provision.log 2>/dev/null | tail -30; done"],
+                    timeout=25)
+            if r.returncode == 0:
+                cur = None
+                for line in (r.stdout or "").splitlines():
+                    if line.startswith("##"):
+                        cur = line[2:].strip()
+                        continue
+                    if cur and line.strip() and (cur, line) not in _PROV_SEEN:
+                        _PROV_SEEN.add((cur, line))
+                        plog(f"[装载 {cur}] {line}")
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+threading.Thread(target=_provision_log_pump, daemon=True).start()
 
 
 def run(cmd, timeout=1200):
