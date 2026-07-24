@@ -25,7 +25,6 @@ const port = (() => {
 })();
 
 const PKG = path.join(__dirname, '..');
-const APP_PY = path.join(PKG, 'app', 'app.py');
 const ROOT = path.join(os.homedir(), 'projects', 'digital-human');
 const BIN_DIR = path.join(os.homedir(), '.cicy-koubo', 'bin');
 
@@ -41,6 +40,20 @@ console.log('\n🎬 cicy-koubo — 爆款口播视频制作\n');
 const py = ['python3', 'python'].find((p) => sh(p, ['--version']).status === 0);
 if (!py) die('需要 python3(未找到)。macOS: brew install python3');
 ok(`python: ${py}`);
+
+// 后端以按版本编译的 pyc 分发;开发机上有 src/app.py 则优先用源码
+const pyTag = sh(py, ['-c', 'import sys;print("%d%d"%sys.version_info[:2])']).stdout.trim();
+const devSrc = path.join(PKG, 'src', 'app.py');
+const pycFile = path.join(PKG, 'app', `app-${pyTag}.pyc`);
+let APP_PY;
+if (fs.existsSync(devSrc)) { APP_PY = devSrc; ok('dev 模式(源码)'); }
+else if (fs.existsSync(pycFile)) { APP_PY = pycFile; ok(`后端: app-${pyTag}.pyc`); }
+else {
+  const have = fs.readdirSync(path.join(PKG, 'app'))
+    .filter((f) => /^app-\d+\.pyc$/.test(f))
+    .map((f) => f.replace(/app-(\d)(\d+)\.pyc/, '$1.$2')).join(' / ');
+  die(`当前 python ${pyTag[0]}.${pyTag.slice(1)} 没有匹配的后端(支持: ${have})。请用其中一个版本的 python3 重试`);
+}
 
 if (sh(py, ['-c', 'import flask, PIL']).status !== 0) {
   warn('缺 flask/pillow,尝试自动安装…');

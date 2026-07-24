@@ -222,11 +222,15 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
             if r.returncode != 0:
                 raise RuntimeError("scp upload failed: " + r.stderr[:300])
 
-            j["stage"] = "MuseTalk 对口型(数分钟)"
-            log("run MuseTalk on Colab")
+            engine = opts.get("engine") or "musetalk"
+            j["stage"] = ("HeyGem" if engine == "heygem" else "MuseTalk") + " 对口型(数分钟)"
+            log(f"run {engine} on GPU")
             rv, ra = norm.name, pathlib.Path(audio_path).name
             out_remote = f"/content/out_{job_id}.mp4"
-            cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
+            if engine == "heygem":
+                cmd = f"bash /content/hg/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote}"
+            else:
+                cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
             r = run(SSH + [cmd], timeout=1800)
             log(r.stdout.strip()[-400:] if r.stdout else "")
             if r.returncode != 0 or "OK out=" not in (r.stdout or ""):
@@ -323,9 +327,13 @@ def generate_video():
     else:
         ap = None
     bbox = request.form.get("bbox", "0")
+    engine = request.form.get("engine") or "musetalk"
+    if mode != "simple" and engine == "heygem" and \
+            not _ssh_check("test -f /content/hg/HG_READY && echo OK", "OK"):
+        return jsonify({"error": "HeyGem 引擎未安装:在 Colab notebook 里运行「可选:安装 HeyGem」cell(需 ≥16GB 显存)"}), 503
     opts = {"sharp": request.form.get("sharp") == "1",       # 牙齿高清=成片锐化
             "randstart": request.form.get("randstart") == "1",  # 动作随机=底板随机起点
-            "mode": mode}
+            "mode": mode, "engine": engine}
     JOBS[job_id] = {"stage": "排队", "log": [], "result": None, "error": None}
     threading.Thread(target=do_generate, args=(job_id, vp, ap, bbox, opts), daemon=True).start()
     return jsonify({"job_id": job_id})

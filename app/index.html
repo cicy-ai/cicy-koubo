@@ -223,6 +223,11 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <option value="lipsync">对口型(数字人,需 GPU)</option>
       <option value="simple">仅底板合成(本机秒出,不对口型)</option>
     </select>
+    <div class="lbl">对口型引擎</div>
+    <select id="engine">
+      <option value="musetalk">MuseTalk(默认 · 6GB显存即可 · 快)</option>
+      <option value="heygem">HeyGem(实验 · 效果更好 · 需≥16GB显存,先在 Colab 装)</option>
+    </select>
     <div class="row" style="margin-top:10px">
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
@@ -465,6 +470,7 @@ async function genVideo(){
     if(audioBlob)fd.append('audio',audioBlob,'audio.wav');
     else if(voiceId)fd.append('audio_id',voiceId);
     fd.append('mode',mode);
+    fd.append('engine',$('engine').value);
     fd.append('sharp',$('optSharp').checked?'1':'0');
     fd.append('randstart',$('optRand').checked?'1':'0');
     const d=await (await fetch('/api/generate-video',{method:'POST',body:fd})).json();
