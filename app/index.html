@@ -987,11 +987,22 @@ async function refreshEngines() {
     });
     // 安装中的引擎自动展开日志并轮询
     d.engines.forEach(e => { if (e.installing && !_openLogs[e.key]) { toggleLog(e.key, true); } });
-    // 有引擎在安装 → 5s 后自动刷新状态
-    if (d.engines.some(e => e.installing) && $('iModal').style.display === 'block') {
-      _engineTimer = _engineTimer || setTimeout(() => { _engineTimer = null; refreshEngines(); }, 5000);
+    // 有引擎在安装 → 5s 后刷新状态（只刷新卡片，不重建已打开的日志）
+    if (d.engines.some(e => e.installing)) {
+      _engineTimer = _engineTimer || setTimeout(() => { _engineTimer = null; refreshCards(); }, 5000);
     }
   } catch (e) { $('engineList').innerHTML = '<div class="empty">加载引擎状态失败</div>'; }
+}
+
+async function refreshCards() {
+  try {
+    const d = await (await fetch('/api/engines')).json();
+    d.engines.forEach(e => updateEngineCard(e));
+    // 继续安排下一轮
+    if (d.engines.some(e => e.installing)) {
+      _engineTimer = _engineTimer || setTimeout(() => { _engineTimer = null; refreshCards(); }, 5000);
+    }
+  } catch (e) {}
 }
 
 function toggleLog(key, auto) {
