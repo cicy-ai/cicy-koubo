@@ -622,6 +622,9 @@ def edit():
         dims = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                     "-show_entries", "stream=width,height", "-of", "csv=p=0", str(src)])
         w, h = [int(x) for x in dims.stdout.strip().split(",")[:2]]
+        dur_probe = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "csv=p=0", str(src)])
+        src_dur = float(dur_probe.stdout.strip())
         inputs = ["-i", str(src)]
         fc_parts = []
         last_v = "0:v"
@@ -646,7 +649,7 @@ def edit():
         probe_a = run(["ffprobe", "-v", "error", "-select_streams", "a:0",
                        "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(src)])
         has_audio = bool((probe_a.stdout or "").strip())
-        amap = ["-map", "0:a?"]
+        amap = ["-map", "0:a", "-c:a", "copy"] if has_audio else []
         if bgm_path:
             inputs += ["-stream_loop", "-1", "-i", str(bgm_path)]
             if has_audio:
@@ -660,7 +663,7 @@ def edit():
         vmap = ["-map", f"[{last_v}]"] if last_v != "0:v" else ["-map", "0:v"]
         cmd = (["ffmpeg", "-v", "error", "-y"] + inputs +
                (["-filter_complex", ";".join(fc_parts)] if fc_parts else []) + vmap + amap +
-               ["-c:v", "libx264", "-crf", "18", "-preset", "fast", "-shortest", str(out)])
+               ["-c:v", "libx264", "-crf", "18", "-preset", "fast", "-t", str(src_dur), str(out)])
         r = run(cmd, timeout=600)
         if r.returncode != 0:
             plog(f"[剪辑] ❌ ffmpeg 失败: {r.stderr[:150]}")
@@ -1483,9 +1486,9 @@ def _is_installing(key):
 
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
-    "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg"},
-    "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt"},
-    "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy"},
+    "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt",   "est_min": 23, "est_size_gb": 15},
+    "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "est_min": 24, "est_size_gb": 18},
+    "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg",   "est_min":  5, "est_size_gb": 2.6},
 }
 
 # 启动时自动部署 provision 脚本到 /content/（Colab 重启后目录丢失）
@@ -1585,7 +1588,8 @@ def api_engines():
         has_script = (pathlib.Path(cfg["dir"]) / "provision.sh").exists()
         out.append({"key": key, "name": cfg["name"],
                     "installed": installed, "installing": installing,
-                    "version_info": version_info, "has_script": has_script})
+                    "version_info": version_info, "has_script": has_script,
+                    "est_min": cfg.get("est_min"), "est_size_gb": cfg.get("est_size_gb")})
     return jsonify({"engines": out})
 
 

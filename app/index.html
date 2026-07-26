@@ -955,6 +955,12 @@ function engineCardHTML(e) {
     verHtml = '<div class="ev">' + Object.entries(e.version_info)
       .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
   }
+  let estHtml = '';
+  if (e.est_min) {
+    const dur = e.installed ? `实际安装耗时约 ${e.est_min} 分钟` : `预计安装约 ${e.est_min} 分钟`;
+    const size = e.est_size_gb ? ` · ~${e.est_size_gb}GB` : '';
+    estHtml = `<div class="ev" style="color:#888;font-size:11px">⏱ ${dur}${size}</div>`;
+  }
   const btn = e.installing
     ? '<button class="btn ghost" disabled style="font-size:12px">⏳ 安装中…</button>'
     : `<button class="btn ghost" style="font-size:12px" onclick="installEngine('${e.key}')">${e.installed?'🔄 重装':'📥 安装'}</button>`;
@@ -963,6 +969,7 @@ function engineCardHTML(e) {
     <div class="eb">
       <div class="en">${e.name} ${badge} ${e.has_script?'':'(缺安装脚本)'}</div>
       ${verHtml}
+      ${estHtml}
     </div>
     <div style="flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
       ${btn}
