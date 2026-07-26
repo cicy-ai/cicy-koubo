@@ -1,0 +1,310 @@
+#!/usr/bin/env node
+/**
+ * douyin-dl — 从抖音分享链接下载音频/视频,可选转写成文字。
+ *
+ * 用法:
+ *   douyin-dl <抖音链接|完整URL|视频ID> [选项]
+ *
+ * 选项:
+ *   -o, --out DIR       输出目录(默认当前目录)
+ *   -a, --audio         只下音频 mp3(默认)
+ *   -v, --video         下视频 mp4
+ *   -t, --transcribe    下完转写成文字(.txt)
+ *       --engine E      gateway|local(默认 gateway = cicy 网关 STT)
+ *       --model NAME    local 引擎的 whisper 模型(默认 small)
+ *       --lang LANG     语言提示(默认 zh)
+ *       --proxy URL     出站代理(默认 $HTTPS_PROXY,否则探测 127.0.0.1:1087)
+ *       --json          机器可读输出
+ *   -h, --help          帮助
+ *
+ * 反爬:解析短链 -> 规范 www.douyin.com/video/<id> -> 走代理 -> yt-dlp 抖音提取器。
+ * 依赖:yt-dlp(缺则自动下载二进制) ffmpeg ffprobe curl;local 转写另需 python3+faster-whisper。
+ */
+import { execFileSync, spawnSync, execFile } from "node:child_process";
+import fs from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+import net from "node:net";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const HOME = homedir();
+const die = (m) => { process.stderr.write('❌ ' + m + '\n'); process.exit(1); };
+
+// ---------- args ----------
+const argv = process.argv.slice(2);
+const opt = { out: '.', mode: 'audio', tx: false, engine: 'groq', model: 'small', lang: 'zh', json: false, proxy: '', cookies: '' };
+let input = '';
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '-h' || a === '--help') { process.stdout.write(usage()); process.exit(0); }
+  else if (a === '-o' || a === '--out') opt.out = argv[++i];
+  else if (a === '-a' || a === '--audio') opt.mode = 'audio';
+  else if (a === '-v' || a === '--video') opt.mode = 'video';
+  else if (a === '-t' || a === '--transcribe') opt.tx = true;
+  else if (a === '--engine') opt.engine = argv[++i];
+  else if (a === '--model') opt.model = argv[++i];
+  else if (a === '--lang') opt.lang = argv[++i];
+  else if (a === '--proxy') opt.proxy = argv[++i];
+  else if (a === '--cookies') opt.cookies = argv[++i];
+  else if (a === '--json') opt.json = true;
+  else if (a.startsWith('-')) die(`未知选项: ${a}(看 --help)`);
+  else input = a;
+}
+if (!input) { process.stdout.write(usage()); process.exit(1); }
+const log = (m) => { if (!opt.json) process.stderr.write(m + '\n'); };
+
+function usage() {
+  return `douyin-dl — 抖音链接下载音频/视频(绕反爬)+ 可选转文字
+
+用法:
+  douyin-dl <抖音链接|完整URL|视频ID> [选项]
+
+选项:
+  -o, --out DIR       输出目录(默认当前目录)
+  -a, --audio         只下音频 mp3(默认)
+  -v, --video         下视频 mp4
+  -t, --transcribe    下完转写成文字(.txt)
+      --engine E      groq|gateway|local(默认 groq = Groq whisper-large-v3-turbo,快且准)
+      --model NAME    local whisper 模型(默认 small)
+      --lang LANG     语言提示(默认 zh)
+      --proxy URL     出站代理(默认 $HTTPS_PROXY,否则探测 127.0.0.1:1087)
+      --cookies FILE  cookies 文件(抖音要 cookies 时用,传给 yt-dlp)
+      --json          机器可读输出
+  -h, --help          本帮助
+
+下载兜底: yt-dlp 被抖音 "fresh cookies" 风控拦时,自动用本机 agent-chrome
+profile(调试端口 11001/11002)CDP 嗅探 douyinvod 直链下载(需该 Chrome 在跑)。
+`;
+}
+
+// ---------- helpers ----------
+function probePort(host, port, ms) {
+  return new Promise((res) => {
+    const s = net.connect({ host, port });
+    let done = false;
+    const fin = (ok) => { if (!done) { done = true; s.destroy(); res(ok); } };
+    s.setTimeout(ms);
+    s.on('connect', () => fin(true));
+    s.on('timeout', () => fin(false));
+    s.on('error', () => fin(false));
+  });
+}
+function run(cmd, args, opts) {
+  return spawnSync(cmd, args, Object.assign({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }, opts || {}));
+}
+function which(cmd) {
+  const r = spawnSync('command', ['-v', cmd], { shell: '/bin/bash', encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+async function main() {
+  let proxy = opt.proxy || process.env.HTTPS_PROXY || process.env.https_proxy || '';
+  if (!proxy && await probePort('127.0.0.1', 1087, 2000)) proxy = 'http://127.0.0.1:1087';
+  if (proxy) log(`🌐 代理: ${String(proxy).split('@').pop()}(已隐藏凭据)`);
+  else log('⚠️  未发现代理,直连抖音可能被反爬拦截');
+
+  // ensure yt-dlp
+  let ytdlp = which('yt-dlp');
+  const localYt = path.join(HOME, '.local/bin/yt-dlp');
+  if (!ytdlp && fs.existsSync(localYt)) ytdlp = localYt;
+  if (!ytdlp) {
+    log('📦 下载 yt-dlp 二进制…');
+    fs.mkdirSync(path.dirname(localYt), { recursive: true });
+    const ca = ['-sL', '-m', '60'];
+    if (proxy) ca.push('--proxy', proxy);
+    ca.push('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', '-o', localYt);
+    if (run('curl', ca).status !== 0) die('yt-dlp 下载失败');
+    fs.chmodSync(localYt, 0o755);
+    ytdlp = localYt;
+  }
+  if (!which('ffmpeg')) die('缺 ffmpeg(apt install ffmpeg)');
+
+  // resolve video id (绕反爬核心)
+  let vid = '';
+  if (/^[0-9]{15,22}$/.test(input)) vid = input;
+  else {
+    const m1 = input.match(/\/(?:share\/)?video\/([0-9]+)/);
+    if (m1) vid = m1[1];
+    else {
+      log('🔗 解析短链…');
+      for (let attempt = 0; attempt < 3 && !vid; attempt++) {
+        const ca = ['-sL', '-m', '15']; if (proxy) ca.push('--proxy', proxy);
+        const eff = run('curl', ca.concat(['-o', '/dev/null', '-w', '%{url_effective}', input])).stdout || '';
+        const ha = ['-sIL', '-m', '15']; if (proxy) ha.push('--proxy', proxy);
+        const loc = run('curl', ha.concat([input])).stdout || '';
+        const cand = eff + ' ' + loc + ' ' + input;
+        const m2 = cand.match(/\/(?:share\/)?video\/([0-9]+)/) || cand.match(/([0-9]{15,22})/);
+        if (m2) vid = m2[1];
+      }
+    }
+  }
+  if (!vid) die('解析不到视频 ID。换成完整链接或直接给视频 ID。');
+  const canon = `https://www.douyin.com/video/${vid}`;
+  log(`🎬 视频 ID: ${vid}`);
+
+  // download
+  fs.mkdirSync(opt.out, { recursive: true });
+  const base = path.join(opt.out, `dy_${vid}`);
+  const titleFile = `${base}.title.txt`;
+  const px = proxy ? ['--proxy', proxy] : [];
+  if (opt.cookies) px.push('--cookies', opt.cookies);
+  // CDP 嗅探兜底:yt-dlp 被 "fresh cookies" 风控拦时,用本机 agent-chrome 抓 douyinvod 直链
+  const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  const curlDl = (url, out) => run('curl', ['-sL', '-m', '300', '-A', UA, '-e', 'https://www.douyin.com/', '-o', out, url]).status === 0 && fs.existsSync(out) && fs.statSync(out).size > 10000;
+  function cdpFallback() {
+    log('🕵️  yt-dlp 被拦,改用本机 Chrome CDP 嗅探直链…');
+    const r = spawnSync('python3', [path.join(__dirname, 'cdp_sniff.py'), vid], { encoding: 'utf8' });
+    let j = {}; try { j = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch (e) {}
+    if (j.error || (!j.audio && !j.video)) die(`CDP 嗅探也失败: ${j.error || '无媒体地址'}(确认 agent-chrome profile 在跑且能开抖音)`);
+    if (opt.mode === 'audio') {
+      const src = j.audio || j.video;
+      const tmp = `${base}.cdp.mp4`;
+      if (!curlDl(src, tmp)) die('直链下载失败');
+      if (run('ffmpeg', ['-y', '-i', tmp, '-vn', '-b:a', '128k', `${base}.mp3`], { stdio: 'ignore' }).status !== 0) die('转 mp3 失败');
+      fs.rmSync(tmp, { force: true });
+      return `${base}.mp3`;
+    }
+    // 视频模式:抖音音视频轨分离,分别下再合流
+    if (!j.video) die('没嗅到视频轨');
+    const vt = `${base}.v.mp4`;
+    if (!curlDl(j.video, vt)) die('视频轨下载失败');
+    if (j.audio) {
+      const at = `${base}.a.mp4`;
+      if (curlDl(j.audio, at)) {
+        if (run('ffmpeg', ['-y', '-i', vt, '-i', at, '-c', 'copy', '-map', '0:v', '-map', '1:a', `${base}.mp4`], { stdio: 'ignore' }).status === 0) {
+          fs.rmSync(vt, { force: true }); fs.rmSync(at, { force: true });
+          return `${base}.mp4`;
+        }
+      }
+    }
+    fs.renameSync(vt, `${base}.mp4`);  // 没音轨就给纯视频
+    return `${base}.mp4`;
+  }
+
+  let outfile;
+  if (opt.mode === 'audio') {
+    outfile = `${base}.mp3`;
+    log('⬇️  下载音频…');
+    const r = run(ytdlp, px.concat(['--no-playlist', '-x', '--audio-format', 'mp3', '--audio-quality', '0',
+      '-o', `${base}.%(ext)s`, '--print-to-file', '%(title)s', titleFile, canon]));
+    if (r.status !== 0) outfile = cdpFallback();
+  } else {
+    outfile = `${base}.mp4`;
+    log('⬇️  下载视频…');
+    const r = run(ytdlp, px.concat(['--no-playlist', '-o', `${base}.%(ext)s`,
+      '--print-to-file', '%(title)s', titleFile, canon]));
+    if (r.status !== 0) outfile = cdpFallback();
+  }
+  if (!fs.existsSync(outfile)) {
+    const g = fs.readdirSync(opt.out).filter(f => f.startsWith(`dy_${vid}`) && !f.endsWith('.txt'));
+    if (g.length) outfile = path.join(opt.out, g[0]);
+  }
+  if (!fs.existsSync(outfile)) die('下完没找到文件');
+  const title = fs.existsSync(titleFile) ? fs.readFileSync(titleFile, 'utf8').trim() : '';
+  let dur = '';
+  try { dur = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', outfile], { encoding: 'utf8' }).trim(); } catch (e) {}
+  log(`✅ 已保存: ${outfile}  (时长 ${dur ? Math.round(parseFloat(dur)) : '?'}s)`);
+
+  // transcribe (optional)
+  let txtFile = '', text = '';
+  if (opt.tx) {
+    txtFile = `${base}.txt`;
+    let audioIn = outfile;
+    if (opt.mode === 'video') {
+      audioIn = `${base}.audio.mp3`;
+      if (run('ffmpeg', ['-y', '-i', outfile, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', audioIn], { stdio: 'ignore' }).status !== 0) die('抽音轨失败');
+    }
+    if (opt.engine === 'groq') {
+      // Groq whisper-large-v3-turbo:快、准、免费额度大。凭据: $GROQ_API_KEY 或 global.json providers key=groqStt
+      let gk = process.env.GROQ_API_KEY || '', gu = 'https://api.groq.com/openai/v1';
+      if (!gk) {
+        try {
+          const gj = JSON.parse(fs.readFileSync(path.join(HOME, 'cicy-ai/global.json'), 'utf8'));
+          const p = ((gj.providers && gj.providers.items) || []).find(x => x.key === 'groqStt');
+          if (p) { gk = p.apiKey; gu = p.url || gu; }
+        } catch (e) {}
+      }
+      if (!gk) die('缺 Groq 凭据($GROQ_API_KEY 或 global.json providers key=groqStt);或换 --engine gateway/local');
+      log('📝 Groq 转写(whisper-large-v3-turbo)…');
+      // >20MB 或 >10min 切片,否则整段直传
+      const sz = fs.statSync(audioIn).size;
+      const sttGroq = (file) => new Promise((res) => {
+        const args = ['-s', '-m', '300', `${gu.replace(/\/$/, '')}/audio/transcriptions`,
+          '-H', `Authorization: Bearer ${gk}`,
+          '-F', `file=@${file}`, '-F', 'model=whisper-large-v3-turbo', '-F', `language=${opt.lang}`];
+        if (proxy) args.unshift('--proxy', proxy);
+        execFile('curl', args, { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
+          let t = ''; try { t = JSON.parse(out).text || ''; } catch (_) { }
+          if (!t && out) log(`groq 返回异常: ${String(out).slice(0, 160)}`);
+          res(t);
+        });
+      });
+      if (sz <= 20 * 1024 * 1024) {
+        text = (await sttGroq(audioIn)).trim();
+      } else {
+        const chk = path.join(opt.out, `_chunks_${vid}`);
+        fs.rmSync(chk, { recursive: true, force: true }); fs.mkdirSync(chk, { recursive: true });
+        if (run('ffmpeg', ['-y', '-i', audioIn, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k',
+          '-f', 'segment', '-segment_time', '600', path.join(chk, 'c_%03d.mp3')], { stdio: 'ignore' }).status !== 0) die('切片失败');
+        const chunks = fs.readdirSync(chk).filter(f => /^c_\d+\.mp3$/.test(f)).sort();
+        const parts = [];
+        for (const c of chunks) parts.push(await sttGroq(path.join(chk, c)));  // 串行,别触发限速
+        text = parts.join(' ').trim();
+        fs.rmSync(chk, { recursive: true, force: true });
+      }
+      fs.writeFileSync(txtFile, text);
+    } else if (opt.engine === 'gateway') {
+      const gj = JSON.parse(fs.readFileSync(path.join(HOME, 'cicy-ai/global.json'), 'utf8'));
+      const items = (gj.providers && gj.providers.items) || [];
+      const p = items.find(x => x.key === 'defaultOpenAi') || items[0];
+      if (!p || !p.url || !p.apiKey) die('网关 STT 凭据缺失(global.json providers)');
+      log('📝 网关转写(压缩切片 → 并行 whisper)…');
+      const chk = path.join(opt.out, `_chunks_${vid}`);
+      fs.rmSync(chk, { recursive: true, force: true }); fs.mkdirSync(chk, { recursive: true });
+      if (run('ffmpeg', ['-y', '-i', audioIn, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k',
+        '-f', 'segment', '-segment_time', '120', path.join(chk, 'c_%03d.mp3')], { stdio: 'ignore' }).status !== 0) die('切片失败');
+      const chunks = fs.readdirSync(chk).filter(f => /^c_\d+\.mp3$/.test(f)).sort();
+      if (!chunks.length) die('切片为空');
+      const stt = (file) => new Promise((res) => {
+        const args = ['-s', '-m', '180', `${p.url}/v1/audio/transcriptions`,
+          '-H', `Authorization: Bearer ${p.apiKey}`,
+          '-F', `file=@${file}`, '-F', 'model=whisper-1', '-F', `language=${opt.lang}`];
+        execFile('curl', args, { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
+          let t = ''; try { t = JSON.parse(out).text || ''; } catch (_) {}
+          res(t);
+        });
+      });
+      const parts = await Promise.all(chunks.map(c => stt(path.join(chk, c))));
+      text = parts.join(' ').trim();
+      fs.writeFileSync(txtFile, text);
+      fs.rmSync(chk, { recursive: true, force: true });
+    } else {
+      const check = spawnSync('python3', ['-c', 'import faster_whisper'], { stdio: 'ignore' });
+      if (check.status !== 0) die('缺 faster-whisper。装: python3 -m pip install --user --break-system-packages faster-whisper');
+      log(`📝 本地转写(${opt.model},CPU 可能较慢)…`);
+      const py = 'import sys\nfrom faster_whisper import WhisperModel\naudio,out,model_name,lang=sys.argv[1:5]\nm=WhisperModel(model_name,device="cpu",compute_type="int8")\nsegs,info=m.transcribe(audio,language=lang,vad_filter=True,beam_size=5)\nopen(out,"w").write("\\n".join(s.text.strip() for s in segs))\n';
+      const env = Object.assign({}, process.env, proxy ? { HTTPS_PROXY: proxy, https_proxy: proxy } : {});
+      const r = spawnSync('python3', ['-c', py, audioIn, txtFile, opt.model, opt.lang], { stdio: ['ignore', 'inherit', 'inherit'], env });
+      if (r.status !== 0) die('本地转写失败');
+      text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : '';
+    }
+    if (!text) die('转写返回空(网关报错?可加 --engine local 兜底)');
+    log(`✅ 文字稿: ${txtFile}`);
+  }
+
+  // output
+  if (opt.json) {
+    process.stdout.write(JSON.stringify({
+      video_id: vid, title, media: outfile,
+      duration_sec: dur ? parseFloat(dur) : null,
+      transcript_file: txtFile || null, text: text || null
+    }) + '\n');
+  } else {
+    process.stdout.write(`media=${outfile}\n`);
+    if (txtFile) { process.stdout.write(`transcript=${txtFile}\n---\n${text}\n`); }
+  }
+}
+
+main().catch(e => die(e && e.message ? e.message : String(e)));
