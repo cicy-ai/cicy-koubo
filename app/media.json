@@ -1,0 +1,30 @@
+[
+  {
+    "id": "3e960822ac",
+    "type": "video",
+    "file": "video_3e960822ac.mp4",
+    "duration": 6.36,
+    "note": "MuseTalk 成片",
+    "ts": "07-26 15:29"
+  },
+  {
+    "id": "0506005188",
+    "type": "voice",
+    "file": "voice_0506005188.wav",
+    "text": "爆款口播视频制作，爆款口播视频制作，爆款口播视频制作",
+    "chars": 26,
+    "speed": 1.15,
+    "duration": 6.36,
+    "ts": "07-26 15:25"
+  },
+  {
+    "id": "96c64e2113",
+    "type": "voice",
+    "file": "voice_96c64e2113.wav",
+    "text": "爆款口播视频制作，爆款口播视频制作，爆款口播视频制作",
+    "chars": 26,
+    "speed": 1.15,
+    "duration": 11.36,
+    "ts": "07-26 15:21"
+  }
+]
