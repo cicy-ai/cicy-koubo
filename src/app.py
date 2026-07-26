@@ -483,7 +483,7 @@ def tts():
 
     # 裁到 ~10s 16kHz mono
     ref_trim = WORK / f"ref_trim_{jid}.wav"
-    tr = run(["ffmpeg", "-v", "error", "-y", "-i", str(ref), "-t", "10",
+    tr = run(["ffmpeg", "-v", "error", "-y", "-i", str(ref), "-t", "6",
               "-ar", "16000", "-ac", "1", str(ref_trim)])
     if tr.returncode == 0 and ref_trim.exists():
         ref = ref_trim
