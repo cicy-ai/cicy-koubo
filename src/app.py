@@ -1558,6 +1558,19 @@ def _is_installing(key):
         return False
 
 
+# 启动时确保中文字体可用（字幕渲染 PIL 需要）
+def _ensure_cjk_font():
+    for f in ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+              "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"):
+        if os.path.exists(f):
+            return
+    # 只有 Colab/Linux 需要装，macOS 自带
+    if sys.platform == "linux":
+        subprocess.run(["apt-get", "install", "-y", "-qq", "fonts-noto-cjk"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+_ensure_cjk_font()
+
+
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
     "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt",   "est_min": 23, "est_size_gb": 15},
