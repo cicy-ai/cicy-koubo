@@ -1048,8 +1048,10 @@ async function pollLog(key) {
     const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
     box.textContent = d.lines.join('\n').replace(/\r/g, '\n') || '(暂无日志)';
     box.scrollTop = box.scrollHeight;
+    // 已装完且不在安装中 → 不需要 SSE，直接结束
+    if (!d.installing && box.textContent !== '(暂无日志)') return;
   } catch (e) {}
-  // SSE 实时流
+  // SSE 实时流（仅安装中需要）
   try {
     const es = new EventSource('/api/engines/' + key + '/stream');
     _installPolls[key] = es;
@@ -1059,7 +1061,6 @@ async function pollLog(key) {
         const d = JSON.parse(e.data);
         if (d.done) {
           es.close(); delete _installPolls[key];
-          // 只刷新这一个引擎的状态栏，不重建整个列表（避免抖动/死循环）
           try {
             const all = await (await fetch('/api/engines')).json();
             const eng = all.engines.find(e => e.key === key);
