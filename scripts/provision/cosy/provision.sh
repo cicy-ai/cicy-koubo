@@ -1,109 +1,74 @@
 #!/bin/bash
-set -e
-DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG="$DIR/provision.log"
-exec > >(tee -a "$LOG") 2>&1
-echo "=== CosyVoice provision $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+# CosyVoice2-0.5B self-provision for a Google Colab GPU runtime (voice clone TTS).
+# 与 MuseTalk 独立的 micromamba 环境(torch 版本不同),装在 /content/cosy/。
+# 由 Colab 引导 cell 在 MuseTalk 之后后台拉起:
+#   curl -fsSL .../cosyvoice-provision.sh > /content/cosy/provision.sh
+#   nohup bash /content/cosy/provision.sh > /content/cosy/provision.log 2>&1 &
+# 成功后写 /content/cosy/COSY_READY,供编排方轮询。
+set -uo pipefail
+export LD_LIBRARY_PATH="/usr/lib64-nvidia:${LD_LIBRARY_PATH:-}"
+# 强制无头 matplotlib 后端(从笔记本 cell 启动会继承 Jupyter 的 inline 后端导致崩)
+export MPLBACKEND=Agg
 
-cd "$DIR"
-rm -rf env CosyVoice cosyvoice_tts.py
+WORK=/content/cosy
+ENV=$WORK/env
+REPO=$WORK/CosyVoice
+RAW=https://raw.githubusercontent.com/cicy-ai/cicy-tools/main
+export MAMBA_ROOT_PREFIX=$WORK/mamba
 
-echo "[cosy] base deps..."
-pip install -q --upgrade setuptools wheel pip
-pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install -q huggingface_hub modelscope soundfile hyperpyyaml openai-whisper wetext
-pip install -q "numba>=0.61" "onnxruntime-gpu<1.21"
+log(){ echo "=== [$(date +%H:%M:%S)] $*"; }
+die(){ echo "!!! $*" >&2; exit 1; }
 
-echo "[cosy] cloning CosyVoice..."
-git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
+rm -f $WORK/COSY_READY
+mkdir -p $WORK
+nvidia-smi --query-gpu=name --format=csv,noheader || die "no GPU"
 
-# Fix cudart symlink
-if [ ! -f /usr/lib/x86_64-linux-gnu/libcudart.so.13 ]; then
-    ln -sf /usr/local/cuda/lib64/libcudart.so.12 /usr/lib/x86_64-linux-gnu/libcudart.so.13 2>/dev/null || true
-    ldconfig 2>/dev/null || true
+log "1/6 micromamba + python 3.10 + pynini(conda-forge)"
+MM=/content/mt/bin/micromamba
+if [ ! -x "$MM" ]; then
+  mkdir -p $WORK/bin
+  (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
+  MM=$WORK/bin/micromamba
 fi
+[ -x $ENV/bin/python ] || $MM create -y -q -p $ENV -c conda-forge python=3.10 pip "pynini==2.1.5" || die "env create"
+PIP=$ENV/bin/pip; PY=$ENV/bin/python
 
-echo "[cosy] pip install -r requirements.txt..."
-cd CosyVoice
-pip install -q -r requirements.txt 2>/dev/null || true
+log "2/6 torch 2.3.1 + cu121"
+$PY -c 'import torch' 2>/dev/null || \
+  $PIP install -q torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121 || die "torch"
 
-# Install matcha-tts submodule
-echo "[cosy] installing matcha-tts..."
-cd third_party/Matcha-TTS
-pip install -q -e . 2>/dev/null || pip install -q -e . --no-build-isolation 2>/dev/null || true
-cd "$DIR/CosyVoice"
+log "3/6 CosyVoice repo + requirements"
+[ -d $REPO/.git ] || git clone --recursive https://github.com/FunAudioLLM/CosyVoice $REPO || die "clone"
+# numpy 必须先装:否则一旦 requirements 中断,后续 modelscope 因缺 numpy 崩
+# setuptools<80:新版移除了 pkg_resources,lightning(matcha 依赖)加载时需要它
+$PIP install -q "numpy<2" scipy "setuptools<80" || die "numpy/setuptools"
+# 剔掉编译易崩且推理不需要的 openai-whisper / deepspeed,避免中断整批安装
+grep -v -iE 'openai-whisper|deepspeed' $REPO/requirements.txt > /tmp/cosy-req.txt
+$PIP install -q -r /tmp/cosy-req.txt 2>&1 | tail -3 || log "requirements 部分失败,兜底补装"
+# zero-shot 推理关键依赖兜底
+$PIP install -q modelscope onnxruntime librosa soundfile hyperpyyaml omegaconf \
+  conformer inflect gdown "diffusers==0.29.0" transformers || die "关键依赖补装失败"
+# openai-whisper:CosyVoice2 加载模型时 import whisper;它在构建隔离下会崩,numpy 就绪后免隔离装
+$PY -c "import whisper" 2>/dev/null || \
+  $PIP install -q --no-build-isolation openai-whisper || \
+  $PIP install -q openai-whisper || die "openai-whisper 安装失败"
+$PY -c "import numpy, modelscope, whisper" || die "关键依赖仍不可用"
 
-echo "[cosy] downloading model..."
-MODEL_DIR="$DIR/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
-mkdir -p "$MODEL_DIR"
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='$MODEL_DIR')
-"
+log "4/6 下载 CosyVoice2-0.5B 权重(真权重,约 2GB)"
+[ -f $REPO/pretrained_models/CosyVoice2-0.5B/llm.pt ] && \
+  [ $(stat -c%s $REPO/pretrained_models/CosyVoice2-0.5B/llm.pt) -gt 1000000 ] || \
+  $PY -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice2-0.5B', local_dir='$REPO/pretrained_models/CosyVoice2-0.5B')" || die "model download"
 
-echo "[cosy] verifying import..."
-python3 -c "
-import sys, os, types
-# Stub matcha if not installed
-if 'matcha' not in sys.modules:
-    m = types.ModuleType('matcha')
-    m.models = types.ModuleType('matcha.models')
-    m.models.components = types.ModuleType('matcha.models.components')
-    m.models.components.flow_matching = types.ModuleType('matcha.models.components.flow_matching')
-    class BASECFM: pass
-    m.models.components.flow_matching.BASECFM = BASECFM
-    sys.modules['matcha'] = m
-    sys.modules['matcha.models'] = m.models
-    sys.modules['matcha.models.components'] = m.models.components
-    sys.modules['matcha.models.components.flow_matching'] = m.models.components.flow_matching
-sys.path.insert(0, '$DIR/CosyVoice')
-os.environ['MODELSCOPE_CACHE'] = '$DIR/CosyVoice/pretrained_models'
-from cosyvoice.cli.cosyvoice import AutoModel
-print('CosyVoice import OK')
-" 2>&1
+log "5/6 TTS 封装脚本"
+curl -fsSL $RAW/cosyvoice_tts.py -o $WORK/cosyvoice_tts.py || die "tts.py download"
 
-# TTS wrapper with matcha stub
-cat > "$DIR/cosyvoice_tts.py" << 'PYEOF'
-#!/usr/bin/env python3
-import sys, os, types, argparse, base64
-import numpy as np, soundfile as sf
+log "6/6 冒烟:加载模型"
+$PY -c "
+import sys; sys.path.append('$REPO'); sys.path.append('$REPO/third_party/Matcha-TTS')
+from cosyvoice.cli.cosyvoice import CosyVoice2
+m=CosyVoice2('$REPO/pretrained_models/CosyVoice2-0.5B', load_jit=False, load_trt=False, fp16=False)
+print('model load ok, sr=', m.sample_rate)
+" || die "model load failed"
 
-# Stub matcha module
-m = types.ModuleType('matcha')
-m.models = types.ModuleType('matcha.models')
-m.models.components = types.ModuleType('matcha.models.components')
-m.models.components.flow_matching = types.ModuleType('matcha.models.components.flow_matching')
-class BASECFM: pass
-m.models.components.flow_matching.BASECFM = BASECFM
-sys.modules['matcha'] = m
-sys.modules['matcha.models'] = m.models
-sys.modules['matcha.models.components'] = m.models.components
-sys.modules['matcha.models.components.flow_matching'] = m.models.components.flow_matching
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'CosyVoice'))
-os.environ['MODELSCOPE_CACHE'] = os.path.join(os.path.dirname(__file__), 'CosyVoice', 'pretrained_models')
-from cosyvoice.cli.cosyvoice import AutoModel
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--ref', required=True)
-parser.add_argument('--ref-text-b64', default='')
-parser.add_argument('--text-b64', required=True)
-parser.add_argument('--speed', type=float, default=1.0)
-parser.add_argument('--out', required=True)
-args = parser.parse_args()
-
-ref_text = base64.b64decode(args.ref_text_b64).decode()
-text = base64.b64decode(args.text_b64).decode()
-
-ckpt = os.path.join(os.path.dirname(__file__), 'CosyVoice', 'pretrained_models', 'Fun-CosyVoice3-0.5B')
-model = AutoModel(model_dir=ckpt)
-result = list(model.inference_zero_shot(text, ref_text, args.ref))[0]
-sf.write(args.out, result['tts_speech'], 24000)
-print(f"OK out={args.out}")
-PYEOF
-chmod +x "$DIR/cosyvoice_tts.py"
-
-echo "[cosy] DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "cosy_version=3.0" > "$DIR/COSY_READY"
-echo "cosy_model=Fun-CosyVoice3-0.5B" >> "$DIR/COSY_READY"
-echo "cosy_installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DIR/COSY_READY"
+echo "ready_at=$(date -u +%FT%TZ)" > $WORK/COSY_READY
+log "DONE — COSY_READY written"
