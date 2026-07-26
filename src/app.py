@@ -277,10 +277,27 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 cmd = f"bash /content/hg/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote}"
             else:
                 cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
-            r = run(SSH + [cmd], timeout=1800)
-            log(r.stdout.strip()[-400:] if r.stdout else "")
-            if r.returncode != 0 or "OK out=" not in (r.stdout or ""):
-                raise RuntimeError("MuseTalk failed: " + (r.stderr or r.stdout)[-400:])
+            # 实时日志:stream 行写入 j["log"] 供前端轮询
+            log_file = jd / "synthesize.log"
+            import subprocess as _sp
+            with open(str(log_file), "w") as lf:
+                p = _sp.Popen(SSH + [cmd], stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                              text=True, start_new_session=True)
+                for line in p.stdout:
+                    line = line.rstrip('\n').rstrip('\r')
+                    if line:
+                        log(f"[MuseTalk] {line[:120]}")
+                    lf.write(line + "\n")
+                p.wait()
+                rc = p.returncode
+            if rc != 0:
+                raise RuntimeError("MuseTalk failed, check log")
+            # 验证输出
+            r2 = _sp.run(["bash", "-lc", f"test -f {out_remote} && echo OK || echo MISSING"],
+                         capture_output=True, text=True)
+            if "OK" not in (r2.stdout or ""):
+                raise RuntimeError("MuseTalk did not produce output")
+            log("done")
 
             j["stage"] = "取回成片"
             r = run(SCP + [REMOTE + ":" + out_remote, str(result)], timeout=180)
