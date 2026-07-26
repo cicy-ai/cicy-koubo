@@ -99,25 +99,37 @@ def api_logs():
 # GPU 侧安装进度也汇入唯一日志:后台每分钟拉一次 mt/cosy/hg 的关键行,没见过的追加进 pipeline.log
 _PROV_SEEN = set()
 
-
 def _provision_log_pump():
+    """轮询本地 provision.log，有新行就汇入 pipeline.log"""
+    import glob as _glob
+    positions = {}
     while True:
         try:
-            r = run(SSH + ["for f in mt cosy hg; do echo \"##$f\"; "
-                           "grep -E '^===|^!!!' /content/$f/provision.log 2>/dev/null | tail -30; done"],
-                    timeout=25)
-            if r.returncode == 0:
-                cur = None
-                for line in (r.stdout or "").splitlines():
-                    if line.startswith("##"):
-                        cur = line[2:].strip()
-                        continue
-                    if cur and line.strip() and (cur, line) not in _PROV_SEEN:
-                        _PROV_SEEN.add((cur, line))
-                        plog(f"[装载 {cur}] {line}")
+            for logf in sorted(pathlib.Path("/content").glob("*/provision.log")):
+                key = logf.parent.name
+                if key not in ENGINES:
+                    continue
+                prev = positions.get(key, 0)
+                try:
+                    st = logf.stat()
+                    if st.st_size > prev:
+                        with open(logf, "r") as f:
+                            f.seek(prev)
+                            for line in f:
+                                line = line.rstrip("\n").rstrip("\r")
+                                if line.strip() and (key, line) not in _PROV_SEEN:
+                                    _PROV_SEEN.add((key, line))
+                                    plog(f"[{ENGINES[key]['name']}] {line}")
+                        positions[key] = st.st_size
+                except Exception:
+                    pass
+            # 清理已不存在的引擎的 position
+            for k in list(positions.keys()):
+                if k not in ENGINES:
+                    del positions[k]
         except Exception:
             pass
-        time.sleep(60)
+        time.sleep(2)
 
 
 threading.Thread(target=_provision_log_pump, daemon=True).start()
