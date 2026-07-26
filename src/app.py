@@ -436,8 +436,7 @@ def _pull_colab_log(jid):
 
 @app.post("/api/tts")
 def tts():
-    """文案 + 参考音色 → CosyVoice zero-shot 克隆配音(Colab GPU)。
-    参考音色:上传的 ref 文件,或默认用 assets 里最新的 voice-sample。"""
+    """文案 + 参考音色 → CosyVoice zero-shot 克隆配音(本机 GPU 直接跑)。"""
     text = ""
     if request.is_json:
         text = (request.json or {}).get("text", "").strip()
@@ -449,80 +448,87 @@ def tts():
         speed = max(0.5, min(1.5, float(request.form.get("speed", "1.0"))))
     except ValueError:
         speed = 1.0
-    # 不做易误判的预检(隧道抖动会假报未就绪拦掉请求);直接干,真失败报真错误
 
     jid = uuid.uuid4().hex[:10]
-    whole = request.form.get("mode") == "whole"  # 整段生成(不分句,语气连贯但长文可能截断)
+    whole = request.form.get("mode") == "whole"
     plog(f"[配音 {jid}] 开始: {len(text)}字 语速{speed} 模式{'整段' if whole else '分段'}")
-    jd = WORK / ("tts_" + jid)
-    jd.mkdir(exist_ok=True)
-    # 参考音色:指定 ref_id(音色库)> 上传 ref 文件 > 最新样本
+
+    # 参考音色
     ref_id = (request.form.get("ref_id") or "").strip()
     if ref_id and ref_id.startswith("voice-sample-") and (ROOT / "assets" / ref_id).exists():
         ref = ROOT / "assets" / ref_id
     elif "ref" in request.files and request.files["ref"].filename:
-        ref = jd / ("ref" + pathlib.Path(request.files["ref"].filename).suffix)
+        ref = WORK / (uuid.uuid4().hex[:8] + "_ref" + pathlib.Path(request.files["ref"].filename).suffix)
         request.files["ref"].save(ref)
     else:
         samples = sorted((ROOT / "assets").glob("voice-sample-*.wav"))
         if not samples:
             return jsonify({"error": "没有参考音色,请先选择/上传一段人声样本"}), 400
         ref = samples[-1]
-    # 参考音频裁到约 10 秒:兼顾音色相似度与上下文长度(截断问题已由 tts 脚本分句解决)
-    ref_trim = jd / "ref_trim.wav"
+
+    # 裁到 ~10s 16kHz mono
+    ref_trim = WORK / f"ref_trim_{jid}.wav"
     tr = run(["ffmpeg", "-v", "error", "-y", "-i", str(ref), "-t", "10",
               "-ar", "16000", "-ac", "1", str(ref_trim)])
     if tr.returncode == 0 and ref_trim.exists():
         ref = ref_trim
-    # 裁剪后再转写(prompt text 必须匹配实际参考音频内容),CosyVoice 克隆需要
     ref_text = _groq_transcribe(str(ref))
-    try:
-        r = run_retry(SCP + [str(ref), REMOTE + f":/content/cosy/ref_{jid}.wav"], timeout=120)
-        if r.returncode != 0:
-            return jsonify({"error": "上传参考音频失败: " + r.stderr[:200]}), 502
-        out_remote = f"/content/cosy/tts_{jid}.wav"
-        done = f"/content/cosy/tts_{jid}.done"
-        log_r = f"/content/cosy/tts_{jid}.log"
-        # text/ref-text 用 base64 传:纯 ASCII,彻底规避嵌套引号破坏中文标点
-        import base64
-        t_b64 = base64.b64encode(text.encode()).decode()
-        rt_b64 = base64.b64encode((ref_text or "").encode()).decode()
-        # 后台跑合成(setsid 脱离 SSH),扛隧道抖动;完成写 .done
-        launch = (f"export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
-                  f"setsid bash -c '/content/cosy/env/bin/python /content/cosy/cosyvoice_tts.py "
-                  f"--ref /content/cosy/ref_{jid}.wav --ref-text-b64 {rt_b64} "
-                  f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} --out {out_remote} > {log_r} 2>&1; "
-                  f"echo done > {done}' </dev/null >/dev/null 2>&1 &")
-        run_retry(SSH + [launch], timeout=30, tries=3)
-        # 轮询完成标记(每次短 SSH,抗抖动),最多约 5 分钟
-        ok = False
-        for _ in range(60):
-            time.sleep(5)
-            if _ssh_check(f"cat {done} 2>/dev/null", "done", tries=2):
-                ok = True
-                break
-        if not ok:
-            taillog = run_retry(SSH + [f"tail -3 {log_r} 2>/dev/null"], timeout=20, tries=2)
-            plog(f"[配音 {jid}] ❌ 超时/失败: {(taillog.stdout or '')[-200:]}")
-            return jsonify({"error": "配音超时/失败: " + (taillog.stdout or "")[-300:]}), 500
-        local = jd / "tts.wav"
-        run_retry(SCP + [REMOTE + ":" + out_remote, str(local)], timeout=120)
-        if not local.exists():
-            return jsonify({"error": "取回配音失败"}), 502
-        # 入媒体库(文件+meta),前端拿 id/url
-        import shutil
-        dur = _ffdur(local)
-        dst = MEDIA_DIR / f"voice_{jid}.wav"
-        shutil.copy(local, dst)
-        _media_add({"id": jid, "type": "voice", "file": dst.name,
-                    "text": text[:100], "chars": len(text), "speed": speed,
-                    "duration": dur, "ts": time.strftime("%m-%d %H:%M")})
-        plog(f"[配音 {jid}] ✅ 完成 {dur}s → media/voice_{jid}.wav")
-        _pull_colab_log(jid)
-        return jsonify({"id": jid, "url": f"/api/media/{jid}/file",
-                        "duration": dur, "chars": len(text)})
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
+
+    # 本机直接跑 CosyVoice
+    cosy_dir = pathlib.Path("/content/cosy")
+    cosy_py = cosy_dir / "env/bin/python"
+    cosy_script = cosy_dir / "cosyvoice_tts.py"
+    if not cosy_script.exists():
+        return jsonify({"error": "CosyVoice 未安装,请先在安装管理中安装"}), 503
+
+    import base64
+    t_b64 = base64.b64encode(text.encode()).decode()
+    rt_b64 = base64.b64encode((ref_text or "参考声音").encode()).decode()
+
+    out_wav = cosy_dir / f"tts_{jid}.wav"
+    done_file = cosy_dir / f"tts_{jid}.done"
+    log_file = cosy_dir / f"tts_{jid}.log"
+
+    # 拷贝 ref 到 cosy 目录
+    ref_dst = cosy_dir / f"ref_{jid}.wav"
+    import shutil as _sh
+    _sh.copy(ref, ref_dst)
+
+    launch = (f"export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
+              f"cd {cosy_dir} && nohup {cosy_py} {cosy_script} "
+              f"--ref {ref_dst} --ref-text-b64 {rt_b64} "
+              f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} --out {out_wav} "
+              f"> {log_file} 2>&1; echo done > {done_file} &")
+    subprocess.Popen(["bash", "-lc", launch], start_new_session=True)
+
+    # 轮询 done
+    for _ in range(120):
+        time.sleep(3)
+        if done_file.exists():
+            break
+
+    if not done_file.exists():
+        tail = ""
+        try:
+            tail = log_file.read_text()[-300:] if log_file.exists() else ""
+        except Exception:
+            pass
+        plog(f"[配音 {jid}] ❌ 超时: {tail}")
+        return jsonify({"error": "配音超时: " + tail[-200:]}), 500
+
+    if not out_wav.exists():
+        return jsonify({"error": "配音完成后未生成音频文件"}), 500
+
+    # 入媒体库
+    dur = _ffdur(out_wav)
+    dst = MEDIA_DIR / f"voice_{jid}.wav"
+    _sh.copy(out_wav, dst)
+    _media_add({"id": jid, "type": "voice", "file": dst.name,
+                "text": text[:100], "chars": len(text), "speed": speed,
+                "duration": dur, "ts": time.strftime("%m-%d %H:%M")})
+    plog(f"[配音 {jid}] ✅ 完成 {dur}s → media/voice_{jid}.wav")
+    return jsonify({"id": jid, "url": f"/api/media/{jid}/file",
+                    "duration": dur, "chars": len(text)})
 
 
 @app.post("/api/edit")
