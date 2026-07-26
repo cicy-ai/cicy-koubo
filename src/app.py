@@ -1558,7 +1558,7 @@ def api_engine_install(engine):
     if not logf.exists():
         logf.write_text(f"=== install started at {time.strftime('%Y-%m-%dT%H:%M:%SZ')} ===\n")
     subprocess.Popen(["nohup", "bash", str(script)],
-                     stdout=open(str(logf), "a"), stderr=subprocess.STDOUT,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, cwd=str(script.parent))
     return jsonify({"ok": True, "started": True, "log_path": str(logf)})
 
