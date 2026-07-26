@@ -994,7 +994,7 @@ async function pollLog(key) {
   if (!box || !box.classList.contains('show')) { delete _installPolls[key]; return; }
   try {
     const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
-    box.textContent = d.lines.join('\n') || '(暂无日志)';
+    box.textContent = d.lines.join('\n').replace(/\r/g, '\n') || '(暂无日志)';
     box.scrollTop = box.scrollHeight;
     const wasInstalling = !!_installPolls[key];
     if (d.installing) {
