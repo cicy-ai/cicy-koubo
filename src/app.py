@@ -730,7 +730,24 @@ def _font_path(fid):
 
 @app.get("/api/fonts")
 def fonts():
-    return jsonify([{"id": k, "name": v[1]} for k, v in FONTS.items() if os.path.exists(v[0])])
+    # 返回回退链中实际可用的字体
+    FALLBACK_FONTS = [
+        ("heavy", "思源黑体·特粗(抖音风,推荐)", "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+        ("bold", "思源黑体·粗", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ("heavy", "思源黑体·特粗(用户上传)", "/content/SourceHanSansCN-Heavy.otf"),
+        ("bold", "思源黑体·粗(用户上传)", "/content/SourceHanSansCN-Bold.otf"),
+    ]
+    out = []
+    seen = set()
+    for k, v in FONTS.items():
+        if os.path.exists(v[0]):
+            out.append({"id": k, "name": v[1]})
+            seen.add(k)
+    for fid, name, path in FALLBACK_FONTS:
+        if fid not in seen and os.path.exists(path):
+            out.append({"id": fid, "name": name})
+            seen.add(fid)
+    return jsonify(out)
 
 
 def _hex_rgba(s, default):
