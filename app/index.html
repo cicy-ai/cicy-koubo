@@ -904,6 +904,7 @@ function bindUploads(){
 /* ---------- 安装管理 ---------- */
 let _installPolls = {};
 let _openLogs = {};
+let _engineTimer = null;
 function fmtGB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
 
 async function openInstallModal() {
