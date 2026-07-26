@@ -278,10 +278,11 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
             else:
                 cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
             # 实时日志:stream 行写入 j["log"] 供前端轮询
+            local_cmd = _rewrite_local(SSH + [cmd])
             log_file = jd / "synthesize.log"
             import subprocess as _sp
             with open(str(log_file), "w") as lf:
-                p = _sp.Popen(SSH + [cmd], stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                p = _sp.Popen(local_cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                               text=True, start_new_session=True)
                 for line in p.stdout:
                     line = line.rstrip('\n').rstrip('\r')
