@@ -1582,14 +1582,20 @@ def api_llm_keys():
         for p in providers:
             k = (p.get("apiKey") or "").strip()
             proto = (p.get("protocol") or "").lower()
-            if k and proto in ("openai", "anthropic"):
-                masked = k[:4] + "****" + k[-4:] if len(k) > 10 else "****"
+            pkey = p.get("key", "")
+            # 只展示豆包(配音)和 deepseek(改写/提取)
+            if pkey not in ("deepseek", "deepseek_claude", "doubaoVoice"):
+                continue
+            if proto in ("openai", "anthropic", "voice"):
+                masked = k[:4] + "****" + k[-4:] if len(k) > 10 else ("****" if k else "未设置")
+                usage = {"openai": "改写/提取", "anthropic": "改写/提取", "voice": "配音"}.get(proto, proto)
                 items.append({
                     "key": p.get("key", ""),
                     "name": p.get("name", ""),
                     "protocol": proto,
                     "url": p.get("url", ""),
                     "model": p.get("defaultModel", ""),
+                    "usage": usage,
                     "masked": masked,
                 })
     except Exception:

@@ -956,17 +956,17 @@ async function openInstallModal() {
   try {
     const k = await (await fetch('/api/llm-keys')).json();
     if (k.providers && k.providers.length) {
-      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:13px;font-weight:600">🔑 大模型 Key</div>' +
+      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:13px;font-weight:600">🔑 模型 Key</div>' +
         k.providers.map(p => `<div class="eline" style="align-items:center;gap:10px;padding:6px 0">
           <div style="flex:1;min-width:0">
-            <div style="font-size:12px;font-weight:600">${p.name} (${p.protocol})</div>
+            <div style="font-size:12px;font-weight:600">${p.name} <span style="font-weight:400;color:var(--mut)">· ${p.usage}</span></div>
             <div style="font-size:10px;color:var(--mut)">${p.masked} · ${p.model}</div>
           </div>
           <input class="inp" id="key-${p.key}" placeholder="sk-..." value="${p.masked}" style="width:180px;font-size:12px;padding:5px 8px">
           <button class="btn" style="font-size:12px;padding:5px 12px" onclick="saveLlmKey('${p.key}')">保存</button>
         </div>`).join('');
     } else {
-      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:12px;color:var(--mut)">🔑 未配置大模型 Key — 在 ~/cicy-ai/global.json 中添加</div>';
+      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:12px;color:var(--mut)">🔑 未配置模型 Key — 在 ~/cicy-ai/global.json 中添加</div>';
     }
   } catch(e) { $('llmKeys').innerHTML = ''; }
   await refreshEngines();
