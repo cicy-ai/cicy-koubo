@@ -1002,39 +1002,58 @@ def bgm_file(bid):
 
 @app.post("/api/srt")
 def gen_srt():
-    """音频 → Groq whisper(verbose_json)→ SRT 文本(逐句时间轴)。"""
+    """音频 → Groq whisper(verbose_json)或本机 whisper → SRT 文本(逐句时间轴)。"""
     if "audio" not in request.files:
         return jsonify({"error": "缺音频"}), 400
     tmp = WORK / (uuid.uuid4().hex[:8] + ".wav")
     request.files["audio"].save(tmp)
     gk = _groq_key()
-    if not gk:
-        return jsonify({"error": "缺转写凭据"}), 500
-    proxy = os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy", ""))
-    cmd = ["curl", "-s", "https://api.groq.com/openai/v1/audio/transcriptions",
-           "-H", f"Authorization: Bearer {gk}", "-F", f"file=@{tmp}",
-           "-F", "model=whisper-large-v3-turbo", "-F", "language=zh",
-           "-F", "response_format=verbose_json"]
-    if proxy:
-        cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
-    try:
-        r = run(cmd, timeout=120)
-        data = json.loads(r.stdout)
-        segs = data.get("segments") or []
 
-        def _ts(t):
-            h, rem = divmod(t, 3600)
-            mnt, s = divmod(rem, 60)
-            return f"{int(h):02d}:{int(mnt):02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
+    def _ts(t):
+        h, rem = divmod(t, 3600)
+        mnt, s = divmod(rem, 60)
+        return f"{int(h):02d}:{int(mnt):02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
 
+    def _to_srt(s):
         lines = []
-        for i, s in enumerate(segs, 1):
+        for i, s in enumerate(s, 1):
             lines.append(f"{i}\n{_ts(s['start'])} --> {_ts(s['end'])}\n{s['text'].strip()}\n")
-        return jsonify({"srt": "\n".join(lines), "segments": len(segs)})
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
-    finally:
-        tmp.unlink(missing_ok=True)
+        return "\n".join(lines)
+
+    # 策略 1: 云端 Groq whisper（快，~10s）
+    if gk:
+        proxy = os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy", ""))
+        cmd = ["curl", "-s", "https://api.groq.com/openai/v1/audio/transcriptions",
+               "-H", f"Authorization: Bearer {gk}", "-F", f"file=@{tmp}",
+               "-F", "model=whisper-large-v3-turbo", "-F", "language=zh",
+               "-F", "response_format=verbose_json"]
+        if proxy:
+            cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
+        try:
+            r = run(cmd, timeout=120)
+            data = json.loads(r.stdout)
+            segs = data.get("segments") or []
+            if segs:
+                return jsonify({"srt": _to_srt(segs), "segments": len(segs), "provider": "groq"})
+        except Exception:
+            pass  # Groq 失败，回退到本机
+
+    # 策略 2: 本机 CosyVoice 环境 whisper medium（GPU，~30-60s）
+    cosy_dir = pathlib.Path("/content/cosy")
+    if cosy_dir.exists():
+        try:
+            script = (
+                "import whisper, sys; m=whisper.load_model('medium',device='cuda'); "
+                f"r=m.transcribe('{tmp}',language='zh',verbose=False); "
+                "import json; print(json.dumps(r['segments'],ensure_ascii=False))"
+            )
+            r = run([sys.executable, "-c", script], timeout=300, cwd=str(cosy_dir))
+            segs = json.loads(r.stdout)
+            if segs:
+                return jsonify({"srt": _to_srt(segs), "segments": len(segs), "provider": "local-whisper"})
+        except Exception as e:
+            return jsonify({"error": f"本机识别失败: {e}"}), 500
+    return jsonify({"error": "缺转写凭据，且无本机 whisper 环境"}), 500
 
 
 @app.get("/api/media")
