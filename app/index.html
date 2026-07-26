@@ -169,8 +169,8 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <span class="pill"><i class="dot" id="d-tun"></i>GPU隧道 <b id="t-tun" style="font-weight:500">检测中</b></span>
     <span class="pill"><i class="dot" id="d-au"></i>配音 <b id="t-au" style="font-weight:500">-</b></span>
     <span class="pill"><i class="dot" id="d-vi"></i>出片 <b id="t-vi" style="font-weight:500">-</b></span>
-    <a class="btn ghost" id="colabBtn" style="text-decoration:none;padding:7px 12px;cursor:pointer"
-       onclick="openInstallModal()">⚙️ 安装管理</a>
+    <a class="btn" id="colabBtn" style="text-decoration:none;padding:7px 12px;cursor:pointer;background:var(--teal);color:#fff;font-weight:600"
+       onclick="openInstallModal()">⚙️ 系统管理</a>
     <a class="btn ghost" style="text-decoration:none;padding:7px 12px" target="_blank"
        href="/api/logs" title="唯一日志:安装进度 + 配音/出片/剪辑全过程">📄 日志</a>
   </div>
@@ -332,11 +332,12 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
 <div id="toast"></div>
 
-<!-- 安装管理 modal -->
+<!-- 系统管理 modal -->
 <div class="mask" id="imask" onclick="closeInstallModal()"></div>
 <div class="modal" id="iModal" style="width:min(720px,94vw);max-height:85vh;overflow-y:auto">
-  <h3>⚙️ 安装管理 <span style="font-size:12px;color:var(--mut);font-weight:400" id="iTitle">加载中…</span></h3>
+  <h3>⚙️ 系统管理 <span style="font-size:12px;color:var(--mut);font-weight:400" id="iTitle">加载中…</span></h3>
   <div class="sysbar" id="sysBar"></div>
+  <div id="llmKeys"></div>
   <div id="engineList"></div>
   <div style="text-align:right;margin-top:10px">
     <button class="btn ghost" onclick="closeInstallModal()">关闭</button>
@@ -951,7 +952,36 @@ async function openInstallModal() {
        <div class="syschip"><div class="sl">🐍 Python</div><div class="sv">${s.python_version||'?'}${s.is_colab?' · Colab':''}</div></div>`;
     $('iTitle').textContent = (s.is_colab ? 'Colab · ' : '') + 'GPU '+ (s.gpu_name || 'N/A');
   } catch (e) { $('sysBar').innerHTML = '<span style="color:var(--red)">加载系统信息失败</span>'; }
+  // LLM keys
+  try {
+    const k = await (await fetch('/api/llm-keys')).json();
+    if (k.providers && k.providers.length) {
+      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:13px;font-weight:600">🔑 大模型 Key</div>' +
+        k.providers.map(p => `<div class="eline" style="align-items:center;gap:10px;padding:6px 0">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:12px;font-weight:600">${p.name} (${p.protocol})</div>
+            <div style="font-size:10px;color:var(--mut)">${p.masked} · ${p.model}</div>
+          </div>
+          <input class="inp" id="key-${p.key}" placeholder="sk-..." value="${p.masked}" style="width:180px;font-size:12px;padding:5px 8px">
+          <button class="btn" style="font-size:12px;padding:5px 12px" onclick="saveLlmKey('${p.key}')">保存</button>
+        </div>`).join('');
+    } else {
+      $('llmKeys').innerHTML = '<div style="margin-top:10px;font-size:12px;color:var(--mut)">🔑 未配置大模型 Key — 在 ~/cicy-ai/global.json 中添加</div>';
+    }
+  } catch(e) { $('llmKeys').innerHTML = ''; }
   await refreshEngines();
+}
+
+async function saveLlmKey(providerKey) {
+  const inp = document.getElementById('key-'+providerKey);
+  const val = inp.value.trim();
+  if (!val || val.includes('****')) return toast('请先输入新 Key');
+  try {
+    const r = await fetch('/api/llm-keys', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key:providerKey, apiKey:val})});
+    const d = await r.json();
+    if (d.error) toast('保存失败: '+d.error);
+    else toast('✅ Key 已保存');
+  } catch(e) { toast('保存失败: '+e.message); }
 }
 
 function closeInstallModal() {

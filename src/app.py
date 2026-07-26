@@ -1571,6 +1571,55 @@ def _ensure_cjk_font():
 _ensure_cjk_font()
 
 
+@app.get("/api/llm-keys")
+def api_llm_keys():
+    """返回当前 LLM provider 的 key 信息（脱敏）"""
+    gj_path = pathlib.Path.home() / "cicy-ai/global.json"
+    items = []
+    try:
+        gj = json.load(open(gj_path))
+        providers = gj.get("providers", {}).get("items") or []
+        for p in providers:
+            k = (p.get("apiKey") or "").strip()
+            proto = (p.get("protocol") or "").lower()
+            if k and proto in ("openai", "anthropic"):
+                masked = k[:4] + "****" + k[-4:] if len(k) > 10 else "****"
+                items.append({
+                    "key": p.get("key", ""),
+                    "name": p.get("name", ""),
+                    "protocol": proto,
+                    "url": p.get("url", ""),
+                    "model": p.get("defaultModel", ""),
+                    "masked": masked,
+                })
+    except Exception:
+        pass
+    return jsonify({"providers": items})
+
+
+@app.post("/api/llm-keys")
+def api_llm_keys_save():
+    """保存/更新 LLM provider key"""
+    data = request.get_json(force=True) or {}
+    provider_key = data.get("key", "")
+    api_key = data.get("apiKey", "").strip()
+    if not provider_key or not api_key:
+        return jsonify({"error": "缺少 key 或 apiKey"}), 400
+    gj_path = pathlib.Path.home() / "cicy-ai/global.json"
+    try:
+        gj = json.load(open(gj_path))
+        items = gj.get("providers", {}).get("items") or []
+        for p in items:
+            if p.get("key") == provider_key:
+                p["apiKey"] = api_key
+                break
+        gj.setdefault("providers", {})["items"] = items
+        json.dump(gj, open(gj_path, "w"), ensure_ascii=False, indent=2)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
     "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt",   "est_min": 23, "est_size_gb": 15},
