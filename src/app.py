@@ -407,8 +407,21 @@ def cover(job_id):
 
 
 def _transcribe(path):
-    """转写参考音频 → 文字。用 Groq whisper-large-v3-turbo（中文准确率高）。"""
-    return _groq_transcribe(path)
+    """转写参考音频 → 文字。用 CosyVoice 环境里的 whisper medium 模型。"""
+    cosy_py = pathlib.Path("/content/cosy/env/bin/python")
+    if not cosy_py.exists():
+        return ""
+    try:
+        r = subprocess.run([str(cosy_py), "-c", (
+            "import whisper,sys; m=whisper.load_model('medium',device='cuda'); "
+            "r=m.transcribe(sys.argv[1],fp16=True,language='zh'); "
+            "print(r['text'].strip())"
+        ), str(path)], capture_output=True, text=True, timeout=300)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
     gk = _groq_key()
     if not gk:
         return ""
@@ -474,11 +487,9 @@ def tts():
               "-ar", "16000", "-ac", "1", str(ref_trim)])
     if tr.returncode == 0 and ref_trim.exists():
         ref = ref_trim
-    ref_text = (request.form.get("ref_text") or "").strip()
+    ref_text = _transcribe(str(ref))
     if not ref_text:
-        ref_text = _transcribe(str(ref))
-    if not ref_text:
-        return jsonify({"error": "参考音频转写失败 — 请在「参考音色标注文字」输入框填入参考音频的文字内容"}), 400
+        return jsonify({"error": "参考音频转写失败 — whisper 未能识别中文，请换清晰的中文人声音频"}), 400
 
     # 本机直接跑 CosyVoice
     cosy_dir = pathlib.Path("/content/cosy")
@@ -487,8 +498,6 @@ def tts():
     if not cosy_script.exists():
         return jsonify({"error": "CosyVoice 未安装,请先在安装管理中安装"}), 503
 
-    if not ref_text:
-        return jsonify({"error": "参考音频转写失败 — Groq API 不可用，请检查网络"}), 500
 
     import base64
     t_b64 = base64.b64encode(text.encode()).decode()
