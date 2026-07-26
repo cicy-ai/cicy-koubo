@@ -1065,6 +1065,16 @@ async function pollLog(key) {
             const eng = all.engines.find(e => e.key === key);
             if (eng) updateEngineCard(eng);
           } catch (_) {}
+          // updateEngineCard 重建了 logbox → 重新填充历史日志
+          const newBox = document.getElementById('log-' + key);
+          if (newBox && _openLogs[key]) {
+            newBox.classList.add('show');
+            try {
+              const hist = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
+              newBox.textContent = hist.lines.join('\n').replace(/\r/g, '\n') || '(暂无日志)';
+              newBox.scrollTop = newBox.scrollHeight;
+            } catch (_) {}
+          }
           return;
         }
         if (d.text) { box.textContent += d.text; box.scrollTop = box.scrollHeight; }
