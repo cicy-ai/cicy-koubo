@@ -406,7 +406,9 @@ def cover(job_id):
     return send_file(f, mimetype="image/jpeg") if f.exists() else ("", 404)
 
 
-def _groq_transcribe(path):
+def _transcribe(path):
+    """转写参考音频 → 文字。用 Groq whisper-large-v3-turbo（中文准确率高）。"""
+    return _groq_transcribe(path)
     gk = _groq_key()
     if not gk:
         return ""
@@ -472,7 +474,11 @@ def tts():
               "-ar", "16000", "-ac", "1", str(ref_trim)])
     if tr.returncode == 0 and ref_trim.exists():
         ref = ref_trim
-    ref_text = _groq_transcribe(str(ref))
+    ref_text = (request.form.get("ref_text") or "").strip()
+    if not ref_text:
+        ref_text = _transcribe(str(ref))
+    if not ref_text:
+        return jsonify({"error": "参考音频转写失败 — 请在「参考音色标注文字」输入框填入参考音频的文字内容"}), 400
 
     # 本机直接跑 CosyVoice
     cosy_dir = pathlib.Path("/content/cosy")
