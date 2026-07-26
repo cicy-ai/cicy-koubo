@@ -24,7 +24,8 @@ fi
 echo "[cosy] installing dependencies..."
 pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 cd "$DIR/CosyVoice"
-pip install -q -r requirements.txt 2>/dev/null || pip install -q modelscope huggingface_hub onnxruntime soundfile
+pip install -q huggingface_hub modelscope onnxruntime soundfile
+pip install -q -r requirements.txt 2>/dev/null || true
 apt-get install -qq -y sox libsox-dev 2>/dev/null || true
 
 # Download model
