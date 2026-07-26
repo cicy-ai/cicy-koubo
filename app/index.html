@@ -58,6 +58,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;heigh
 .kv{font-size:12px;color:var(--mut)}
 audio{width:100%;height:34px;margin-top:6px}
 video.prev{width:100%;max-height:480px;background:#0d1418;border-radius:8px;margin-top:6px;display:none;object-fit:contain}
+video.prev::-webkit-media-controls{transition:opacity 0.5s}
+video.prev.no-controls::-webkit-media-controls{opacity:0;pointer-events:none}
 img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 .stage{font-size:12px;color:var(--teal-d);background:var(--teal-l);border-radius:8px;
   padding:7px 10px;margin-top:8px;display:none;line-height:1.5}
@@ -1135,6 +1137,17 @@ async function installEngine(key) {
   }
   previewBase();
   renderTab();loadScriptsTab();loadMediaTab();
+  // 视频控件自动隐藏: 悬停显示, 移出 2s 后淡出
+  document.querySelectorAll('video.prev').forEach(v => {
+    let t;
+    function show(){ clearTimeout(t); v.classList.remove('no-controls'); }
+    function hide(){ t = setTimeout(() => v.classList.add('no-controls'), 2000); }
+    hide();
+    v.addEventListener('mouseenter', show);
+    v.addEventListener('mouseleave', hide);
+    v.addEventListener('play', () => show());
+    v.addEventListener('pause', () => hide());
+  });
 })();
 </script>
 </body>
