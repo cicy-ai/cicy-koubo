@@ -996,12 +996,13 @@ async function pollLog(key) {
     const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
     box.textContent = d.lines.join('\n') || '(暂无日志)';
     box.scrollTop = box.scrollHeight;
+    const wasInstalling = !!_installPolls[key];
     if (d.installing) {
       _installPolls[key] = setTimeout(() => pollLog(key), 2000);
     } else {
       delete _installPolls[key];
-      // 日志保留显示（不自动隐藏），刷新引擎状态
-      if (d.lines.length) refreshEngines();
+      // 安装刚结束：刷新状态一次，不再继续轮询
+      if (wasInstalling && d.lines.length) refreshEngines();
     }
   } catch (e) {
     if (_installPolls[key]) _installPolls[key] = setTimeout(() => pollLog(key), 3000);
