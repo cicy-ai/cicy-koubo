@@ -1499,6 +1499,47 @@ def api_engine_log(engine):
     return jsonify({"lines": lines, "installing": installing})
 
 
+@app.get("/api/engines/<engine>/stream")
+def api_engine_stream(engine):
+    """SSE 实时日志流——安装进度实时推送，不靠轮询。"""
+    if engine not in ENGINES:
+        return jsonify({"error": "unknown engine"}), 404
+    logf = pathlib.Path(ENGINES[engine]["dir"]) / "provision.log"
+    def generate():
+        pos = 0
+        if logf.exists():
+            try:
+                pos = logf.stat().st_size
+            except Exception:
+                pass
+        import time as _time
+        for _ in range(7200):  # max 2h
+            try:
+                if logf.exists():
+                    st = logf.stat()
+                    if st.st_size > pos:
+                        with open(str(logf), "r") as f:
+                            f.seek(pos)
+                            chunk = f.read()
+                            pos = f.tell()
+                        # \r → \n so progress bars don't overwrite
+                        chunk = chunk.replace("\r", "\n")
+                        yield f"data: {json.dumps({'text': chunk})}\n\n"
+            except Exception:
+                pass
+            # check if still installing
+            try:
+                r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=3)
+                if r.returncode != 0:
+                    yield f"data: {json.dumps({'done': True})}\n\n"
+                    return
+            except Exception:
+                pass
+            _time.sleep(0.8)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.post("/api/engines/<engine>/install")
 def api_engine_install(engine):
     if engine not in ENGINES:

@@ -929,7 +929,7 @@ async function openInstallModal() {
 function closeInstallModal() {
   $('imask').style.display = 'none'; $('iModal').style.display = 'none';
   // 关闭时停止所有轮询
-  Object.values(_installPolls).forEach(clearTimeout);
+  Object.values(_installPolls).forEach(s => { try { s.close(); } catch(_) {} });
   _installPolls = {}; _openLogs = {};
 }
 
@@ -981,7 +981,7 @@ function toggleLog(key, auto) {
   if (isOpen) {
     box.classList.remove('show');
     delete _openLogs[key];
-    if (_installPolls[key]) { clearTimeout(_installPolls[key]); delete _installPolls[key]; }
+    if (_installPolls[key]) { try { _installPolls[key].close(); } catch(_) {} delete _installPolls[key]; }
     return;
   }
   _openLogs[key] = true;
@@ -991,22 +991,30 @@ function toggleLog(key, auto) {
 
 async function pollLog(key) {
   const box = document.getElementById('log-' + key);
-  if (!box || !box.classList.contains('show')) { delete _installPolls[key]; return; }
+  if (!box) return;
+  box.classList.add('show');
+  _openLogs[key] = true;
+  // 先拉历史
   try {
     const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
     box.textContent = d.lines.join('\n').replace(/\r/g, '\n') || '(暂无日志)';
     box.scrollTop = box.scrollHeight;
-    const wasInstalling = !!_installPolls[key];
-    if (d.installing) {
-      _installPolls[key] = setTimeout(() => pollLog(key), 2000);
-    } else {
-      delete _installPolls[key];
-      // 安装刚结束：刷新状态一次，不再继续轮询
-      if (wasInstalling && d.lines.length) refreshEngines();
-    }
-  } catch (e) {
-    if (_installPolls[key]) _installPolls[key] = setTimeout(() => pollLog(key), 3000);
-  }
+  } catch (e) {}
+  // SSE 实时流
+  try {
+    const es = new EventSource('/api/engines/' + key + '/stream');
+    _installPolls[key] = es;
+    es.onmessage = e => {
+      if (!box.classList.contains('show')) { es.close(); delete _installPolls[key]; return; }
+      try {
+        const d = JSON.parse(e.data);
+        if (d.done) { es.close(); delete _installPolls[key]; refreshEngines(); return; }
+        if (d.text) { box.textContent += d.text; box.scrollTop = box.scrollHeight; }
+      } catch (_) {}
+    };
+    es.onerror = () => { es.close(); delete _installPolls[key];
+      if (box.classList.contains('show')) setTimeout(() => pollLog(key), 5000); };
+  } catch (e) {}
 }
 
 async function installEngine(key) {
