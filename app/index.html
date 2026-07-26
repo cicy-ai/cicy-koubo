@@ -970,7 +970,18 @@ function updateEngineCard(e) {
   // restore log state
   if (_openLogs[e.key]) {
     const lb = document.getElementById('log-' + e.key);
-    if (lb) { lb.classList.add('show'); lb.textContent = document.getElementById('log-'+e.key+'-cache')?.textContent || ''; }
+    // 保存旧日志内容
+    const oldLog = document.getElementById('log-' + e.key + '-backup');
+    if (lb) { lb.classList.add('show'); lb.textContent = oldLog?.textContent || ''; }
+  }
+  // 为新 logbox 建一个隐藏备份元素存日志
+  const newBox = document.getElementById('log-' + e.key);
+  const oldBackup = document.getElementById('log-' + e.key + '-backup');
+  if (oldBackup && newBox && oldBackup.textContent) {
+    newBox.textContent = oldBackup.textContent;
+    newBox.classList.add('show');
+    newBox.scrollTop = newBox.scrollHeight;
+    oldBackup.remove();
   }
 }
 
@@ -980,10 +991,17 @@ async function refreshEngines() {
     let html = '';
     d.engines.forEach(e => { html += engineCardHTML(e); });
     $('engineList').innerHTML = html;
-    // 恢复之前打开的日志
+    // 恢复之前打开的日志（备份+恢复内容）
     Object.keys(_openLogs).forEach(k => {
+      const oldBox = document.getElementById('log-' + k);
+      if (oldBox && oldBox.textContent) {
+        // 把旧日志存到隐藏备份元素
+        let bu = document.getElementById('log-' + k + '-backup');
+        if (!bu) { bu = document.createElement('div'); bu.id = 'log-' + k + '-backup'; bu.style.display = 'none'; document.body.appendChild(bu); }
+        bu.textContent = oldBox.textContent;
+      }
       const box = document.getElementById('log-' + k);
-      if (box) { box.classList.add('show'); pollLog(k); }
+      if (box) { box.classList.add('show'); box.textContent = oldBox?.textContent || ''; pollLog(k); }
     });
     // 安装中的引擎自动展开日志并轮询
     d.engines.forEach(e => { if (e.installing && !_openLogs[e.key]) { toggleLog(e.key, true); } });
