@@ -1269,6 +1269,7 @@ def _next_free(pattern, fmt):
 def voice_upload():
     if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"error": "缺文件"}), 400
+    (ROOT / "assets").mkdir(parents=True, exist_ok=True)
     raw = WORK / (uuid.uuid4().hex[:8] + "_vup" + pathlib.Path(request.files["file"].filename).suffix)
     request.files["file"].save(raw)
     vid = _next_free("voice", "voice-sample-{:02d}.wav")
@@ -1297,6 +1298,7 @@ def voice_delete():
 def basevideo_upload():
     if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"error": "缺文件"}), 400
+    (ROOT / "assets").mkdir(parents=True, exist_ok=True)
     raw = WORK / (uuid.uuid4().hex[:8] + "_bup" + pathlib.Path(request.files["file"].filename).suffix)
     request.files["file"].save(raw)
     base = _next_free("base", "base-video-{}.mp4")
