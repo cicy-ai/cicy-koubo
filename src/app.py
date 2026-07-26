@@ -96,37 +96,42 @@ def api_logs():
         return Response("(暂无日志)", mimetype="text/plain; charset=utf-8")
 
 
-# GPU 侧安装进度也汇入唯一日志:后台每分钟拉一次 mt/cosy/hg 的关键行,没见过的追加进 pipeline.log
-_PROV_SEEN = set()
+# 持久化各行指纹，避免重启后重复输出
+_PROV_FP = APP_DIR / "prov_seen.json"
+
+def _prov_seen_load():
+    try:
+        return set(json.loads(open(_PROV_FP).read())) if _PROV_FP.exists() else set()
+    except Exception:
+        return set()
+
+def _prov_seen_save(s):
+    try:
+        json.dump(list(s), open(_PROV_FP, "w"))
+    except Exception:
+        pass
 
 def _provision_log_pump():
-    """轮询本地 provision.log，有新行就汇入 pipeline.log"""
-    import glob as _glob
-    positions = {}
+    """2s 轮询本地 provision.log，新行汇入 pipeline.log。"""
+    seen = _prov_seen_load()
     while True:
         try:
             for logf in sorted(pathlib.Path("/content").glob("*/provision.log")):
                 key = logf.parent.name
                 if key not in ENGINES:
                     continue
-                prev = positions.get(key, 0)
                 try:
-                    st = logf.stat()
-                    if st.st_size > prev:
-                        with open(logf, "r") as f:
-                            f.seek(prev)
-                            for line in f:
-                                line = line.rstrip("\n").rstrip("\r")
-                                if line.strip() and (key, line) not in _PROV_SEEN:
-                                    _PROV_SEEN.add((key, line))
-                                    plog(f"[{ENGINES[key]['name']}] {line}")
-                        positions[key] = st.st_size
+                    for line in logf.read_text().splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        fp = f"{key}:{hash(line)}"
+                        if fp not in seen:
+                            seen.add(fp)
+                            plog(f"[{key}] {line}")
+                            _prov_seen_save(seen)
                 except Exception:
                     pass
-            # 清理已不存在的引擎的 position
-            for k in list(positions.keys()):
-                if k not in ENGINES:
-                    del positions[k]
         except Exception:
             pass
         time.sleep(2)
