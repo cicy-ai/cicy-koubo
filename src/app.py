@@ -481,9 +481,12 @@ def tts():
     if not cosy_script.exists():
         return jsonify({"error": "CosyVoice 未安装,请先在安装管理中安装"}), 503
 
+    if not ref_text:
+        return jsonify({"error": "参考音频转写失败 — Groq API 不可用，请检查网络"}), 500
+
     import base64
     t_b64 = base64.b64encode(text.encode()).decode()
-    rt_b64 = base64.b64encode((ref_text or "参考声音").encode()).decode()
+    rt_b64 = base64.b64encode(ref_text.encode()).decode()
 
     out_wav = cosy_dir / f"tts_{jid}.wav"
     done_file = cosy_dir / f"tts_{jid}.done"
