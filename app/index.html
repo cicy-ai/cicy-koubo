@@ -516,7 +516,7 @@ function toggleGenMode(){
 async function pollJob(jid,btn,mode){
   try{
     const d=await (await fetch('/api/job/'+jid)).json();
-    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true)}
+    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);btn.disabled=false;btn.textContent='🎬 生成视频';return}
     else if(d.result){
       stage('genStage','');$('genStage').style.display='none';
       $('resultPrev').src='/api/result/'+jid;$('resultPrev').style.display='block';

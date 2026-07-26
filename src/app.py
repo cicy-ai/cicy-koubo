@@ -260,11 +260,11 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 if r.returncode != 0 or not result.exists():
                     raise RuntimeError("simple compose failed: " + r.stderr[:300])
         else:
-            j["stage"] = "上传素材到 GPU"
-            log("scp base + audio → Colab")
+            j["stage"] = "准备素材"
+            log("copy base + audio → 本地 GPU")
             r = run(SCP + [str(norm), str(audio_path), REMOTE + ":/content/"], timeout=180)
             if r.returncode != 0:
-                raise RuntimeError("scp upload failed: " + r.stderr[:300])
+                raise RuntimeError("copy failed: " + r.stderr[:300])
 
             engine = opts.get("engine") or "musetalk"
             # 兼容前端 engine key
@@ -285,7 +285,7 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
             j["stage"] = "取回成片"
             r = run(SCP + [REMOTE + ":" + out_remote, str(result)], timeout=180)
             if r.returncode != 0 or not result.exists():
-                raise RuntimeError("scp download failed: " + r.stderr[:300])
+                raise RuntimeError("copy download failed: " + r.stderr[:300])
 
         if opts.get("sharp"):
             j["stage"] = "牙齿高清(锐化增强)"
