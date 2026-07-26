@@ -1,0 +1,8 @@
+{
+  "base": {
+    "base-video-1": "base-video-2-25fps-07261448"
+  },
+  "voice": {
+    "voice-sample-01.wav": "voice-sample-01"
+  }
+}

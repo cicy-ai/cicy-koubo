@@ -1416,6 +1416,8 @@ def voice_upload():
         return jsonify({"error": "音频转换失败: " + r.stderr[:200]}), 400
     name = (request.form.get("name") or "").strip()
     if name:
+        import datetime
+        name = f"{name}-{datetime.datetime.now().strftime('%m%d%H%M')}"
         _meta_set("voice", vid, name)
     return jsonify({"id": vid, "name": name or vid, "duration": _ffdur(dst)})
 
