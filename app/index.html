@@ -189,14 +189,14 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <input class="inp" id="dyUrl" placeholder="1.58 复制打开抖音… https://v.douyin.com/xxxx/">
       <button class="btn ghost" onclick="$('dyUrl').value='';persist($('dyUrl'))" title="清空">✕</button>
     </div>
-    <button class="btn big" id="btn-extract" onclick="extract()">提取视频文案</button>
+    <button class="btn big" id="btn-extract" onclick="extract()">1. 提取视频文案</button>
     <div class="lbl">原始文案(可手动输入)</div>
     <textarea class="ta" id="script1" placeholder="粘贴抖音链接点提取,或手动输入原始文案"></textarea>
     <div class="row">
       <input class="inp" id="style" placeholder="改写风格/行业(选填,如:改成乡镇奶茶店)">
       <button class="btn ghost" onclick="openPrompt()" title="编辑改写提示词">⚙</button>
     </div>
-    <button class="btn big" id="btn-rewrite" onclick="rewrite()">AI 仿写改写</button>
+    <button class="btn big" id="btn-rewrite" onclick="rewrite()">2. AI 仿写改写</button>
     <div class="lbl">改写后文案(配音优先用这份)</div>
     <textarea class="ta" id="script2" placeholder="改写结果;也可直接编辑"></textarea>
     <button class="btn big ghost" id="btn-title" onclick="genTitle()">生成标题 / 话题 / 封面文案</button>
@@ -222,7 +222,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <option value="whole">整段生成(语气连贯,长文可能截断)</option>
     </select>
     <div style="height:10px"></div>
-    <button class="btn big" id="btn-tts" onclick="genAudio()">🎙 生成配音</button>
+    <button class="btn big" id="btn-tts" onclick="genAudio()">3. 🎙 生成配音</button>
     <div class="stage" id="ttsStage"></div>
     <div class="lbl" style="margin-top:12px">配音结果 <span class="kv" id="ttsInfo"></span></div>
     <audio id="ttsPlayer" controls style="display:none"></audio>
@@ -251,7 +251,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
     </div>
-    <button class="btn big" id="btn-gen" onclick="genVideo()">🎬 生成视频</button>
+    <button class="btn big" id="btn-gen" onclick="genVideo()">4. 🎬 生成视频</button>
     <div class="stage" id="genStage"></div>
     <div class="lbl" style="margin-top:12px">成片 <span class="kv" id="genInfo"></span></div>
     <video class="prev" id="resultPrev" controls playsinline></video>
@@ -280,7 +280,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     </div>
     <div class="row"><span class="kv">音量</span><input type="range" id="bgmVol" min="0.05" max="0.8" step="0.05" value="0.2"
       oninput="$('bgmV').textContent=Math.round(this.value*100)+'%'"><b class="kv" id="bgmV">20%</b></div>
-    <button class="btn big" id="btn-edit" onclick="editVideo()">✂️ 剪辑(烧字幕 + 混BGM)</button>
+    <button class="btn big" id="btn-edit" onclick="editVideo()">5. ✂️ 剪辑(烧字幕 + 混BGM)</button>
     <div class="stage" id="editStage"></div>
     <video class="prev" id="editPrev" controls playsinline></video>
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-edit-dl" onclick="dlEdit()" disabled>⬇ 下载剪辑成片</button></div>
