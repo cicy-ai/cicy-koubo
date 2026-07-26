@@ -3,8 +3,6 @@
     "base-video-1": "base-video-2-25fps-07261448"
   },
   "voice": {
-    "voice-sample-01.wav": "voice-sample-01",
-    "voice-sample-02.wav": "voice-sample-01-07261521",
-    "voice-sample-03.wav": "voice-sample-03-07261523"
+    "voice-sample-01.wav": "voice-sample-01"
   }
 }

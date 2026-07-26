@@ -181,9 +181,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 <div class="wrap">
 <div class="flow">
 
-  <!-- ① 提取文案 -->
+  <!-- ① 文案 -->
   <div class="card">
-    <div class="step"><span class="n">1</span><h2>提取文案</h2><span class="tip">粘贴链接 → 提取</span></div>
+    <div class="step"><span class="n">1</span><h2>文案</h2><span class="tip">提取 → 仿写 → 标题</span></div>
     <div class="lbl">🎯 对标视频链接(抖音分享文本直接粘)</div>
     <div class="row" style="margin-top:0">
       <input class="inp" id="dyUrl" placeholder="1.58 复制打开抖音… https://v.douyin.com/xxxx/">
@@ -192,11 +192,6 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <button class="btn big" id="btn-extract" onclick="extract()">提取视频文案</button>
     <div class="lbl">原始文案(可手动输入)</div>
     <textarea class="ta" id="script1" placeholder="粘贴抖音链接点提取,或手动输入原始文案"></textarea>
-  </div>
-
-  <!-- ② 方案改写 -->
-  <div class="card">
-    <div class="step"><span class="n">2</span><h2>方案改写</h2><span class="tip">AI 仿写 + 标题</span></div>
     <div class="row">
       <input class="inp" id="style" placeholder="改写风格/行业(选填,如:改成乡镇奶茶店)">
       <button class="btn ghost" onclick="openPrompt()" title="编辑改写提示词">⚙</button>
@@ -208,9 +203,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <textarea class="ta small" id="titleOut" placeholder="标题 / 话题 / 封面文案…"></textarea>
   </div>
 
-  <!-- ③ 配音 -->
+  <!-- ② 配音 -->
   <div class="card">
-    <div class="step"><span class="n">3</span><h2>配音</h2><span class="tip">CosyVoice 声音克隆</span></div>
+    <div class="step"><span class="n">2</span><h2>配音</h2><span class="tip">CosyVoice 声音克隆</span></div>
     <div class="lbl">参考音色(素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('upVoice').click()">+ 上传</button></div>
     <div class="row" style="margin-top:0">
       <select id="refSel"></select>
@@ -236,9 +231,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <input type="file" id="audFile" accept="audio/*" hidden>
   </div>
 
-  <!-- ④ 生成视频 -->
+  <!-- ③ 出片 -->
   <div class="card">
-    <div class="step"><span class="n">4</span><h2>生成视频</h2><span class="tip">对口型</span></div>
+    <div class="step"><span class="n">3</span><h2>出片</h2><span class="tip">对口型</span></div>
     <div class="lbl">🎬 底板视频(数字人形象,素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('vidFile').click()">+ 上传</button></div>
     <div class="row" style="margin-top:0">
       <select id="baseSel" onchange="previewBase()"></select>
@@ -263,9 +258,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-gen-dl" onclick="dlResult()" disabled>⬇ 下载成片</button></div>
   </div>
 
-  <!-- ⑤ 剪辑 · 封面 -->
+  <!-- ④ 剪辑 · 封面 -->
   <div class="card">
-    <div class="step"><span class="n">5</span><h2>剪辑</h2><span class="tip">字幕 + BGM + 封面</span></div>
+    <div class="step"><span class="n">4</span><h2>剪辑 · 封面</h2><span class="tip">字幕 + BGM + 封面</span></div>
     <div class="lbl">字幕(SRT 可编辑;纯文本=整屏;留空不加)
       <button class="btn ghost" style="margin-left:auto;padding:4px 10px;font-size:12px" id="btn-srt" onclick="genSrt()">按配音生成</button>
     </div>
@@ -474,7 +469,7 @@ function dlTts(){if(voiceId)location.href='/api/media/'+voiceId+'/file'}
 function stage(id,msg,err){const el=$(id);el.style.display=msg?'block':'none';
   el.textContent=msg;el.className='stage'+(err?' err':'')}
 
-/* ---------- ④ 生成视频 ---------- */
+/* ---------- ③ 出片 ---------- */
 let videoBlob=null,curJob=localStorage.getItem(PK+'curJob')||'';
 function previewBase(){
   const v=$('baseSel').value;if(!v)return;
@@ -538,7 +533,7 @@ async function pollJob(jid,btn,mode){
 }
 function dlResult(){if(curJob)location.href='/api/result/'+curJob}
 
-/* ---------- ⑤ 剪辑 ---------- */
+/* ---------- ④ 剪辑 · 封面 ---------- */
 let editUrl='',coverUrl='';
 async function genSrt(){
   if(!voiceId&&!audioBlob)return toast('先生成配音(或上传音频)');
@@ -814,10 +809,10 @@ function videoModal(src){$('vmask').style.display='block';const m=$('vmodal');
 function closeVideo(){const m=$('vmodal'),v=m.querySelector('video');
   v.pause();v.removeAttribute('src');v.load();m.style.display='none';$('vmask').style.display='none'}
 /* 选用 */
-function useVoiceAsset(id){$('refSel').value=id;persist($('refSel'));toast('已设为配音参考音色(步骤③)');renderTab()}
-function useBgm(id){$('bgmSel').value=id;persist($('bgmSel'));toast('已设为剪辑 BGM(步骤⑤)');renderTab()}
+function useVoiceAsset(id){$('refSel').value=id;persist($('refSel'));toast('已设为配音参考音色(步骤②)');renderTab()}
+function useBgm(id){$('bgmSel').value=id;persist($('bgmSel'));toast('已设为剪辑 BGM(步骤④)');renderTab()}
 function useBase(id){$('baseSel').value=id;persist($('baseSel'));previewBase();
-  toast('已选中该底板并预览(步骤④)');renderTab()}
+  toast('已选中该底板并预览(步骤③)');renderTab()}
 /* 内联重命名 */
 function renameInline(btn){
   const nm=btn.closest('.acard').querySelector('.aname');
@@ -871,7 +866,7 @@ function useMedia(id){
   const m=(window._media||[]).find(x=>x.id===id);if(!m)return;
   if(m.type!=='voice')return;
   setVoice(m.id,m.duration,m.chars);
-  toast('✅ 已设为当前配音(步骤③)——直接点「生成视频」即可用它出片,不用重新合成');
+  toast('✅ 已设为当前配音(步骤②)——直接点「生成视频」即可用它出片,不用重新合成');
   window.scrollTo({top:0,behavior:'smooth'});
 }
 async function noteMedia(id){
