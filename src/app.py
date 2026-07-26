@@ -1511,7 +1511,8 @@ def api_engine_install(engine):
     except Exception:
         pass
     logf = script.parent / "provision.log"
-    logf.write_text(f"=== install started at {time.strftime('%Y-%m-%dT%H:%M:%SZ')} ===\n")
+    if not logf.exists():
+        logf.write_text(f"=== install started at {time.strftime('%Y-%m-%dT%H:%M:%SZ')} ===\n")
     subprocess.Popen(["nohup", "bash", str(script)],
                      stdout=open(str(logf), "a"), stderr=subprocess.STDOUT,
                      start_new_session=True, cwd=str(script.parent))
