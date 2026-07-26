@@ -610,6 +610,8 @@ async function loadSelects(){
     fetch('/api/engines').then(r=>r.json())]);
   fillSel('refSel',vs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'refSel'));
   fillSel('baseSel',bs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'baseSel'));
+  // 选中值存在但后台初始化会丢: fillSel 确认后主动触发 onchange 同步预览
+  if ($('baseSel').value) previewBase();
   fillSel('bgmSel',[['','不用 BGM'],...gs.map(v=>[v.id,`${v.name}(${Math.round(v.duration)}s)`])],localStorage.getItem(PK+'bgmSel'));
   fillSel('subFont',fs.map(f=>[f.id,f.name]),localStorage.getItem(PK+'subFont'));
   $('cnt-voice').textContent=vs.length;$('cnt-base').textContent=bs.length;$('cnt-bgm').textContent=gs.length;
