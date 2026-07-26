@@ -717,8 +717,10 @@ def _font_path(fid):
     if os.path.exists(p):
         return p
     for c in (FONTS["heiti"][0],                                   # macOS
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",   # Linux/Colab
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",   # Linux/Colab Noto CJK
               "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+              "/content/SourceHanSansCN-Heavy.otf",                    # 用户上传字体(Colab /content)
+              "/content/SourceHanSansCN-Bold.otf",
               "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
         if os.path.exists(c):
             return c
