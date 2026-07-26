@@ -740,14 +740,25 @@ def _hex_rgba(s, default):
         return default
 
 
+def _load_font(fid, size):
+    """加载字体。文件路径方式对部分 OTF(CFF) 有 bug，回退到 bytes 加载。"""
+    from PIL import ImageFont
+    p = _font_path(fid)
+    try:
+        return ImageFont.truetype(p, size)
+    except OSError:
+        with open(p, "rb") as ff:
+            return ImageFont.truetype(ff, size)
+
+
 def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="#000000", mb=60, font_id="heavy"):
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     fs = fontsize if fontsize and fontsize >= 16 else max(28, int(w * 0.06))
     fg = _hex_rgba(color, (255, 255, 255, 255))
     og = _hex_rgba(outline, (0, 0, 0, 255))
-    font = ImageFont.truetype(_font_path(font_id), fs)
+    font = _load_font(font_id, fs)
     maxw = w * 0.86
     lines, cur = [], ""
     for ch in text:
@@ -957,7 +968,7 @@ def gen_cover():
         if title:
             d = ImageDraw.Draw(img)
             fs = max(48, int(w * 0.09))
-            font = ImageFont.truetype(_font_path("heavy"), fs)
+            font = _load_font("heavy", fs)
             maxw = w * 0.88
             lines, cur = [], ""
             for ch in title:
