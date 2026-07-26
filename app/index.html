@@ -898,7 +898,11 @@ async function uploadAsset(file,ep){
     else{
       toast(`✅ 已入库:${d.name}(${d.duration}s)`);
       if (ep === UP_EP.base && d.id) {
-        $('baseSel').value = d.id; persist($('baseSel')); previewBase(); renderTab(); loadSelects();
+        localStorage.setItem(PK + 'baseSel', d.id);
+        await loadSelects();
+        $('baseSel').value = d.id;
+        previewBase();
+        renderTab();
       } else { renderTab(); loadSelects(); }
     }
   } catch(e) { toast('上传失败: '+e.message); }
