@@ -138,6 +138,27 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 .modal{position:fixed;left:50%;top:12%;transform:translateX(-50%);width:min(680px,92vw);
   background:#fff;border-radius:12px;padding:16px;z-index:61;display:none}
 .modal h3{margin:0 0 10px;font-size:15px}
+
+/* 安装管理 modal */
+.sysbar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.syschip{flex:1;min-width:100px;background:#f6f8fa;border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;font-size:12px;line-height:1.5}
+.syschip .sl{color:var(--mut);font-size:11px}
+.syschip .sv{font-weight:600;color:var(--ink)}
+.eline{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px;
+  display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.eline .ei{font-size:26px;flex:none;width:36px;text-align:center}
+.eline .eb{flex:1;min-width:200px}
+.eline .en{font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.eline .ev{font-size:11px;color:var(--mut);margin-top:3px}
+.logbox{background:#0d141a;color:#b3c7d4;font-family:monospace;font-size:11px;border-radius:8px;
+  padding:8px 10px;max-height:240px;overflow-y:auto;white-space:pre-wrap;margin-top:8px;display:none}
+.logbox.show{display:block}
+.badge2{font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
+.badge2.yes{background:var(--teal-l);color:var(--teal-d)}
+.badge2.no{background:#fdf0ee;color:var(--red)}
+.badge2.ing{background:#fef7e8;color:var(--amber)}
+
 </style>
 </head>
 <body>
@@ -148,9 +169,8 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <span class="pill"><i class="dot" id="d-tun"></i>GPU隧道 <b id="t-tun" style="font-weight:500">检测中</b></span>
     <span class="pill"><i class="dot" id="d-au"></i>配音 <b id="t-au" style="font-weight:500">-</b></span>
     <span class="pill"><i class="dot" id="d-vi"></i>出片 <b id="t-vi" style="font-weight:500">-</b></span>
-    <a class="btn ghost" id="colabBtn" style="text-decoration:none;padding:7px 12px" target="_blank"
-       href="https://colab.research.google.com/github/cicy-ai/cicy-tools/blob/main/colab-digital-human.ipynb"
-       title="打开预装 notebook,点「全部运行」即可">🚀 Colab 一键装</a>
+    <a class="btn ghost" id="colabBtn" style="text-decoration:none;padding:7px 12px;cursor:pointer"
+       onclick="openInstallModal()">⚙️ 安装管理</a>
     <a class="btn ghost" style="text-decoration:none;padding:7px 12px" target="_blank"
        href="/api/logs" title="唯一日志:安装进度 + 配音/出片/剪辑全过程">📄 日志</a>
   </div>
@@ -317,6 +337,17 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
 <div id="toast"></div>
 
+<!-- 安装管理 modal -->
+<div class="mask" id="imask" onclick="closeInstallModal()"></div>
+<div class="modal" id="iModal" style="width:min(720px,94vw);max-height:85vh;overflow-y:auto">
+  <h3>⚙️ 安装管理 <span style="font-size:12px;color:var(--mut);font-weight:400" id="iTitle">加载中…</span></h3>
+  <div class="sysbar" id="sysBar"></div>
+  <div id="engineList"></div>
+  <div style="text-align:right;margin-top:10px">
+    <button class="btn ghost" onclick="closeInstallModal()">关闭</button>
+  </div>
+</div>
+
 <script>
 const $=id=>document.getElementById(id);
 const PK='krv8:';
@@ -342,7 +373,7 @@ async function refreshStatus(){
       s.audio_service==='ready'?'就绪':(s.tunnel!=='ready'?'离线':'装载中'));
     setPill('vi', s.video_service==='ready'?'ok':(s.tunnel!=='ready'?'bad':'wait'),
       s.video_service==='ready'?'就绪':(s.tunnel!=='ready'?'离线':'装载中'));
-    const cb=$('colabBtn');if(cb)cb.className=s.tunnel==='ready'?'btn ghost':'btn';
+    const cb=$('colabBtn');if(cb)cb.className='btn ghost';
   }catch(e){setPill('tun','bad','后端断开');setPill('au','bad','-');setPill('vi','bad','-')}
 }
 function setPill(k,cls,txt){$('d-'+k).className='dot '+cls;$('t-'+k).textContent=txt}
@@ -872,6 +903,120 @@ function bindUploads(){
   bindDrop('vidDrop','vidFile',f=>{videoBlob=f;
     $('basePrev').src=URL.createObjectURL(f);$('basePrev').style.display='block';
     $('vidDrop').textContent='✅ '+f.name+'(优先于底板库)';toast('已选本地底板')});
+}
+
+/* ---------- 安装管理 ---------- */
+let _installPolls = {};
+let _openLogs = {};
+function fmtGB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
+
+async function openInstallModal() {
+  $('imask').style.display = 'block'; $('iModal').style.display = 'block';
+  $('iTitle').textContent = '';
+  // 系统信息
+  try {
+    const s = await (await fetch('/api/system')).json();
+    $('sysBar').innerHTML =
+      `<div class="syschip"><div class="sl">🖥 GPU</div><div class="sv">${s.gpu_name||'无'} · ${fmtGB(s.gpu_memory_mb)}${s.cuda_version?' · CUDA '+s.cuda_version:''}</div></div>
+       <div class="syschip"><div class="sl">⚙️ CPU</div><div class="sv">${s.cpu_cores} 核 · RAM ${s.ram_gb}GB</div></div>
+       <div class="syschip"><div class="sl">💾 硬盘</div><div class="sv">${s.disk_total_gb}GB · 可用 ${s.disk_free_gb}GB</div></div>
+       <div class="syschip"><div class="sl">🐍 Python</div><div class="sv">${s.python_version||'?'}${s.is_colab?' · Colab':''}</div></div>`;
+    $('iTitle').textContent = (s.is_colab ? 'Colab · ' : '') + 'GPU '+ (s.gpu_name || 'N/A');
+  } catch (e) { $('sysBar').innerHTML = '<span style="color:var(--red)">加载系统信息失败</span>'; }
+  await refreshEngines();
+}
+
+function closeInstallModal() {
+  $('imask').style.display = 'none'; $('iModal').style.display = 'none';
+  // 关闭时停止所有轮询
+  Object.values(_installPolls).forEach(clearTimeout);
+  _installPolls = {}; _openLogs = {};
+}
+
+async function refreshEngines() {
+  try {
+    const d = await (await fetch('/api/engines')).json();
+    let html = '';
+    d.engines.forEach(e => {
+      const icon = e.installed ? '🟢' : (e.installing ? '🟡' : '🔴');
+      const badge = e.installed
+        ? '<span class="badge2 yes">已安装</span>'
+        : (e.installing ? '<span class="badge2 ing">安装中…</span>' : '<span class="badge2 no">未安装</span>');
+      let verHtml = '';
+      if (e.installed && Object.keys(e.version_info).length) {
+        verHtml = '<div class="ev">' + Object.entries(e.version_info)
+          .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
+      }
+      const btn = e.installing
+        ? '<button class="btn ghost" disabled style="font-size:12px">⏳ 安装中…</button>'
+        : `<button class="btn ghost" style="font-size:12px" onclick="installEngine('${e.key}')">${e.installed?'🔄 重装':'📥 安装'}</button>`;
+      html += `<div class="eline">
+        <div class="ei">${icon}</div>
+        <div class="eb">
+          <div class="en">${e.name} ${badge} ${e.has_script?'':'(缺安装脚本)'}</div>
+          ${verHtml}
+        </div>
+        <div style="flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+          ${btn}
+          <button class="btn ghost" style="font-size:11px" onclick="toggleLog('${e.key}')">📄 日志</button>
+        </div>
+      </div>
+      <div class="logbox" id="log-${e.key}" data-engine="${e.key}"></div>`;
+    });
+    $('engineList').innerHTML = html;
+    // 恢复之前打开的日志
+    Object.keys(_openLogs).forEach(k => {
+      const box = document.getElementById('log-' + k);
+      if (box) { box.classList.add('show'); pollLog(k); }
+    });
+    // 安装中的引擎自动展开日志并轮询
+    d.engines.forEach(e => { if (e.installing && !_openLogs[e.key]) { toggleLog(e.key, true); } });
+  } catch (e) { $('engineList').innerHTML = '<div class="empty">加载引擎状态失败</div>'; }
+}
+
+function toggleLog(key, auto) {
+  const box = document.getElementById('log-' + key);
+  if (!box) return;
+  const isOpen = box.classList.contains('show');
+  if (isOpen) {
+    box.classList.remove('show');
+    delete _openLogs[key];
+    if (_installPolls[key]) { clearTimeout(_installPolls[key]); delete _installPolls[key]; }
+    return;
+  }
+  _openLogs[key] = true;
+  box.classList.add('show');
+  pollLog(key);
+}
+
+async function pollLog(key) {
+  const box = document.getElementById('log-' + key);
+  if (!box || !box.classList.contains('show')) { delete _installPolls[key]; return; }
+  try {
+    const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
+    box.textContent = d.lines.join('\n') || '(暂无日志)';
+    box.scrollTop = box.scrollHeight;
+    if (d.installing) {
+      _installPolls[key] = setTimeout(() => pollLog(key), 2000);
+    } else {
+      delete _installPolls[key];
+      // 日志保留显示（不自动隐藏），刷新引擎状态
+      if (d.lines.length) refreshEngines();
+    }
+  } catch (e) {
+    if (_installPolls[key]) _installPolls[key] = setTimeout(() => pollLog(key), 3000);
+  }
+}
+
+async function installEngine(key) {
+  if (!confirm('确定要安装/重装 '+key+' 吗？这会覆盖之前的安装。')) return;
+  try {
+    const d = await (await fetch('/api/engines/' + key + '/install', { method: 'POST' })).json();
+    if (d.error) { toast(d.error); return; }
+    toast((d.already_running ? '已在安装中' : '已启动安装') + ': ' + key);
+    await refreshEngines();
+    setTimeout(() => toggleLog(key, true), 500);
+  } catch (e) { toast('安装失败: ' + e); }
 }
 
 /* ---------- 启动 ---------- */

@@ -1395,6 +1395,129 @@ def media_update():
     return jsonify({"ok": True})
 
 
+# ═══════════ 安装管理 ═══════════
+ENGINES = {
+    "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg"},
+    "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt"},
+    "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy"},
+}
+
+
+@app.get("/api/system")
+def api_system():
+    import shutil
+    info = {"gpu_name": "", "gpu_memory_mb": 0, "gpu_free_mb": 0,
+            "cpu_cores": os.cpu_count() or 0,
+            "ram_gb": 0, "disk_total_gb": 0, "disk_free_gb": 0,
+            "python_version": "", "cuda_version": "",
+            "is_colab": pathlib.Path("/content").exists()}
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+        parts = (r.stdout or "").strip().split(",")
+        if len(parts) >= 3:
+            info["gpu_name"] = parts[0].strip()
+            info["gpu_memory_mb"] = int(parts[1].strip())
+            info["gpu_free_mb"] = int(parts[2].strip())
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or "").splitlines():
+            if "CUDA Version:" in line:
+                info["cuda_version"] = line.split("CUDA Version:")[-1].strip().split()[0]
+    except Exception:
+        pass
+    mem = shutil.disk_usage("/")
+    info["disk_total_gb"] = round(mem.total / (1024**3), 1)
+    info["disk_free_gb"] = round(mem.free / (1024**3), 1)
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if "MemTotal:" in line:
+                    info["ram_gb"] = round(int(line.split()[1]) / (1024**2), 1)
+                    break
+    except Exception:
+        pass
+    try:
+        r = subprocess.run([sys.executable, "--version"], capture_output=True, text=True, timeout=5)
+        info["python_version"] = (r.stdout or r.stderr).strip().split()[-1]
+    except Exception:
+        pass
+    return jsonify(info)
+
+
+@app.get("/api/engines")
+def api_engines():
+    out = []
+    for key, cfg in ENGINES.items():
+        ready = pathlib.Path(cfg["ready"])
+        installed = ready.exists()
+        version_info = {}
+        if installed:
+            try:
+                for line in ready.read_text().strip().splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        version_info[k.strip()] = v.strip()
+            except Exception:
+                pass
+        installing = False
+        try:
+            r = subprocess.run(["pgrep", "-f", f"provision.sh.*{key}"], capture_output=True, timeout=5)
+            installing = r.returncode == 0
+        except Exception:
+            pass
+        has_script = (pathlib.Path(cfg["dir"]) / "provision.sh").exists()
+        out.append({"key": key, "name": cfg["name"],
+                    "installed": installed, "installing": installing,
+                    "version_info": version_info, "has_script": has_script})
+    return jsonify({"engines": out})
+
+
+@app.get("/api/engines/<engine>/log")
+def api_engine_log(engine):
+    if engine not in ENGINES:
+        return jsonify({"error": "unknown engine"}), 404
+    logf = pathlib.Path(ENGINES[engine]["dir"]) / "provision.log"
+    if not logf.exists():
+        return jsonify({"lines": [], "installing": False})
+    tail = request.args.get("tail", 200, type=int)
+    try:
+        lines = logf.read_text().splitlines()[-tail:]
+    except Exception:
+        lines = []
+    installing = False
+    try:
+        r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=5)
+        installing = r.returncode == 0
+    except Exception:
+        pass
+    return jsonify({"lines": lines, "installing": installing})
+
+
+@app.post("/api/engines/<engine>/install")
+def api_engine_install(engine):
+    if engine not in ENGINES:
+        return jsonify({"error": "unknown engine"}), 404
+    cfg = ENGINES[engine]
+    script = pathlib.Path(cfg["dir"]) / "provision.sh"
+    if not script.exists():
+        return jsonify({"error": f"{cfg['name']} 安装脚本不存在 — 请先准备 {script}"}), 404
+    try:
+        r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=5)
+        if r.returncode == 0:
+            return jsonify({"ok": True, "already_running": True, "log_path": str(script.parent / "provision.log")})
+    except Exception:
+        pass
+    logf = script.parent / "provision.log"
+    logf.write_text(f"=== install started at {time.strftime('%Y-%m-%dT%H:%M:%SZ')} ===\n")
+    subprocess.Popen(["nohup", "bash", str(script)],
+                     stdout=open(str(logf), "a"), stderr=subprocess.STDOUT,
+                     start_new_session=True, cwd=str(script.parent))
+    return jsonify({"ok": True, "started": True, "log_path": str(logf)})
+
+
 @app.get("/")
 def index():
     return Response((SRC_DIR / "index.html").read_text(encoding="utf-8"), mimetype="text/html")
