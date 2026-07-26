@@ -1584,7 +1584,7 @@ def api_llm_keys():
             proto = (p.get("protocol") or "").lower()
             pkey = p.get("key", "")
             # 只展示豆包(配音)和 deepseek(改写/提取)
-            if pkey not in ("deepseek", "deepseek_claude", "doubaoVoice"):
+            if pkey not in ("deepseek", "deepseek_claude", "doubaoVoice", "doubao"):
                 continue
             if proto in ("openai", "anthropic", "voice"):
                 masked = k[:4] + "****" + k[-4:] if len(k) > 10 else ("****" if k else "未设置")
