@@ -538,7 +538,8 @@ async function genSrt(){
   const b=$('btn-srt');b.disabled=true;b.textContent='识别中…';
   try{
     let blob=audioBlob;
-    if(!blob)blob=await (await fetch('/api/media/'+voiceId+'/file')).blob();
+    if(!blob&&voiceId)blob=await (await fetch('/api/media/'+voiceId+'/file')).blob();
+    if(!blob){toast('请先生成配音');b.disabled=false;b.textContent='按配音生成';return;}
     const fd=new FormData();fd.append('audio',blob,'a.wav');
     const d=await (await fetch('/api/srt',{method:'POST',body:fd})).json();
     if(d.error)toast(d.error);
