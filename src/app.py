@@ -267,6 +267,8 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 raise RuntimeError("scp upload failed: " + r.stderr[:300])
 
             engine = opts.get("engine") or "musetalk"
+            # 兼容前端 engine key
+            engine = {"mt": "musetalk", "hg": "heygem"}.get(engine, engine)
             j["stage"] = ("HeyGem" if engine == "heygem" else "MuseTalk") + " 对口型(数分钟)"
             log(f"run {engine} on GPU")
             rv, ra = norm.name, pathlib.Path(audio_path).name
@@ -372,6 +374,8 @@ def generate_video():
         ap = None
     bbox = request.form.get("bbox", "0")
     engine = request.form.get("engine") or "musetalk"
+    # 兼容前端 engine key
+    engine = {"mt": "musetalk", "hg": "heygem"}.get(engine, engine)
     if mode != "simple" and engine == "heygem" and \
             not _ssh_check("test -f /content/hg/HG_READY && echo OK", "OK"):
         return jsonify({"error": "HeyGem 引擎未安装:在 Colab notebook 里运行「可选:安装 HeyGem」cell(需 ≥16GB 显存)"}), 503
@@ -1479,6 +1483,17 @@ if pathlib.Path("/content").exists():
                 import shutil as _sh
                 _sh.copy(src_script, dst_script)
                 dst_script.chmod(0o755)
+
+# 启动时预置 BGM（从项目脚本目录 seed 到 assets/bgm/，不覆盖已存在的）
+_BGM_SEED = SRC_DIR.parent / "scripts" / "provision" / "bgm-prebuild"
+if _BGM_SEED.exists():
+    _bgm_dir = ROOT / "assets/bgm"
+    _bgm_dir.mkdir(parents=True, exist_ok=True)
+    for _sf in _BGM_SEED.glob("*.mp3"):
+        _df = _bgm_dir / _sf.name
+        if not _df.exists():
+            import shutil as _sh
+            _sh.copy(_sf, _df)
 
 
 @app.get("/api/system")

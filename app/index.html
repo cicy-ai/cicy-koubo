@@ -232,24 +232,20 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
   <!-- ③ 出片 -->
   <div class="card">
     <div class="step"><span class="n">3</span><h2>出片</h2><span class="tip">对口型</span></div>
-    <div class="lbl">🎬 底板视频(数字人形象,素材库可增删改)</div>
+    <div class="lbl">🎬 底板视频(数字人形象,素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('vidFile').click()">+ 上传</button></div>
     <div class="row" style="margin-top:0">
       <select id="baseSel" onchange="previewBase()"></select>
     </div>
-    <div class="drop" id="vidDrop" onclick="$('vidFile').click()">或 点击/拖入本地底板视频(mp4)</div>
     <input type="file" id="vidFile" accept="video/mp4,video/quicktime" hidden>
     <video class="prev" id="basePrev" muted controls playsinline></video>
     <div class="lbl">生成模式</div>
-    <select id="genMode">
+    <select id="genMode" onchange="toggleGenMode()">
       <option value="lipsync">对口型(数字人,需 GPU)</option>
-      <option value="simple">仅底板合成(本机秒出,不对口型)</option>
+      <option value="simple">底板测试(本机秒出,不对口型)</option>
     </select>
-    <div class="lbl">对口型引擎</div>
-    <select id="engine">
-      <option value="musetalk">MuseTalk(默认 · 6GB显存即可 · 快)</option>
-      <option value="heygem">HeyGem(实验 · 效果更好 · 需≥16GB显存)</option>
-    </select>
-    <div class="row" style="margin-top:10px">
+    <div class="lbl" id="lblEngine">对口型引擎</div>
+    <select id="engine"></select>
+    <div class="row" id="rowEngineOpts" style="margin-top:10px">
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
     </div>
@@ -490,7 +486,7 @@ async function genVideo(){
   const hasAudio=!!(audioBlob||voiceId);
   let mode=$('genMode').value;
   if(!hasAudio&&mode==='lipsync'){
-    if(!confirm('没有配音/音频,只能「仅底板合成」出无声片。继续?'))return;
+    if(!confirm('没有配音/音频,只能「底板测试」出无声片。继续?'))return;
     mode='simple';
   }
   const b=$('btn-gen');b.disabled=true;b.textContent='生成中…';
@@ -508,10 +504,16 @@ async function genVideo(){
     const d=await (await fetch('/api/generate-video',{method:'POST',body:fd})).json();
     if(d.error){stage('genStage','❌ '+d.error,true);b.disabled=false;b.textContent='🎬 生成视频';return}
     curJob=d.job_id;localStorage.setItem(PK+'curJob',curJob);
-    pollJob(d.job_id,b);
+    pollJob(d.job_id,b,mode);
   }catch(e){stage('genStage','❌ '+e,true);b.disabled=false;b.textContent='🎬 生成视频'}
 }
-async function pollJob(jid,btn){
+function toggleGenMode(){
+  const m=$('genMode').value;
+  $('lblEngine').style.display=m==='simple'?'none':'';
+  $('engine').style.display=m==='simple'?'none':'';
+  $('rowEngineOpts').style.display=m==='simple'?'none':'';
+}
+async function pollJob(jid,btn,mode){
   try{
     const d=await (await fetch('/api/job/'+jid)).json();
     if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true)}
@@ -524,8 +526,8 @@ async function pollJob(jid,btn){
     }else if(d.error){stage('genStage','❌ '+d.error,true);
       btn.disabled=false;btn.textContent='🎬 生成视频';return;
     }else{stage('genStage','⏳ '+d.stage+(d.log&&d.log.length?' · '+d.log[d.log.length-1].slice(0,60):''))}
-    setTimeout(()=>pollJob(jid,btn),4000);
-  }catch(e){setTimeout(()=>pollJob(jid,btn),6000)}
+    setTimeout(()=>pollJob(jid,btn),mode==='simple'?1000:4000);
+  }catch(e){setTimeout(()=>pollJob(jid,btn),mode==='simple'?2000:6000)}
 }
 function dlResult(){if(curJob)location.href='/api/result/'+curJob}
 
@@ -599,14 +601,24 @@ function dlCover(){if(!coverUrl)return;const a=document.createElement('a');
 
 /* ---------- 下拉数据 ---------- */
 async function loadSelects(){
-  const [vs,bs,gs,fs]=await Promise.all([
+  const [vs,bs,gs,fs,es]=await Promise.all([
     fetch('/api/voices').then(r=>r.json()),fetch('/api/basevideos').then(r=>r.json()),
-    fetch('/api/bgms').then(r=>r.json()),fetch('/api/fonts').then(r=>r.json())]);
+    fetch('/api/bgms').then(r=>r.json()),fetch('/api/fonts').then(r=>r.json()),
+    fetch('/api/engines').then(r=>r.json())]);
   fillSel('refSel',vs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'refSel'));
   fillSel('baseSel',bs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'baseSel'));
   fillSel('bgmSel',[['','不用 BGM'],...gs.map(v=>[v.id,`${v.name}(${Math.round(v.duration)}s)`])],localStorage.getItem(PK+'bgmSel'));
   fillSel('subFont',fs.map(f=>[f.id,f.name]),localStorage.getItem(PK+'subFont'));
   $('cnt-voice').textContent=vs.length;$('cnt-base').textContent=bs.length;$('cnt-bgm').textContent=gs.length;
+  // 引擎:只显示已安装的口型引擎(排除cosy等非口型引擎)
+  const LIPSYNC_KEYS=['mt','hg'];
+  const engEl=$('engine'), keep=engEl.value;
+  engEl.innerHTML='';
+  const ready=(es.engines||[]).filter(e=>e.installed&&LIPSYNC_KEYS.includes(e.key));
+  if(!ready.length) engEl.innerHTML='<option value="">-- 请先安装引擎 --</option>';
+  else ready.forEach(e=>{const o=new Option(e.name,e.key);engEl.appendChild(o);});
+  if(keep&&[...engEl.options].some(o=>o.value===keep)) engEl.value=keep;
+  toggleGenMode();
   return {vs,bs,gs};
 }
 function fillSel(id,pairs,keep){
@@ -898,9 +910,9 @@ function bindUploads(){
     if(auds.length)uploadMany(auds,curTab==='bgm'?UP_EP.bgm:UP_EP.voice);
     if(!auds.length&&!vids.length)toast('只支持音频/视频文件');
   };
-  bindDrop('vidDrop','vidFile',f=>{videoBlob=f;
+  $('vidFile').onchange=e=>{const f=e.target.files[0];if(!f)return;videoBlob=f;
     $('basePrev').src=URL.createObjectURL(f);$('basePrev').style.display='block';
-    $('vidDrop').textContent='✅ '+f.name+'(优先于底板库)';toast('已选本地底板')});
+    toast('已选本地底板')};
 }
 
 /* ---------- 安装管理 ---------- */
