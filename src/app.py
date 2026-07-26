@@ -1440,7 +1440,7 @@ def api_system():
     except Exception:
         pass
     try:
-        r = subprocess.run([sys.executable, "--version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run([sys.executable, "-c", "import sys;print(sys.version.split()[0])"], capture_output=True, text=True, timeout=5)
         info["python_version"] = (r.stdout or r.stderr).strip().split()[-1]
     except Exception:
         pass
