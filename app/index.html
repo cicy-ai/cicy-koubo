@@ -682,7 +682,7 @@ async function renderTab(){
       audioCard('voice',v,$('refSel').value===v.id,'/api/voices/'+v.id,`useVoiceAsset('${v.id}')`)
     ).join('')}</div>`:empty('还没有音色 — 点上方上传,或直接把音频拖进本区');
   }else if(curTab==='base'){
-    tools.innerHTML=toolbar(`<button class="btn" onclick="$('upBase').click()">➕ 上传底板</button>
+    tools.innerHTML=toolbar(`<button class="btn" onclick="$('vidDrop').click()">➕ 上传底板</button>
       <span class="kv">正脸 1-2 分钟;自动归一 25fps</span>`);
     const list=prep(await (await fetch('/api/basevideos')).json());
     $('cnt-base').textContent=list.length;
