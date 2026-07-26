@@ -895,7 +895,12 @@ async function uploadAsset(file,ep){
   try {
     const d=await aj(await fetch(ep,{method:'POST',body:fd}));
     if(d.error)toast('失败:'+d.error);
-    else{toast(`✅ 已入库:${d.name}(${d.duration}s)`);renderTab();loadSelects()}
+    else{
+      toast(`✅ 已入库:${d.name}(${d.duration}s)`);
+      if (ep === UP_EP.base && d.id) {
+        $('baseSel').value = d.id; persist($('baseSel')); previewBase(); renderTab(); loadSelects();
+      } else { renderTab(); loadSelects(); }
+    }
   } catch(e) { toast('上传失败: '+e.message); }
 }
 async function uploadMany(files,ep){for(const f of files)await uploadAsset(f,ep)}
