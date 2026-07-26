@@ -926,7 +926,12 @@ function bindUploads(){
   };
   $('vidFile').onchange=e=>{const f=e.target.files[0];if(!f)return;videoBlob=f;
     $('basePrev').src=URL.createObjectURL(f);$('basePrev').style.display='block';
-    toast('已选本地底板')};
+    toast('已选本地底板，上传中...');
+    uploadAsset(f, UP_EP.base).then(() => {
+      $('baseSel').value = ''; // 刷新 select
+      loadSelects();
+    });
+  };
 }
 
 /* ---------- 安装管理 ---------- */
