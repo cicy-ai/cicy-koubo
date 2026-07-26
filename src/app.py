@@ -1415,6 +1415,20 @@ ENGINES = {
     "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy"},
 }
 
+# 启动时自动部署 provision 脚本到 /content/（Colab 重启后目录丢失）
+if pathlib.Path("/content").exists():
+    PROV_SRC = SRC_DIR.parent / "scripts" / "provision"
+    if PROV_SRC.exists():
+        for key, cfg in ENGINES.items():
+            dst = pathlib.Path(cfg["dir"])
+            dst.mkdir(parents=True, exist_ok=True)
+            src_script = PROV_SRC / key / "provision.sh"
+            dst_script = dst / "provision.sh"
+            if src_script.exists():
+                import shutil as _sh
+                _sh.copy(src_script, dst_script)
+                dst_script.chmod(0o755)
+
 
 @app.get("/api/system")
 def api_system():
