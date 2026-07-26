@@ -933,36 +933,52 @@ function closeInstallModal() {
   _installPolls = {}; _openLogs = {};
 }
 
+function engineCardHTML(e) {
+  const icon = e.installed ? '🟢' : (e.installing ? '🟡' : '🔴');
+  const badge = e.installed
+    ? '<span class="badge2 yes">已安装</span>'
+    : (e.installing ? '<span class="badge2 ing">安装中…</span>' : '<span class="badge2 no">未安装</span>');
+  let verHtml = '';
+  if (e.installed && Object.keys(e.version_info).length) {
+    verHtml = '<div class="ev">' + Object.entries(e.version_info)
+      .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
+  }
+  const btn = e.installing
+    ? '<button class="btn ghost" disabled style="font-size:12px">⏳ 安装中…</button>'
+    : `<button class="btn ghost" style="font-size:12px" onclick="installEngine('${e.key}')">${e.installed?'🔄 重装':'📥 安装'}</button>`;
+  return `<div class="eline" data-engine="${e.key}">
+    <div class="ei">${icon}</div>
+    <div class="eb">
+      <div class="en">${e.name} ${badge} ${e.has_script?'':'(缺安装脚本)'}</div>
+      ${verHtml}
+    </div>
+    <div style="flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+      ${btn}
+      <button class="btn ghost" style="font-size:11px" onclick="toggleLog('${e.key}')">📄 日志</button>
+    </div>
+  </div>
+  <div class="logbox" id="log-${e.key}" data-engine="${e.key}"></div>`;
+}
+
+function updateEngineCard(e) {
+  const old = document.querySelector(`[data-engine="${e.key}"]`);
+  if (!old) return;
+  const html = engineCardHTML(e);
+  const tmp = document.createElement('div'); tmp.innerHTML = html;
+  const newEl = tmp.firstElementChild;
+  old.replaceWith(newEl);
+  // restore log state
+  if (_openLogs[e.key]) {
+    const lb = document.getElementById('log-' + e.key);
+    if (lb) { lb.classList.add('show'); lb.textContent = document.getElementById('log-'+e.key+'-cache')?.textContent || ''; }
+  }
+}
+
 async function refreshEngines() {
   try {
     const d = await (await fetch('/api/engines')).json();
     let html = '';
-    d.engines.forEach(e => {
-      const icon = e.installed ? '🟢' : (e.installing ? '🟡' : '🔴');
-      const badge = e.installed
-        ? '<span class="badge2 yes">已安装</span>'
-        : (e.installing ? '<span class="badge2 ing">安装中…</span>' : '<span class="badge2 no">未安装</span>');
-      let verHtml = '';
-      if (e.installed && Object.keys(e.version_info).length) {
-        verHtml = '<div class="ev">' + Object.entries(e.version_info)
-          .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
-      }
-      const btn = e.installing
-        ? '<button class="btn ghost" disabled style="font-size:12px">⏳ 安装中…</button>'
-        : `<button class="btn ghost" style="font-size:12px" onclick="installEngine('${e.key}')">${e.installed?'🔄 重装':'📥 安装'}</button>`;
-      html += `<div class="eline">
-        <div class="ei">${icon}</div>
-        <div class="eb">
-          <div class="en">${e.name} ${badge} ${e.has_script?'':'(缺安装脚本)'}</div>
-          ${verHtml}
-        </div>
-        <div style="flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-          ${btn}
-          <button class="btn ghost" style="font-size:11px" onclick="toggleLog('${e.key}')">📄 日志</button>
-        </div>
-      </div>
-      <div class="logbox" id="log-${e.key}" data-engine="${e.key}"></div>`;
-    });
+    d.engines.forEach(e => { html += engineCardHTML(e); });
     $('engineList').innerHTML = html;
     // 恢复之前打开的日志
     Object.keys(_openLogs).forEach(k => {
@@ -1012,7 +1028,16 @@ async function pollLog(key) {
       if (!box.classList.contains('show')) { es.close(); delete _installPolls[key]; return; }
       try {
         const d = JSON.parse(e.data);
-        if (d.done) { es.close(); delete _installPolls[key]; refreshEngines(); return; }
+        if (d.done) {
+          es.close(); delete _installPolls[key];
+          // 只刷新这一个引擎的状态栏，不重建整个列表（避免抖动/死循环）
+          try {
+            const all = await (await fetch('/api/engines')).json();
+            const eng = all.engines.find(e => e.key === key);
+            if (eng) updateEngineCard(eng);
+          } catch (_) {}
+          return;
+        }
         if (d.text) { box.textContent += d.text; box.scrollTop = box.scrollHeight; }
       } catch (_) {}
     };
