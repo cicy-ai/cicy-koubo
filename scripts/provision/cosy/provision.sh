@@ -6,34 +6,83 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== CosyVoice provision $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
 cd "$DIR"
-rm -rf env
+rm -rf env CosyVoice cosyvoice_tts.py
 
-if [ ! -d CosyVoice ]; then
-    echo "[cosy] cloning..."
-    git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
+echo "[cosy] base deps..."
+pip install -q --upgrade setuptools wheel pip
+pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install -q huggingface_hub modelscope soundfile hyperpyyaml openai-whisper wetext
+pip install -q "numba>=0.61" "onnxruntime-gpu<1.21"
+
+echo "[cosy] cloning CosyVoice..."
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
+
+# Fix cudart symlink
+if [ ! -f /usr/lib/x86_64-linux-gnu/libcudart.so.13 ]; then
+    ln -sf /usr/local/cuda/lib64/libcudart.so.12 /usr/lib/x86_64-linux-gnu/libcudart.so.13 2>/dev/null || true
+    ldconfig 2>/dev/null || true
 fi
 
-echo "[cosy] deps..."
-pip install -q huggingface_hub modelscope onnxruntime soundfile
+echo "[cosy] pip install -r requirements.txt..."
 cd CosyVoice
 pip install -q -r requirements.txt 2>/dev/null || true
 
-echo "[cosy] model..."
+# Install matcha-tts submodule
+echo "[cosy] installing matcha-tts..."
+cd third_party/Matcha-TTS
+pip install -q -e . 2>/dev/null || pip install -q -e . --no-build-isolation 2>/dev/null || true
+cd "$DIR/CosyVoice"
+
+echo "[cosy] downloading model..."
 MODEL_DIR="$DIR/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
-if [ ! -f "$MODEL_DIR/llm.pt" ]; then
-    python3 -c "
+mkdir -p "$MODEL_DIR"
+python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='$MODEL_DIR')
-" 2>&1
-fi
+"
 
-# Write TTS wrapper
+echo "[cosy] verifying import..."
+python3 -c "
+import sys, os, types
+# Stub matcha if not installed
+if 'matcha' not in sys.modules:
+    m = types.ModuleType('matcha')
+    m.models = types.ModuleType('matcha.models')
+    m.models.components = types.ModuleType('matcha.models.components')
+    m.models.components.flow_matching = types.ModuleType('matcha.models.components.flow_matching')
+    class BASECFM: pass
+    m.models.components.flow_matching.BASECFM = BASECFM
+    sys.modules['matcha'] = m
+    sys.modules['matcha.models'] = m.models
+    sys.modules['matcha.models.components'] = m.models.components
+    sys.modules['matcha.models.components.flow_matching'] = m.models.components.flow_matching
+sys.path.insert(0, '$DIR/CosyVoice')
+os.environ['MODELSCOPE_CACHE'] = '$DIR/CosyVoice/pretrained_models'
+from cosyvoice.cli.cosyvoice import AutoModel
+print('CosyVoice import OK')
+" 2>&1
+
+# TTS wrapper with matcha stub
 cat > "$DIR/cosyvoice_tts.py" << 'PYEOF'
 #!/usr/bin/env python3
-"""CosyVoice zero-shot TTS wrapper."""
-import sys, os, argparse, base64, numpy as np, soundfile as sf
+import sys, os, types, argparse, base64
+import numpy as np, soundfile as sf
+
+# Stub matcha module
+m = types.ModuleType('matcha')
+m.models = types.ModuleType('matcha.models')
+m.models.components = types.ModuleType('matcha.models.components')
+m.models.components.flow_matching = types.ModuleType('matcha.models.components.flow_matching')
+class BASECFM: pass
+m.models.components.flow_matching.BASECFM = BASECFM
+sys.modules['matcha'] = m
+sys.modules['matcha.models'] = m.models
+sys.modules['matcha.models.components'] = m.models.components
+sys.modules['matcha.models.components.flow_matching'] = m.models.components.flow_matching
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'CosyVoice'))
 os.environ['MODELSCOPE_CACHE'] = os.path.join(os.path.dirname(__file__), 'CosyVoice', 'pretrained_models')
+from cosyvoice.cli.cosyvoice import AutoModel
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ref', required=True)
@@ -46,12 +95,11 @@ args = parser.parse_args()
 ref_text = base64.b64decode(args.ref_text_b64).decode()
 text = base64.b64decode(args.text_b64).decode()
 
-from cosyvoice.cli.cosyvoice import AutoModel
 ckpt = os.path.join(os.path.dirname(__file__), 'CosyVoice', 'pretrained_models', 'Fun-CosyVoice3-0.5B')
 model = AutoModel(model_dir=ckpt)
 result = list(model.inference_zero_shot(text, ref_text, args.ref))[0]
 sf.write(args.out, result['tts_speech'], 24000)
-print(f"OK: {args.out}")
+print(f"OK out={args.out}")
 PYEOF
 chmod +x "$DIR/cosyvoice_tts.py"
 
