@@ -1440,8 +1440,11 @@ def api_system():
     except Exception:
         pass
     try:
-        r = subprocess.run([sys.executable, "-c", "import sys;print(sys.version.split()[0])"], capture_output=True, text=True, timeout=5)
-        info["python_version"] = (r.stdout or r.stderr).strip().split()[-1]
+        import sys as _sys
+        r = subprocess.run([_sys.executable, "-c", "import sys;print(sys.version.split()[0],end='')"], capture_output=True, text=True, timeout=5)
+        info["python_version"] = (r.stdout or r.stderr).strip()
+        if not info["python_version"] and r.returncode != 0:
+            print(f"[api/system] python version failed rc={r.returncode} stderr={r.stderr[:80]}", file=_sys.stderr, flush=True)
     except Exception:
         pass
     return jsonify(info)
