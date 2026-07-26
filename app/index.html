@@ -1024,7 +1024,7 @@ async function pollLog(key) {
   try {
     const es = new EventSource('/api/engines/' + key + '/stream');
     _installPolls[key] = es;
-    es.onmessage = e => {
+    es.onmessage = async e => {
       if (!box.classList.contains('show')) { es.close(); delete _installPolls[key]; return; }
       try {
         const d = JSON.parse(e.data);
