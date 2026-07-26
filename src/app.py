@@ -12,6 +12,7 @@ import os
 import pathlib
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -741,14 +742,31 @@ def _hex_rgba(s, default):
 
 
 def _load_font(fid, size):
-    """加载字体。文件路径方式对部分 OTF(CFF) 有 bug，回退到 bytes 加载。"""
+    """加载字体。遍历回退链直到找到可用的字体（PIL path/bytes 双模式）。"""
     from PIL import ImageFont
+    candidates = [
+        FONTS[fid or "heavy"][0],                                   # ROOT 标准路径
+        FONTS["heiti"][0],                                           # macOS
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",       # Linux/Colab Noto CJK
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/content/SourceHanSansCN-Heavy.otf",                        # 用户上传(Colab /content)
+        "/content/SourceHanSansCN-Bold.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",      # 最后后备
+    ]
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            try:
+                with open(p, "rb") as ff:
+                    return ImageFont.truetype(ff, size)
+            except Exception:
+                continue
+    # 全部失败，用第一个非空路径硬试
     p = _font_path(fid)
-    try:
-        return ImageFont.truetype(p, size)
-    except OSError:
-        with open(p, "rb") as ff:
-            return ImageFont.truetype(ff, size)
+    return ImageFont.truetype(p, size)
 
 
 def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="#000000", mb=60, font_id="heavy"):
