@@ -437,7 +437,7 @@ function savePrompt(){customPrompt=$('pText').value.trim();
 async function resetPrompt(){const d=await (await fetch('/api/rewrite-prompt')).json();
   $('pText').value=d.prompt;customPrompt='';localStorage.removeItem(PK+'rewritePrompt');toast('已恢复默认')}
 
-/* ---------- ② 配音 ---------- */
+async function aj(r) { try { return await r.json(); } catch(e) { throw new Error(r.status+' '+(r.statusText||'')); } }
 let voiceId=localStorage.getItem(PK+'voiceId')||'';   // 最近一次配音的媒体库 id
 let audioBlob=null;                                    // 上传的现成音频
 function setVoice(id,dur,chars){
@@ -459,7 +459,7 @@ async function genAudio(){
     if($('ttsMode').value==='whole')fd.append('mode','whole');
     if($('refSel').value)fd.append('ref_id',$('refSel').value);
     const r=await fetch('/api/tts',{method:'POST',body:fd});
-    const d=await r.json();
+    const d=await aj(r);
     if(d.error){stage('ttsStage','❌ '+d.error,true);toast('配音失败')}
     else{setVoice(d.id,d.duration,d.chars);audioBlob=null;
       stage('ttsStage','');$('ttsStage').style.display='none';
