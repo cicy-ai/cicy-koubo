@@ -1097,7 +1097,8 @@ def gen_srt():
                 f"r=m.transcribe('{tmp}',language='zh',verbose=False); "
                 "import json; sys.stdout.write(json.dumps(r['segments'],ensure_ascii=False))"
             )
-            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300, cwd=str(cosy_dir))
+            cosy_python = str(cosy_dir / "env" / "bin" / "python")
+            r = subprocess.run([cosy_python, "-c", script], capture_output=True, text=True, timeout=300, cwd=str(cosy_dir))
             segs = json.loads(r.stdout)
             if segs:
                 return jsonify({"srt": _to_srt(segs), "segments": len(segs), "provider": "local-whisper"})
