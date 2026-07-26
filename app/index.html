@@ -30,8 +30,6 @@ body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-ser
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;
   box-shadow:0 1px 3px rgba(20,40,50,.04)}
 .step{display:flex;align-items:center;gap:8px;margin:0 0 12px}
-.step .n{width:24px;height:24px;border-radius:50%;background:var(--teal);color:#fff;
-  display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex:none}
 .step h2{font-size:15px;margin:0;font-weight:700}
 .step .tip{margin-left:auto;font-size:11px;color:var(--mut)}
 
@@ -183,7 +181,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
   <!-- ① 文案 -->
   <div class="card">
-    <div class="step"><span class="n">1</span><h2>文案</h2><span class="tip">提取 → 仿写 → 标题</span></div>
+    <div class="step"><h2>文案</h2><span class="tip">提取 → 仿写 → 标题</span></div>
     <div class="lbl">🎯 对标视频链接(抖音分享文本直接粘)</div>
     <div class="row" style="margin-top:0">
       <input class="inp" id="dyUrl" placeholder="1.58 复制打开抖音… https://v.douyin.com/xxxx/">
@@ -205,7 +203,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
   <!-- ② 配音 -->
   <div class="card">
-    <div class="step"><span class="n">2</span><h2>配音</h2><span class="tip">CosyVoice 声音克隆</span></div>
+    <div class="step"><h2>配音</h2><span class="tip">CosyVoice 声音克隆</span></div>
     <div class="lbl">参考音色(素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('upVoice').click()">+ 上传</button></div>
     <div class="row" style="margin-top:0">
       <select id="refSel"></select>
@@ -233,7 +231,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
   <!-- ③ 出片 -->
   <div class="card">
-    <div class="step"><span class="n">3</span><h2>出片</h2><span class="tip">对口型</span></div>
+    <div class="step"><h2>出片</h2><span class="tip">对口型</span></div>
     <div class="lbl">🎬 底板视频(数字人形象,素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('vidFile').click()">+ 上传</button></div>
     <div class="row" style="margin-top:0">
       <select id="baseSel" onchange="previewBase()"></select>
@@ -260,7 +258,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 
   <!-- ④ 剪辑 · 封面 -->
   <div class="card">
-    <div class="step"><span class="n">4</span><h2>剪辑 · 封面</h2><span class="tip">字幕 + BGM + 封面</span></div>
+    <div class="step"><h2>剪辑 · 封面</h2><span class="tip">字幕 + BGM + 封面</span></div>
     <div class="lbl">字幕(SRT 可编辑;纯文本=整屏;留空不加)
       <button class="btn ghost" style="margin-left:auto;padding:4px 10px;font-size:12px" id="btn-srt" onclick="genSrt()">按配音生成</button>
     </div>
