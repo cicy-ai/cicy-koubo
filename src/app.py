@@ -1048,18 +1048,22 @@ def _resolve_vid(url):
 
 
 def _openai_provider():
+    """从 global.json 找第一个有 apiKey 的 openai/anthropic 协议 provider（跳过 voice/stt）。"""
     try:
         gj = json.load(open(pathlib.Path.home() / "cicy-ai/global.json"))
-        key = gj.get("providers", {}).get("default", {}).get("stt")  # default openai family
+        defs = (gj.get("providers", {}).get("default") or {})
         items = gj.get("providers", {}).get("items") or []
-        p = next((x for x in items if x.get("key") == "defaultOpenAi"), None)
-        if not p:
-            p = next((x for x in items if x.get("key") == key), None)
-        if p:
-            return p
+        # 按默认 provider 顺序优先，然后补其余的
+        order = [v for v in defs.values() if isinstance(v, str) and v not in ("groqStt","doubaoVoice","zhipuVision")]
+        ordered = sorted(items, key=lambda x: order.index(x["key"]) if x["key"] in order else 999)
+        for p in ordered:
+            k = (p.get("apiKey") or "").strip()
+            proto = (p.get("protocol") or "").lower()
+            if k and proto in ("openai", "anthropic"):
+                return p
     except Exception:
         pass
-    if os.environ.get("OPENAI_API_KEY"):     # 无 global.json 的机器(如 Colab)用环境变量
+    if os.environ.get("OPENAI_API_KEY"):
         return {"url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
                 "apiKey": os.environ["OPENAI_API_KEY"],
                 "defaultModel": os.environ.get("OPENAI_MODEL", "gpt-4o-mini")}
@@ -1126,13 +1130,20 @@ def title():
 
 
 def _groq_key():
+    """优先用 groqStt 的 key，没有则回退到 _openai_provider 的 key。"""
     try:
         gj = json.load(open(pathlib.Path.home() / "cicy-ai/global.json"))
         for x in (gj.get("providers", {}).get("items") or []):
             if x.get("key") == "groqStt":
-                return x.get("apiKey", "")
+                k = (x.get("apiKey") or "").strip()
+                if k:
+                    return k
     except Exception:
         pass
+    # 回退：用任意有效 openai provider 的 key
+    p = _openai_provider()
+    if p:
+        return p.get("apiKey", "")
     return os.environ.get("GROQ_API_KEY", "")
 
 
