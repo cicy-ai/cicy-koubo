@@ -1425,6 +1425,16 @@ def media_update():
     return jsonify({"ok": True})
 
 
+def _is_installing(key):
+    """检测 /content/<key>/provision.sh 是否在运行。匹配进程命令行里的路径。"""
+    try:
+        r = subprocess.run(["pgrep", "-f", f"/content/{key}/provision.sh"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
     "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg"},
@@ -1509,12 +1519,7 @@ def api_engines():
                         version_info[k.strip()] = v.strip()
             except Exception:
                 pass
-        installing = False
-        try:
-            r = subprocess.run(["pgrep", "-f", f"provision.sh.*{key}"], capture_output=True, timeout=5)
-            installing = r.returncode == 0
-        except Exception:
-            pass
+        installing = _is_installing(key)
         has_script = (pathlib.Path(cfg["dir"]) / "provision.sh").exists()
         out.append({"key": key, "name": cfg["name"],
                     "installed": installed, "installing": installing,
@@ -1534,12 +1539,7 @@ def api_engine_log(engine):
         lines = logf.read_text().splitlines()[-tail:]
     except Exception:
         lines = []
-    installing = False
-    try:
-        r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=5)
-        installing = r.returncode == 0
-    except Exception:
-        pass
+    installing = _is_installing(engine)
     return jsonify({"lines": lines, "installing": installing})
 
 
@@ -1550,12 +1550,15 @@ def api_engine_stream(engine):
         return jsonify({"error": "unknown engine"}), 404
     logf = pathlib.Path(ENGINES[engine]["dir"]) / "provision.log"
     def generate():
-        pos = 0
+        # 先推送已有日志
         if logf.exists():
             try:
-                pos = logf.stat().st_size
+                existing = logf.read_text().replace("\r", "\n")
+                if existing.strip():
+                    yield f"data: {json.dumps({'text': existing})}\n\n"
             except Exception:
                 pass
+        pos = logf.stat().st_size if logf.exists() else 0
         import time as _time
         for _ in range(7200):  # max 2h
             try:
@@ -1572,13 +1575,9 @@ def api_engine_stream(engine):
             except Exception:
                 pass
             # check if still installing
-            try:
-                r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=3)
-                if r.returncode != 0:
-                    yield f"data: {json.dumps({'done': True})}\n\n"
-                    return
-            except Exception:
-                pass
+            if not _is_installing(engine):
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
             _time.sleep(0.8)
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1592,12 +1591,8 @@ def api_engine_install(engine):
     script = pathlib.Path(cfg["dir"]) / "provision.sh"
     if not script.exists():
         return jsonify({"error": f"{cfg['name']} 安装脚本不存在 — 请先准备 {script}"}), 404
-    try:
-        r = subprocess.run(["pgrep", "-f", f"provision.sh.*{engine}"], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            return jsonify({"ok": True, "already_running": True, "log_path": str(script.parent / "provision.log")})
-    except Exception:
-        pass
+    if _is_installing(engine):
+        return jsonify({"ok": True, "already_running": True, "log_path": str(script.parent / "provision.log")})
     logf = script.parent / "provision.log"
     if not logf.exists():
         logf.write_text(f"=== install started at {time.strftime('%Y-%m-%dT%H:%M:%SZ')} ===\n")
