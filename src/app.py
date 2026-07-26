@@ -1477,12 +1477,17 @@ if pathlib.Path("/content").exists():
         for key, cfg in ENGINES.items():
             dst = pathlib.Path(cfg["dir"])
             dst.mkdir(parents=True, exist_ok=True)
-            src_script = PROV_SRC / key / "provision.sh"
-            dst_script = dst / "provision.sh"
-            if src_script.exists():
-                import shutil as _sh
-                _sh.copy(src_script, dst_script)
-                dst_script.chmod(0o755)
+            src_dir = PROV_SRC / key
+            if not src_dir.exists():
+                continue
+            import shutil as _sh
+            # 部署目录下所有文件(provision.sh + cosyvoice_tts.py 等)
+            for sf in src_dir.iterdir():
+                if sf.is_file():
+                    df = dst / sf.name
+                    _sh.copy(sf, df)
+                    if sf.suffix == ".sh":
+                        df.chmod(0o755)
 
 # 启动时预置 BGM（从项目脚本目录 seed 到 assets/bgm/，不覆盖已存在的）
 _BGM_SEED = SRC_DIR.parent / "scripts" / "provision" / "bgm-prebuild"
