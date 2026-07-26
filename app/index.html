@@ -226,7 +226,6 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <audio id="ttsPlayer" controls style="display:none"></audio>
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-tts-dl" onclick="dlTts()" disabled>⬇ 下载配音</button></div>
     <div class="lbl" style="margin-top:10px">或上传现成音频代替配音</div>
-    <div class="drop" id="audDrop" onclick="$('audFile').click()">点击/拖入音频文件(wav·mp3)</div>
     <input type="file" id="audFile" accept="audio/*" hidden>
   </div>
 
@@ -897,9 +896,6 @@ function bindUploads(){
     if(auds.length)uploadMany(auds,curTab==='bgm'?UP_EP.bgm:UP_EP.voice);
     if(!auds.length&&!vids.length)toast('只支持音频/视频文件');
   };
-  bindDrop('audDrop','audFile',f=>{audioBlob=f;voiceId='';localStorage.removeItem(PK+'voiceId');
-    $('ttsPlayer').src=URL.createObjectURL(f);$('ttsPlayer').style.display='block';
-    $('ttsInfo').textContent='上传音频:'+f.name;$('audDrop').textContent='✅ '+f.name;toast('已用上传音频代替配音')});
   bindDrop('vidDrop','vidFile',f=>{videoBlob=f;
     $('basePrev').src=URL.createObjectURL(f);$('basePrev').style.display='block';
     $('vidDrop').textContent='✅ '+f.name+'(优先于底板库)';toast('已选本地底板')});
