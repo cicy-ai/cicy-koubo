@@ -19,15 +19,15 @@ import uuid
 
 from flask import Flask, request, jsonify, send_file, Response
 
-ROOT = pathlib.Path.home() / "projects/digital-human"
-APP_DIR = ROOT / "kr-app"
+SRC_DIR = pathlib.Path(__file__).resolve().parent      # src/
+ROOT = SRC_DIR.parent / "app"                            # 项目根下的 app/
+APP_DIR = ROOT
 WORK = APP_DIR / "jobs"
 WORK.mkdir(parents=True, exist_ok=True)
-COSY_VENV = ROOT.parent / "cosyvoice-venv/bin/python"
-COSY_MODEL = ROOT.parent / "CosyVoice/pretrained_models/CosyVoice2-0.5B/llm.pt"
+COSY_VENV = pathlib.Path.home() / "cosyvoice-venv/bin/python"
+COSY_MODEL = pathlib.Path.home() / "CosyVoice/pretrained_models/CosyVoice2-0.5B/llm.pt"
 
 PORT = int(os.environ.get("KOUBO_PORT", "8770"))
-SRC_DIR = pathlib.Path(__file__).resolve().parent   # 代码目录(index.html 随代码走,数据仍在 ROOT)
 def _gpu_ssh_conf():
     """远程 GPU 的 SSH 端点:环境变量 KOUBO_GPU_SSH(user@host)/KOUBO_GPU_SSH_PORT,
     否则读本机私有配置(不入库、不进代码)。都没有→占位值,远程操作自然失败,
@@ -1448,6 +1448,8 @@ def basevideo_upload():
     use = norm if (r.returncode == 0 and norm.exists()) else orig
     name = (request.form.get("name") or "").strip()
     if name:
+        import datetime
+        name = f"{name}-{datetime.datetime.now().strftime('%m%d%H%M')}"
         _meta_set("base", base.replace(".mp4", ""), name)
     return jsonify({"id": use.name, "name": name or base.replace(".mp4", ""), "duration": _ffdur(use)})
 
@@ -1563,7 +1565,7 @@ ENGINES = {
 
 # 启动时自动部署 provision 脚本到 /content/（Colab 重启后目录丢失）
 if pathlib.Path("/content").exists():
-    PROV_SRC = SRC_DIR.parent / "scripts" / "provision"
+    PROV_SRC = SRC_DIR.parent / "scripts/provision"
     if PROV_SRC.exists():
         for key, cfg in ENGINES.items():
             dst = pathlib.Path(cfg["dir"])
@@ -1581,7 +1583,7 @@ if pathlib.Path("/content").exists():
                         df.chmod(0o755)
 
 # 启动时预置 BGM（从项目脚本目录 seed 到 assets/bgm/，不覆盖已存在的）
-_BGM_SEED = SRC_DIR.parent / "scripts" / "provision" / "bgm-prebuild"
+_BGM_SEED = SRC_DIR.parent / "scripts/provision/bgm-prebuild"
 if _BGM_SEED.exists():
     _bgm_dir = ROOT / "assets/bgm"
     _bgm_dir.mkdir(parents=True, exist_ok=True)

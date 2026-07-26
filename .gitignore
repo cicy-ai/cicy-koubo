@@ -1,2 +1,11 @@
 src/vendor/
 __pycache__
+app/assets/
+app/jobs/
+app/media/
+app/thumbs/
+app/pipeline.log
+app/probe_cache.json
+app/prov_seen.json
+app/*.mp4
+app/bgm/
