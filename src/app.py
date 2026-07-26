@@ -1091,9 +1091,11 @@ def gen_srt():
     if cosy_dir.exists():
         try:
             script = (
-                "import whisper, sys; m=whisper.load_model('medium',device='cuda'); "
+                "import sys, os, warnings; "
+                "warnings.filterwarnings('ignore'); os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; "
+                "import whisper; m=whisper.load_model('medium',device='cuda'); "
                 f"r=m.transcribe('{tmp}',language='zh',verbose=False); "
-                "import json; print(json.dumps(r['segments'],ensure_ascii=False))"
+                "import json; sys.stdout.write(json.dumps(r['segments'],ensure_ascii=False))"
             )
             r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300, cwd=str(cosy_dir))
             segs = json.loads(r.stdout)
