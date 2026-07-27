@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* cicy-koubo — 爆款口播视频制作工作台启动器
  *   npx cicy-koubo            本地启动 → http://127.0.0.1:8770
+ *   npx cicy-koubo --install-only  只安装/检查运行依赖,不启动服务
  *   npx cicy-koubo --cft      同时开 cloudflared 快速隧道,打印公网 URL
  *   npx cicy-koubo --port N   指定端口
  */
@@ -14,11 +15,13 @@ const argv = process.argv.slice(2);
 if (argv.includes('--help') || argv.includes('-h')) {
   console.log(`cicy-koubo — 数字人口播工作台
   npx cicy-koubo            本地启动(默认端口 8770)
+  npx cicy-koubo --install-only  安装并检查运行依赖,不启动服务
   npx cicy-koubo --cft      额外开 cloudflared 快速隧道,输出公网 https 地址
   npx cicy-koubo --port N   指定端口`);
   process.exit(0);
 }
 const useCft = argv.includes('--cft');
+const installOnly = argv.includes('--install-only');
 const port = (() => {
   const i = argv.indexOf('--port');
   return i >= 0 && argv[i + 1] ? parseInt(argv[i + 1], 10) : 8770;
@@ -86,6 +89,13 @@ if (process.platform === 'linux' && !fs.existsSync(fontFile) &&
     'https://cdn.jsdelivr.net/gh/adobe-fonts/source-han-sans@release/OTF/SimplifiedChinese/SourceHanSansSC-Heavy.otf'],
     { timeout: 300000 });
   if (r.status === 0) ok('中文字体已就位'); else { warn('字体下载失败,字幕将用系统字体'); fs.rmSync(fontFile, { force: true }); }
+}
+
+if (installOnly) {
+  console.log('\n──────────────────────────────────────────────');
+  console.log('  ✅ cicy-koubo 运行依赖已准备完成');
+  console.log('──────────────────────────────────────────────\n');
+  process.exit(0);
 }
 
 /* ---------- 3. 起服务 ---------- */

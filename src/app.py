@@ -8,6 +8,7 @@
 运行:python3 app.py  → http://127.0.0.1:8770
 """
 import json
+import datetime
 import os
 import pathlib
 import shlex
@@ -26,6 +27,24 @@ WORK = APP_DIR / "jobs"
 WORK.mkdir(parents=True, exist_ok=True)
 COSY_VENV = pathlib.Path.home() / "cosyvoice-venv/bin/python"
 COSY_MODEL = pathlib.Path.home() / "CosyVoice/pretrained_models/CosyVoice2-0.5B/llm.pt"
+
+GLOBAL_CFG = pathlib.Path.home() / "cicy-ai/global.json"
+
+def load_global_cfg():
+    """读取 cicy-ai 的唯一全局配置源。"""
+    try:
+        return json.load(open(GLOBAL_CFG))
+    except FileNotFoundError:
+        return {}
+
+def save_global_cfg(cfg):
+    """原子写回 global.json；口播只维护其中的 koubo 节点。"""
+    GLOBAL_CFG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GLOBAL_CFG.with_suffix(f".json.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, GLOBAL_CFG)
 
 PORT = int(os.environ.get("KOUBO_PORT", "8770"))
 def _gpu_ssh_conf():
@@ -71,6 +90,137 @@ def _rewrite_local(cmd):
         rest = [a.replace(REMOTE + ":", "") for a in cmd[len(SCP):]]
         return ["cp", "-f"] + rest
     return cmd
+
+
+# ═══════════ GPU 模式自动检测 ═══════════
+import platform as _platform
+
+def _get_gpu_memory_mb():
+    """返回 GPU 显存(MB)，无 GPU 返回 0"""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        return int((r.stdout or "").strip().splitlines()[0])
+    except Exception:
+        return 0
+
+def detect_gpu_mode():
+    """自动检测 GPU 模式:
+      macOS → colab_cli
+      Linux + GPU ≥ 8GB → local
+      Linux + GPU < 8GB → colab_cli
+      无 GPU → colab_cli
+    """
+    if os.environ.get("KOUBO_GPU_MODE"):
+        return os.environ["KOUBO_GPU_MODE"]
+    # 强制本地模式(跑在 Colab 上)
+    if LOCAL_GPU:
+        return "local"
+    sys_name = _platform.system()
+    if sys_name == "Darwin":
+        return "colab_cli"
+    # Linux
+    gpu_mb = _get_gpu_memory_mb()
+    if gpu_mb >= 8192:
+        return "local"
+    return "colab_cli"
+
+GPU_MODE = detect_gpu_mode()
+
+def _colab_profiles_cfg():
+    """读取 Colab CLI 配置档；凭据文件由用户在本机单独准备。"""
+    cfg = load_global_cfg()
+    colab = cfg.setdefault("koubo", {}).setdefault("colab", {})
+    profiles = colab.setdefault("profiles", [])
+    if not profiles:
+        profiles.append({
+            "id": "default",
+            "name": "默认 Google 账号",
+            "auth": "oauth2",
+            "credentials_path": "",
+            "session_config": str(pathlib.Path.home() / ".config/colab-cli/sessions.json"),
+            "session": "koubo",
+            "gpu": "T4",
+        })
+        colab["active"] = "default"
+    colab.setdefault("active", profiles[0]["id"])
+    return cfg, colab
+
+
+def _active_colab_profile():
+    _, colab = _colab_profiles_cfg()
+    active = colab.get("active")
+    profile = next((p for p in colab["profiles"] if p.get("id") == active), colab["profiles"][0])
+    return {
+        "id": profile.get("id") or "default",
+        "name": profile.get("name") or "Google 账号",
+        "auth": (profile.get("auth") or "oauth2").lower(),
+        "credentials_path": os.path.expanduser(profile.get("credentials_path") or ""),
+        "session_config": os.path.expanduser(profile.get("session_config") or
+                                             "~/.config/colab-cli/sessions.json"),
+        "session": profile.get("session") or "koubo",
+        "gpu": (profile.get("gpu") or "T4").upper(),
+    }
+
+
+def _colab_base_args(profile):
+    colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+    return [colab_bin, "--auth", profile["auth"], "--config", profile["session_config"]]
+
+
+def _colab_env(profile):
+    env = os.environ.copy()
+    if profile.get("auth") == "adc" and profile.get("credentials_path"):
+        env["GOOGLE_APPLICATION_CREDENTIALS"] = profile["credentials_path"]
+    return env
+
+
+def _colab_exec(cmd_str, session=None, timeout=300):
+    """通过 colab CLI 执行远程命令，返回 (returncode, stdout)"""
+    import tempfile
+    colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+    profile = _active_colab_profile()
+    # 写一个 Python 脚本来执行命令并打印输出
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(f"import subprocess,sys,json\n"
+                f"r=subprocess.run({repr(cmd_str)},shell=True,capture_output=True,text=True,timeout={timeout})\n"
+                f"sys.stdout.write(r.stdout)\n"
+                f"sys.stdout.write(json.dumps({{'rc':r.returncode}}))\n")
+        tmp = f.name
+    args = _colab_base_args(profile) + ["exec", "-s", session or profile["session"], "-f", tmp, "--timeout", str(timeout)]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 30,
+                       env=_colab_env(profile))
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+    # 解析输出: stdout + rc json
+    output = r.stdout + r.stderr
+    rc = r.returncode
+    # 尝试从输出末尾提取 rc
+    import re
+    m = re.search(r'\{"rc":\s*(\d+)\}[\d]*\s*$', output)
+    if m:
+        rc = int(m.group(1))
+        output = output[:m.start()].rstrip()
+    return rc, output
+
+def _colab_upload(local_path, remote_path, session=None):
+    """上传文件到 Colab"""
+    profile = _active_colab_profile()
+    r = subprocess.run(_colab_base_args(profile) + ["upload", "-s", session or profile["session"],
+                        str(local_path), remote_path], env=_colab_env(profile),
+                       capture_output=True, text=True, timeout=300)
+    return r.returncode == 0
+
+def _colab_download(remote_path, local_path, session=None):
+    """从 Colab 下载文件"""
+    profile = _active_colab_profile()
+    r = subprocess.run(_colab_base_args(profile) + ["download", "-s", session or profile["session"],
+                        remote_path, str(local_path)], env=_colab_env(profile),
+                       capture_output=True, text=True, timeout=300)
+    return r.returncode == 0
 
 app = Flask(__name__)
 JOBS = {}  # id -> {stage, log[], result, error}
@@ -187,7 +337,21 @@ def _ssh_check(remote_cmd, needle, tries=3):
 
 
 def tunnel_status():
-    # 隧道通不通:能 SSH 上就算 up;READY 在则 ready
+    if GPU_MODE == "colab_cli":
+        # colab_cli 模式:检查是否有活跃 session
+        colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+        try:
+            r = subprocess.run([colab_bin, "sessions"], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and "No active" not in (r.stdout or ""):
+                # 有 session，检查环境是否就绪
+                check_rc, check_out = _colab_exec("cat /content/mt/READY 2>/dev/null && echo OK || echo NO", timeout=15)
+                if "OK" in check_out:
+                    return "ready", "Colab CLI · 环境就绪"
+                return "provisioning", "Colab CLI · 环境部署中"
+            return "offline", "Colab CLI · 无活跃 session，需 colab new --gpu T4"
+        except Exception:
+            return "offline", "Colab CLI · 连接失败"
+    # SSH 模式(原有逻辑)
     for _ in range(3):
         try:
             r = run(SSH + ["cat /content/mt/READY 2>/dev/null && echo OK || echo NOREADY"], timeout=15)
@@ -206,6 +370,7 @@ def status():
             ("installing" if tstate == "ready" else "down")
     return jsonify({
         "tunnel": tstate, "tunnel_note": tnote,
+        "gpu_mode": GPU_MODE,
         "audio_service": audio,
         "video_service": "ready" if tstate == "ready" else "down",
     })
@@ -262,10 +427,17 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                     raise RuntimeError("simple compose failed: " + r.stderr[:300])
         else:
             j["stage"] = "准备素材"
-            log("copy base + audio → 本地 GPU")
-            r = run(SCP + [str(norm), str(audio_path), REMOTE + ":/content/"], timeout=180)
-            if r.returncode != 0:
-                raise RuntimeError("copy failed: " + r.stderr[:300])
+            if GPU_MODE == "colab_cli":
+                log("upload base + audio → Colab")
+                if not _colab_upload(norm, f"/content/{norm.name}"):
+                    raise RuntimeError("colab upload base failed")
+                if not _colab_upload(audio_path, f"/content/{pathlib.Path(audio_path).name}"):
+                    raise RuntimeError("colab upload audio failed")
+            else:
+                log("copy base + audio → 本地 GPU")
+                r = run(SCP + [str(norm), str(audio_path), REMOTE + ":/content/"], timeout=180)
+                if r.returncode != 0:
+                    raise RuntimeError("copy failed: " + r.stderr[:300])
 
             engine = opts.get("engine") or "musetalk"
             # 兼容前端 engine key
@@ -278,33 +450,53 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 cmd = f"bash /content/hg/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote}"
             else:
                 cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
-            # 实时日志:stream 行写入 j["log"] 供前端轮询
-            local_cmd = _rewrite_local(SSH + [cmd])
-            log_file = jd / "synthesize.log"
-            import subprocess as _sp
-            with open(str(log_file), "w") as lf:
-                p = _sp.Popen(local_cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                              text=True, start_new_session=True)
-                for line in p.stdout:
-                    line = line.rstrip('\n').rstrip('\r')
-                    if line:
+
+            if GPU_MODE == "colab_cli":
+                log("colab exec: " + cmd[:80])
+                rc, output = _colab_exec(cmd, timeout=600)
+                for line in output.splitlines():
+                    if line.strip():
                         log(f"[MuseTalk] {line[:120]}")
-                    lf.write(line + "\n")
-                p.wait()
-                rc = p.returncode
-            if rc != 0:
-                raise RuntimeError("MuseTalk failed, check log")
+                if rc != 0:
+                    raise RuntimeError("MuseTalk failed via colab CLI")
+            else:
+                # 实时日志:stream 行写入 j["log"] 供前端轮询
+                local_cmd = _rewrite_local(SSH + [cmd])
+                log_file = jd / "synthesize.log"
+                import subprocess as _sp
+                with open(str(log_file), "w") as lf:
+                    p = _sp.Popen(local_cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                                  text=True, start_new_session=True)
+                    for line in p.stdout:
+                        line = line.rstrip('\n').rstrip('\r')
+                        if line:
+                            log(f"[MuseTalk] {line[:120]}")
+                        lf.write(line + "\n")
+                    p.wait()
+                    rc = p.returncode
+                if rc != 0:
+                    raise RuntimeError("MuseTalk failed, check log")
+
             # 验证输出
-            r2 = _sp.run(["bash", "-lc", f"test -f {out_remote} && echo OK || echo MISSING"],
-                         capture_output=True, text=True)
-            if "OK" not in (r2.stdout or ""):
-                raise RuntimeError("MuseTalk did not produce output")
+            if GPU_MODE == "colab_cli":
+                check_rc, check_out = _colab_exec(f"test -f {out_remote} && echo OK || echo MISSING", timeout=30)
+                if "OK" not in check_out:
+                    raise RuntimeError("MuseTalk did not produce output")
+            else:
+                r2 = _sp.run(["bash", "-lc", f"test -f {out_remote} && echo OK || echo MISSING"],
+                             capture_output=True, text=True)
+                if "OK" not in (r2.stdout or ""):
+                    raise RuntimeError("MuseTalk did not produce output")
             log("done")
 
             j["stage"] = "取回成片"
-            r = run(SCP + [REMOTE + ":" + out_remote, str(result)], timeout=180)
-            if r.returncode != 0 or not result.exists():
-                raise RuntimeError("copy download failed: " + r.stderr[:300])
+            if GPU_MODE == "colab_cli":
+                if not _colab_download(out_remote, result):
+                    raise RuntimeError("colab download failed")
+            else:
+                r = run(SCP + [REMOTE + ":" + out_remote, str(result)], timeout=180)
+                if r.returncode != 0 or not result.exists():
+                    raise RuntimeError("copy download failed: " + r.stderr[:300])
 
         if opts.get("sharp"):
             j["stage"] = "牙齿高清(锐化增强)"
@@ -431,6 +623,20 @@ def cover(job_id):
 
 def _transcribe(path):
     """转写参考音频 → 文字。用 CosyVoice 环境里的 whisper medium 模型。"""
+    if GPU_MODE == "colab_cli":
+        # 通过 colab CLI 远程转写
+        remote_audio = f"/content/_ref_{pathlib.Path(path).name}"
+        if not _colab_upload(path, remote_audio):
+            return ""
+        script = (
+            "import whisper,sys,json; "
+            "m=whisper.load_model('medium',device='cuda'); "
+            f"r=m.transcribe('{remote_audio}',fp16=True,language='zh'); "
+            "sys.stdout.write(r['text'].strip())"
+        )
+        rc, out = _colab_exec(f"cd /content/cosy && env/bin/python -c {shlex.quote(script)}", timeout=300)
+        return out.strip() if rc == 0 else ""
+    # 本地 Colab 环境
     cosy_py = pathlib.Path("/content/cosy/env/bin/python")
     if not cosy_py.exists():
         return ""
@@ -518,13 +724,45 @@ def tts():
     cosy_dir = pathlib.Path("/content/cosy")
     cosy_py = cosy_dir / "env/bin/python"
     cosy_script = cosy_dir / "cosyvoice_tts.py"
-    if not cosy_script.exists():
-        return jsonify({"error": "CosyVoice 未安装,请先在安装管理中安装"}), 503
-
 
     import base64
     t_b64 = base64.b64encode(text.encode()).decode()
     rt_b64 = base64.b64encode(ref_text.encode()).decode()
+
+    if GPU_MODE == "colab_cli":
+        # 上传 ref 音频到 Colab
+        remote_ref = f"/content/_ref_{jid}.wav"
+        if not _colab_upload(ref, remote_ref):
+            return jsonify({"error": "上传参考音频到 Colab 失败"}), 500
+        # 远程执行 CosyVoice TTS
+        cmd = (f"export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
+               f"cd /content/cosy && nohup env/bin/python cosyvoice_tts.py "
+               f"--ref {remote_ref} --ref-text-b64 {rt_b64} "
+               f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} "
+               f"--out /content/tts_{jid}.wav "
+               f"> /content/tts_{jid}.log 2>&1; echo done > /content/tts_{jid}.done &")
+        _colab_exec(cmd, timeout=10)
+        # 轮询完成
+        for _ in range(120):
+            time.sleep(3)
+            check_rc, check_out = _colab_exec(f"cat /content/tts_{jid}.done 2>/dev/null && echo DONE", timeout=10)
+            if "DONE" in check_out:
+                break
+        # 下载结果
+        result_wav = WORK / f"tts_{jid}.wav"
+        if not _colab_download(f"/content/tts_{jid}.wav", result_wav):
+            log_out = ""
+            _, log_out = _colab_exec(f"tail -5 /content/tts_{jid}.log 2>/dev/null", timeout=10)
+            return jsonify({"error": "CosyVoice TTS 失败: " + log_out[:200]}), 500
+        # 入媒体库
+        _media_add({"id": jid, "type": "audio", "file": result_wav.name,
+                    "note": f"CosyVoice 配音({len(text)}字)"})
+        return send_file(result_wav, mimetype="audio/wav",
+                         as_attachment=True, download_name=f"tts_{jid}.wav")
+
+    # 本机 Colab 环境
+    if not cosy_script.exists():
+        return jsonify({"error": "CosyVoice 未安装,请先在安装管理中安装"}), 503
 
     out_wav = cosy_dir / f"tts_{jid}.wav"
     done_file = cosy_dir / f"tts_{jid}.done"
@@ -1086,7 +1324,26 @@ def gen_srt():
         except Exception:
             pass  # Groq 失败，回退到本机
 
-    # 策略 2: 本机 CosyVoice 环境 whisper medium（GPU，~30-60s）
+    # 策略 2: Colab whisper medium（GPU，~30-60s）
+    if GPU_MODE == "colab_cli":
+        remote_audio = f"/content/_srt_{tmp.name}"
+        if _colab_upload(tmp, remote_audio):
+            script = (
+                "import sys, os, warnings, json; "
+                "warnings.filterwarnings('ignore'); os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; "
+                "import whisper; m=whisper.load_model('medium',device='cuda'); "
+                f"r=m.transcribe('{remote_audio}',language='zh',verbose=False); "
+                "sys.stdout.write(json.dumps(r['segments'],ensure_ascii=False))"
+            )
+            rc, out = _colab_exec(f"cd /content/cosy && env/bin/python -c {shlex.quote(script)}", timeout=300)
+            if rc == 0:
+                try:
+                    segs = json.loads(out)
+                    if segs:
+                        return jsonify({"srt": _to_srt(segs), "segments": len(segs), "provider": "colab-whisper"})
+                except Exception:
+                    pass
+    # 本机 CosyVoice 环境 whisper medium
     cosy_dir = pathlib.Path("/content/cosy")
     if cosy_dir.exists():
         try:
@@ -1104,7 +1361,7 @@ def gen_srt():
                 return jsonify({"srt": _to_srt(segs), "segments": len(segs), "provider": "local-whisper"})
         except Exception as e:
             return jsonify({"error": f"本机识别失败: {e}"}), 500
-    return jsonify({"error": "缺转写凭据，且无本机 whisper 环境"}), 500
+    return jsonify({"error": "缺转写凭据，且无 whisper 环境(Colab/本地)"}), 500
 
 
 @app.get("/api/media")
@@ -1184,25 +1441,30 @@ def _resolve_vid(url):
 
 
 def _openai_provider():
-    """从 global.json 找第一个有 apiKey 的 openai/anthropic 协议 provider（跳过 voice/stt）。"""
+    """直接从 global.json 选择可用的 OpenAI 协议 provider。"""
     try:
-        gj = json.load(open(pathlib.Path.home() / "cicy-ai/global.json"))
-        defs = (gj.get("providers", {}).get("default") or {})
-        items = gj.get("providers", {}).get("items") or []
-        # 按默认 provider 顺序优先，然后补其余的
-        order = [v for v in defs.values() if isinstance(v, str) and v not in ("groqStt","doubaoVoice","zhipuVision")]
-        ordered = sorted(items, key=lambda x: order.index(x["key"]) if x["key"] in order else 999)
-        for p in ordered:
-            k = (p.get("apiKey") or "").strip()
-            proto = (p.get("protocol") or "").lower()
-            if k and proto in ("openai", "anthropic"):
+        providers = load_global_cfg().get("providers", {})
+        items = providers.get("items") or []
+        by_key = {p.get("key"): p for p in items}
+        preferred = [
+            "defaultOpenAi",
+            (providers.get("default") or {}).get("cicy"),
+            "deepseek",
+            "deepseek_openai",
+        ]
+        for key in preferred:
+            p = by_key.get(key)
+            if p and (p.get("protocol") or "").lower() == "openai" and (p.get("apiKey") or "").strip():
+                return p
+        for p in items:
+            if (p.get("protocol") or "").lower() == "openai" and (p.get("apiKey") or "").strip():
                 return p
     except Exception:
         pass
     if os.environ.get("OPENAI_API_KEY"):
         return {"url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
                 "apiKey": os.environ["OPENAI_API_KEY"],
-                "defaultModel": os.environ.get("OPENAI_MODEL", "gpt-4o-mini")}
+                "defaultModel": os.environ.get("OPENAI_MODEL", "")}
     return None
 
 
@@ -1211,12 +1473,16 @@ def _chat(messages, model=None, max_tokens=1200, timeout=90):
     p = _openai_provider()
     if not p:
         raise RuntimeError("global.json 缺 defaultOpenAi")
-    mdl = model or "deepseek-v4-flash"
+    mdl = model or p.get("defaultModel") or "deepseek-v4-flash"
     body = json.dumps({"model": mdl, "messages": messages,
                        "max_tokens": max_tokens, "temperature": 0.9}).encode()
-    req = urllib.request.Request(p["url"].rstrip("/") + "/v1/chat/completions", data=body,
+    endpoint = (p.get("url") or "").rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint += "/chat/completions" if endpoint.endswith("/v1") else "/v1/chat/completions"
+    req = urllib.request.Request(endpoint, data=body,
                                  headers={"Authorization": "Bearer " + p["apiKey"],
-                                          "Content-Type": "application/json"})
+                                          "Content-Type": "application/json",
+                                          "User-Agent": "cicy-koubo/0.1"})
     r = json.load(urllib.request.urlopen(req, timeout=timeout))
     return r["choices"][0]["message"].get("content", "").strip()
 
@@ -1266,28 +1532,28 @@ def title():
 
 
 def _groq_key():
-    """优先用 groqStt 的 key，没有则回退到 _openai_provider 的 key。"""
+    """只从 global.json（或显式环境变量）读取 Groq STT key。"""
+    if os.environ.get("GROQ_API_KEY"):
+        return os.environ["GROQ_API_KEY"]
     try:
-        gj = json.load(open(pathlib.Path.home() / "cicy-ai/global.json"))
+        gj = load_global_cfg()
         for x in (gj.get("providers", {}).get("items") or []):
-            if x.get("key") == "groqStt":
+            if x.get("key") in ("groqStt", "groq_stt"):
                 k = (x.get("apiKey") or "").strip()
                 if k:
                     return k
     except Exception:
         pass
-    # 回退：用任意有效 openai provider 的 key
-    p = _openai_provider()
-    if p:
-        return p.get("apiKey", "")
-    return os.environ.get("GROQ_API_KEY", "")
+    return ""
 
 
 @app.post("/api/extract")
 def extract():
     """抖音链接 → 下载音频 → Groq 转写 → 返回文案。"""
-    url = (request.json or {}).get("url", "").strip()
-    force = (request.json or {}).get("force", False)
+    body = request.json or {}
+    url = body.get("url", "").strip()
+    media_url = body.get("media_url", "").strip()
+    force = body.get("force", False)
     if "douyin.com" not in url:
         return jsonify({"error": "请粘贴抖音分享链接(含 v.douyin.com)"}), 400
     jd = WORK / ("dy_" + uuid.uuid4().hex[:8])
@@ -1304,23 +1570,39 @@ def extract():
                 eu = e.get("url", "")
                 if url == eu or (code and code in eu) or (code and code == e.get("id")):
                     return jsonify({"text": e["text"], "audio": e.get("audio"), "cached": True})
-        # 第二层:解析短链拿数字ID再查(处理换了短链但同一视频的情况)
-        if not force:
+        # 第二层:解析短链拿数字ID再查(处理换了短链但同一视频的情况)。
+        # agent-electron 已从登录页面拿到 media 时不再走慢短链/CDP 下载链路。
+        if not force and not media_url:
             pre_vid = _resolve_vid(url)
             if pre_vid:
                 for e in _load_scripts():
                     if e.get("id") == pre_vid:
                         return jsonify({"text": e["text"], "audio": e.get("audio"), "cached": True})
-        dl = _douyin_dl()
-        if not dl:
-            return jsonify({"error": "本机没有 douyin-dl 提取组件(设 KOUBO_DOUYIN_DL 指向脚本,或升级 cicy-koubo)"}), 500
-        dlcmd = [str(dl)] if os.access(dl, os.X_OK) else ["node", str(dl)]
-        r = run(dlcmd + [url, "-o", str(jd)], timeout=180)
         media, vid = "", ""
-        for line in (r.stdout or "").splitlines():
-            if line.startswith("media="):
-                media = line.split("=", 1)[1].strip()
-                vid = pathlib.Path(media).stem.replace("dy_", "")
+        if media_url:
+            import urllib.request
+            import urllib.parse
+            parsed = urllib.parse.urlparse(url)
+            vm = re.search(r"/video/(\d+)", parsed.path)
+            qm = urllib.parse.parse_qs(urllib.parse.urlparse(media_url).query).get("__vid", [])
+            vid = (vm.group(1) if vm else "") or (qm[0] if qm else "") or uuid.uuid4().hex[:12]
+            media = str(jd / f"dy_{vid}.mp4")
+            req = urllib.request.Request(media_url, headers={
+                "User-Agent": request.headers.get("User-Agent") or "Mozilla/5.0",
+                "Referer": "https://www.douyin.com/",
+            })
+            with urllib.request.urlopen(req, timeout=180) as src, open(media, "wb") as dst:
+                _sht.copyfileobj(src, dst)
+        else:
+            dl = _douyin_dl()
+            if not dl:
+                return jsonify({"error": "本机没有 douyin-dl 提取组件(设 KOUBO_DOUYIN_DL 指向脚本,或升级 cicy-koubo)"}), 500
+            dlcmd = [str(dl)] if os.access(dl, os.X_OK) else ["node", str(dl)]
+            r = run(dlcmd + [url, "-o", str(jd)], timeout=180)
+            for line in (r.stdout or "").splitlines():
+                if line.startswith("media="):
+                    media = line.split("=", 1)[1].strip()
+                    vid = pathlib.Path(media).stem.replace("dy_", "")
         # 命中缓存(同一视频)直接返回,除非 force;下载失败也回退到缓存
         if vid and not force:
             for e in _load_scripts():
@@ -1330,18 +1612,37 @@ def extract():
             for e in _load_scripts():  # 下载失败但曾缓存过 → 用缓存
                 if url in (e.get("url") or "") or (vid and e.get("id") == vid):
                     return jsonify({"text": e["text"], "cached": True, "note": "下载失败,返回历史缓存"})
-            return jsonify({"error": "下载失败(抖音风控),稍后重试。日志:" + (r.stdout or r.stderr)[-200:]}), 502
-        gk = _groq_key()
-        if not gk:
-            return jsonify({"error": "缺 Groq 转写凭据"}), 500
-        proxy = os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy", ""))
-        cmd = ["curl", "-s", "https://api.groq.com/openai/v1/audio/transcriptions",
-               "-H", f"Authorization: Bearer {gk}", "-F", f"file=@{media}",
-               "-F", "model=whisper-large-v3-turbo", "-F", "language=zh"]
-        if proxy:
-            cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
-        tr = run(cmd, timeout=180)
-        text = json.loads(tr.stdout).get("text", "").strip()
+            detail = "" if media_url else (r.stdout or r.stderr)[-200:]
+            return jsonify({"error": "下载失败(抖音风控),稍后重试。日志:" + detail}), 502
+        # 转写: Colab whisper
+        text = ""
+        if GPU_MODE == "colab_cli":
+            remote_audio = f"/content/_dy_{pathlib.Path(media).name}"
+            if _colab_upload(media, remote_audio):
+                script = (
+                    "import whisper,sys,json; "
+                    "m=whisper.load_model('medium',device='cuda'); "
+                    f"r=m.transcribe('{remote_audio}',language='zh',verbose=False); "
+                    "sys.stdout.write(r['text'].strip())"
+                )
+                rc, out = _colab_exec(f"cd /content/cosy && env/bin/python -c {shlex.quote(script)}", timeout=300)
+                if rc == 0:
+                    text = out.strip()
+        if not text:
+            # fallback: 本机 CosyVoice 环境
+            cosy_py = pathlib.Path("/content/cosy/env/bin/python")
+            if cosy_py.exists():
+                try:
+                    r = subprocess.run([str(cosy_py), "-c", (
+                        "import whisper,sys; m=whisper.load_model('medium',device='cuda'); "
+                        f"r=m.transcribe('{media}',language='zh'); "
+                        "print(r['text'].strip())"
+                    )], capture_output=True, text=True, timeout=300)
+                    text = r.stdout.strip() if r.returncode == 0 else ""
+                except Exception:
+                    pass
+        if not text:
+            return jsonify({"error": "转写失败:无可用 whisper 环境(Colab/本地)"}), 500
         _save_script({"id": vid, "url": url, "text": text, "audio": media,
                       "ts": time.strftime("%Y-%m-%d %H:%M")})
         return jsonify({"text": text, "audio": media, "cached": False})
@@ -1550,6 +1851,15 @@ def media_update():
 
 def _is_installing(key):
     """检测 /content/<key>/provision.sh 是否在运行。匹配进程命令行里的路径。"""
+    if GPU_MODE == "colab_cli":
+        try:
+            rc, out = _colab_exec(
+                f"pgrep -f '/content/{key}/[p]rovision.sh' >/dev/null && echo YES || echo NO",
+                timeout=15,
+            )
+            return rc == 0 and out.strip().endswith("YES")
+        except Exception:
+            return False
     try:
         r = subprocess.run(["pgrep", "-f", f"/content/{key}/provision.sh"],
                            capture_output=True, timeout=5)
@@ -1571,67 +1881,190 @@ def _ensure_cjk_font():
 _ensure_cjk_font()
 
 
-@app.get("/api/llm-keys")
-def api_llm_keys():
-    """返回当前 LLM provider 的 key 信息（脱敏）"""
-    gj_path = pathlib.Path.home() / "cicy-ai/global.json"
-    items = []
-    try:
-        gj = json.load(open(gj_path))
-        providers = gj.get("providers", {}).get("items") or []
-        for p in providers:
-            k = (p.get("apiKey") or "").strip()
-            proto = (p.get("protocol") or "").lower()
-            pkey = p.get("key", "")
-            # 只展示豆包(配音)和 deepseek(改写/提取)
-            if pkey not in ("deepseek", "deepseek_claude", "doubaoVoice", "doubao"):
-                continue
-            if proto in ("openai", "anthropic", "voice"):
-                masked = k[:4] + "****" + k[-4:] if len(k) > 10 else ("****" if k else "未设置")
-                usage = {"openai": "改写/提取", "anthropic": "改写/提取", "voice": "配音"}.get(proto, proto)
-                items.append({
-                    "key": p.get("key", ""),
-                    "name": p.get("name", ""),
-                    "protocol": proto,
-                    "url": p.get("url", ""),
-                    "model": p.get("defaultModel", ""),
-                    "usage": usage,
-                    "masked": masked,
-                })
-    except Exception:
-        pass
-    return jsonify({"providers": items})
-
-
-@app.post("/api/llm-keys")
-def api_llm_keys_save():
-    """保存/更新 LLM provider key"""
-    data = request.get_json(force=True) or {}
-    provider_key = data.get("key", "")
-    api_key = data.get("apiKey", "").strip()
-    if not provider_key or not api_key:
-        return jsonify({"error": "缺少 key 或 apiKey"}), 400
-    gj_path = pathlib.Path.home() / "cicy-ai/global.json"
-    try:
-        gj = json.load(open(gj_path))
-        items = gj.get("providers", {}).get("items") or []
-        for p in items:
-            if p.get("key") == provider_key:
-                p["apiKey"] = api_key
-                break
-        gj.setdefault("providers", {})["items"] = items
-        json.dump(gj, open(gj_path, "w"), ensure_ascii=False, indent=2)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
     "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt",   "est_min": 23, "est_size_gb": 15},
     "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "est_min": 24, "est_size_gb": 18},
+    "whisper":  {"name": "Whisper",   "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "builtin": True},
     "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg",   "est_min":  5, "est_size_gb": 2.6},
 }
+
+COLAB_GPUS = ("T4", "L4", "G4", "H100", "A100")
+
+
+@app.get("/api/colab/profiles")
+def api_colab_profiles():
+    """列出可切换的 Google/Colab 配置档，不返回凭据内容。"""
+    _, colab = _colab_profiles_cfg()
+    items = []
+    for raw in colab["profiles"]:
+        p = dict(raw)
+        p["auth"] = (p.get("auth") or "oauth2").lower()
+        cred = pathlib.Path(os.path.expanduser(p.get("credentials_path") or ""))
+        if p["auth"] == "oauth2":
+            p["credentials_ready"] = (pathlib.Path.home() / ".config/colab-cli/token.json").is_file()
+        else:
+            p["credentials_ready"] = bool(p.get("credentials_path")) and cred.is_file()
+        items.append(p)
+    return jsonify({"active": colab["active"], "profiles": items, "gpu_options": COLAB_GPUS})
+
+
+@app.post("/api/colab/profiles")
+def api_colab_profiles_save():
+    data = request.get_json(force=True) or {}
+    cfg, colab = _colab_profiles_cfg()
+    if data.get("active"):
+        wanted = data["active"]
+        if not any(p.get("id") == wanted for p in colab["profiles"]):
+            return jsonify({"error": "配置档不存在"}), 404
+        colab["active"] = wanted
+        save_global_cfg(cfg)
+        return jsonify({"ok": True})
+    profile = data.get("profile") or {}
+    profile_id = "".join(c for c in (profile.get("id") or f"google-{int(time.time())}") if c.isalnum() or c in "-_")
+    gpu = (profile.get("gpu") or "T4").upper()
+    if not profile_id or gpu not in COLAB_GPUS:
+        return jsonify({"error": "配置档 ID 或 GPU 类型无效"}), 400
+    normalized = {
+        "id": profile_id,
+        "name": (profile.get("name") or profile_id).strip(),
+        "auth": (profile.get("auth") or "oauth2").lower(),
+        "credentials_path": os.path.expanduser((profile.get("credentials_path") or "").strip()),
+        "session_config": os.path.expanduser((profile.get("session_config") or
+                                               f"~/.config/colab-cli/{profile_id}-sessions.json").strip()),
+        "session": (profile.get("session") or f"koubo-{profile_id}").strip(),
+        "gpu": gpu,
+    }
+    if normalized["auth"] not in ("oauth2", "adc"):
+        return jsonify({"error": "授权方式仅支持 oauth2 或 adc"}), 400
+    if normalized["auth"] == "adc" and not normalized["credentials_path"]:
+        return jsonify({"error": "请填写该 Google 账号的 ADC 凭据文件路径"}), 400
+    existing = next((p for p in colab["profiles"] if p.get("id") == profile_id), None)
+    if existing:
+        existing.update(normalized)
+    else:
+        colab["profiles"].append(normalized)
+    colab["active"] = profile_id
+    pathlib.Path(normalized["session_config"]).parent.mkdir(parents=True, exist_ok=True)
+    save_global_cfg(cfg)
+    return jsonify({"ok": True, "profile": normalized})
+
+
+@app.post("/api/colab/session/start")
+def api_colab_session_start():
+    profile = _active_colab_profile()
+    if profile["auth"] == "adc" and not pathlib.Path(profile["credentials_path"]).is_file():
+        return jsonify({"error": "当前账号的 ADC 凭据文件不存在"}), 400
+    args = _colab_base_args(profile) + ["new", "-s", profile["session"], "--gpu", profile["gpu"]]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180,
+                           env=_colab_env(profile))
+        if r.returncode:
+            return jsonify({"error": (r.stderr or r.stdout)[-800:]}), 500
+        cfg, colab = _colab_profiles_cfg()
+        current = next((p for p in colab["profiles"] if p.get("id") == colab["active"]), None)
+        if current is not None:
+            current["started_at"] = time.time()
+            save_global_cfg(cfg)
+        return jsonify({"ok": True, "session": profile["session"], "gpu": profile["gpu"],
+                        "output": (r.stdout or "").strip()[-500:]})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/colab/session/stop")
+def api_colab_session_stop():
+    profile = _active_colab_profile()
+    try:
+        r = subprocess.run(_colab_base_args(profile) + ["stop", "-s", profile["session"]],
+                           capture_output=True, text=True, timeout=60, env=_colab_env(profile))
+        if r.returncode:
+            return jsonify({"error": (r.stderr or r.stdout)[-800:]}), 500
+        cfg, colab = _colab_profiles_cfg()
+        current = next((p for p in colab["profiles"] if p.get("id") == colab["active"]), None)
+        if current is not None:
+            current.pop("started_at", None)
+            save_global_cfg(cfg)
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/colab/session")
+def api_colab_session_status():
+    """返回当前配置档的会话状态与运行时长，不暴露会话 token。"""
+    profile = _active_colab_profile()
+    state_path = pathlib.Path(profile["session_config"])
+    try:
+        sessions = json.loads(state_path.read_text()) if state_path.exists() else {}
+        session = sessions.get(profile["session"])
+    except Exception:
+        session = None
+    account_email = ""
+    try:
+        who = subprocess.run(_colab_base_args(profile) + ["whoami"], capture_output=True,
+                             text=True, timeout=30, env=_colab_env(profile))
+        for line in (who.stdout or who.stderr).splitlines():
+            if line.startswith("Email:"):
+                account_email = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+    common = {
+        "session": profile["session"],
+        "gpu": profile["gpu"],
+        "account_email": account_email,
+        "plan": None,
+        "compute_units": None,
+        "manage_url": "https://colab.research.google.com/signup",
+    }
+    if not session:
+        return jsonify({"running": False, **common})
+    endpoint = session.get("endpoint", "")
+    started_at = None
+    history = state_path.parent / "history" / f"{profile['session']}.jsonl"
+    if history.exists():
+        try:
+            for line in history.read_text().splitlines():
+                event = json.loads(line)
+                if event.get("event_type") == "session_created" and (
+                        not endpoint or event.get("endpoint") == endpoint):
+                    started_at = datetime.datetime.fromisoformat(
+                        event["timestamp"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+    if started_at is None:
+        _, colab = _colab_profiles_cfg()
+        current = next((p for p in colab["profiles"] if p.get("id") == colab["active"]), {})
+        started_at = current.get("started_at")
+    now = time.time()
+    gpu_usage = {}
+    try:
+        rc, raw_usage = _colab_exec(
+            "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw "
+            "--format=csv,noheader,nounits | head -1",
+            timeout=20,
+        )
+        parts = [part.strip() for part in raw_usage.splitlines()[-1].split(",")]
+        if rc == 0 and len(parts) >= 4:
+            gpu_usage = {
+                "utilization_percent": float(parts[0]),
+                "memory_used_mb": float(parts[1]),
+                "memory_total_mb": float(parts[2]),
+                "power_watts": float(parts[3]),
+            }
+    except Exception:
+        pass
+    return jsonify({
+        "running": True,
+        **common,
+        "gpu": session.get("accelerator") or profile["gpu"],
+        "variant": session.get("variant", ""),
+        "started_at": started_at,
+        "runtime_seconds": max(0, int(now - started_at)) if started_at else None,
+        "last_execution": (session.get("last_execution") or [None, None, None])[-1],
+        "gpu_usage": gpu_usage,
+    })
 
 # 启动时自动部署 provision 脚本到 /content/（Colab 重启后目录丢失）
 if pathlib.Path("/content").exists():
@@ -1670,8 +2103,10 @@ def api_system():
     info = {"gpu_name": "", "gpu_memory_mb": 0, "gpu_free_mb": 0,
             "cpu_cores": os.cpu_count() or 0,
             "ram_gb": 0, "disk_total_gb": 0, "disk_free_gb": 0,
-            "python_version": "", "cuda_version": "",
-            "is_colab": pathlib.Path("/content").exists()}
+            "python_version": "", "cuda_version": "", "ffmpeg_version": "",
+            "gpu_mode": GPU_MODE,
+            "is_colab": pathlib.Path("/content").exists(),
+            "colab_cli_installed": False, "colab_cli_version": ""}
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
@@ -1693,11 +2128,16 @@ def api_system():
     info["disk_total_gb"] = round(mem.total / (1024**3), 1)
     info["disk_free_gb"] = round(mem.free / (1024**3), 1)
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if "MemTotal:" in line:
-                    info["ram_gb"] = round(int(line.split()[1]) / (1024**2), 1)
-                    break
+        if pathlib.Path("/proc/meminfo").exists():
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if "MemTotal:" in line:
+                        info["ram_gb"] = round(int(line.split()[1]) / (1024**2), 1)
+                        break
+        else:
+            r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                info["ram_gb"] = round(int(r.stdout.strip()) / (1024**3), 1)
     except Exception:
         pass
     try:
@@ -1708,29 +2148,156 @@ def api_system():
             print(f"[api/system] python version failed rc={r.returncode} stderr={r.stderr[:80]}", file=_sys.stderr, flush=True)
     except Exception:
         pass
+    # ffmpeg
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        first_line = (r.stdout or "").splitlines()[0] if r.stdout else ""
+        # "ffmpeg version 7.1.1 Copyright ..."
+        info["ffmpeg_version"] = first_line.split()[2] if len(first_line.split()) >= 3 else first_line
+    except Exception:
+        pass
+    # whisper: CosyVoice 环境自带
+    info["whisper_local"] = ""
+    if GPU_MODE == "colab_cli":
+        # 远程检测 /content/cosy/env/bin/python 是否有 whisper
+        rc, out = _colab_exec("test -f /content/cosy/env/bin/python && /content/cosy/env/bin/python -c 'import whisper;print(whisper.__version__,end=\"\")' 2>/dev/null || echo ''", timeout=30)
+        if rc == 0 and out.strip():
+            info["whisper_local"] = out.strip()
+    else:
+        cosy_python = pathlib.Path.home() / "cosyvoice-venv/bin/python"
+        if cosy_python.exists():
+            try:
+                r = subprocess.run([str(cosy_python), "-c",
+                                    "import whisper; print(whisper.__version__, end='')"],
+                                   capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    info["whisper_local"] = r.stdout.strip() or "installed"
+            except Exception:
+                pass
+    # colab cli
+    try:
+        colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+        if pathlib.Path(colab_bin).exists():
+            info["colab_cli_installed"] = True
+            # 从 dist-info 读版本(uv tools 或 pip)
+            import glob as _glob
+            for pat in [str(pathlib.Path.home() / ".local/share/uv/tools/*/lib/python*/site-packages/google_colab_cli-*.dist-info"),
+                        str(pathlib.Path.home() / ".local/lib/python*/site-packages/google_colab_cli-*.dist-info")]:
+                for d in _glob.glob(pat):
+                    ver = d.split("google_colab_cli-")[1].split(".dist-info")[0]
+                    info["colab_cli_version"] = ver
+                    break
+                if info["colab_cli_version"]:
+                    break
+    except Exception:
+        pass
     return jsonify(info)
+
+
+@app.post("/api/install/ffmpeg")
+def install_ffmpeg():
+    """自动检测平台并安装 ffmpeg"""
+    import platform
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            r = subprocess.run(["brew", "install", "ffmpeg"], capture_output=True, text=True, timeout=600)
+        elif system == "Linux":
+            # 尝试 apt (Ubuntu/Debian) → yum (CentOS/RHEL) → apk (Alpine)
+            for pkg_mgr, install_cmd in [
+                ("apt-get", ["sudo", "apt-get", "update", "-qq", "&&", "sudo", "apt-get", "install", "-y", "ffmpeg"]),
+                ("yum", ["sudo", "yum", "install", "-y", "epel-release", "&&", "sudo", "yum", "install", "-y", "ffmpeg"]),
+                ("apk", ["sudo", "apk", "add", "ffmpeg"]),
+            ]:
+                if pathlib.Path(f"/usr/bin/{pkg_mgr}").exists() or pathlib.Path(f"/usr/bin/{pkg_mgr}-get").exists():
+                    r = subprocess.run(" ".join(install_cmd), shell=True, capture_output=True, text=True, timeout=600)
+                    break
+            else:
+                return jsonify({"error": "未找到包管理器(apt/yum/apk)，请手动安装 ffmpeg"}), 500
+        else:
+            return jsonify({"error": f"不支持的平台: {system}"}), 500
+        if r.returncode == 0:
+            # 验证安装
+            vr = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+            ver = (vr.stdout or "").splitlines()[0].split()[2] if len((vr.stdout or "").splitlines()[0].split()) >= 3 else "unknown"
+            return jsonify({"ok": True, "version": ver})
+        else:
+            return jsonify({"error": r.stderr[:500]}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/install/colab-cli")
+def install_colab_cli():
+    """安装官方 google-colab-cli；优先使用隔离的 uv tool。"""
+    try:
+        if _sht.which("uv"):
+            cmd = ["uv", "tool", "install", "--force", "google-colab-cli"]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade", "google-colab-cli"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+            vr = subprocess.run([colab_bin, "version"], capture_output=True, text=True, timeout=15)
+            version = (vr.stdout or vr.stderr).strip().splitlines()[-1] if (vr.stdout or vr.stderr).strip() else "installed"
+            return jsonify({"ok": True, "version": version})
+        else:
+            return jsonify({"error": (r.stderr or r.stdout)[-800:],
+                            "command": " ".join(cmd[:3])}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.get("/api/engines")
 def api_engines():
     out = []
+    is_remote = GPU_MODE == "colab_cli"
+    # 远程检测: colab cli 模式下通过 exec 检查 READY 文件
+    remote_status = {}
+    if is_remote:
+        for key, cfg in ENGINES.items():
+            ready_remote = cfg["ready"]
+            script = f"/content/{key}/[p]rovision.sh"
+            rc, out_txt = _colab_exec(
+                f"(test -f {ready_remote} && cat {ready_remote} || true); "
+                f"echo __KOUBO_INSTALLING__; "
+                f"(pgrep -f '{script}' >/dev/null && echo YES || echo NO)",
+                timeout=30,
+            )
+            before, _, after = out_txt.rpartition("__KOUBO_INSTALLING__")
+            remote_status[key] = {
+                "installed": bool(before.strip()),
+                "version_text": before.strip(),
+                "installing": after.strip().endswith("YES"),
+            }
     for key, cfg in ENGINES.items():
-        ready = pathlib.Path(cfg["ready"])
-        installed = ready.exists()
-        version_info = {}
-        if installed:
-            try:
-                for line in ready.read_text().strip().splitlines():
+        if is_remote:
+            rs = remote_status.get(key, {})
+            installed = rs.get("installed", False)
+            version_info = {}
+            if installed and rs.get("version_text"):
+                for line in rs["version_text"].splitlines():
                     if "=" in line:
                         k, v = line.split("=", 1)
                         version_info[k.strip()] = v.strip()
-            except Exception:
-                pass
-        installing = _is_installing(key)
+        else:
+            ready = pathlib.Path(cfg["ready"])
+            installed = ready.exists()
+            version_info = {}
+            if installed:
+                try:
+                    for line in ready.read_text().strip().splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            version_info[k.strip()] = v.strip()
+                except Exception:
+                    pass
+        installing = remote_status.get(key, {}).get("installing", False) if is_remote else _is_installing(key)
         has_script = (pathlib.Path(cfg["dir"]) / "provision.sh").exists()
         out.append({"key": key, "name": cfg["name"],
                     "installed": installed, "installing": installing,
                     "version_info": version_info, "has_script": has_script,
+                    "remote": is_remote, "builtin": cfg.get("builtin", False),
                     "est_min": cfg.get("est_min"), "est_size_gb": cfg.get("est_size_gb")})
     return jsonify({"engines": out})
 
@@ -1740,9 +2307,20 @@ def api_engine_log(engine):
     if engine not in ENGINES:
         return jsonify({"error": "unknown engine"}), 404
     logf = pathlib.Path(ENGINES[engine]["dir"]) / "provision.log"
+    tail = request.args.get("tail", 200, type=int)
+    # colab cli 模式: 远程读日志
+    if GPU_MODE == "colab_cli":
+        script = f"/content/{engine}/[p]rovision.sh"
+        rc, out = _colab_exec(
+            f"tail -n {max(20, min(tail, 1000))} {logf} 2>/dev/null || true; "
+            f"echo __KOUBO_INSTALLING__; "
+            f"(pgrep -f '{script}' >/dev/null && echo YES || echo NO)",
+            timeout=30,
+        )
+        text, _, state = out.rpartition("__KOUBO_INSTALLING__")
+        return jsonify({"lines": text.splitlines(), "installing": state.strip().endswith("YES"), "remote": True})
     if not logf.exists():
         return jsonify({"lines": [], "installing": False})
-    tail = request.args.get("tail", 200, type=int)
     try:
         lines = logf.read_text().splitlines()[-tail:]
     except Exception:
@@ -1758,6 +2336,32 @@ def api_engine_stream(engine):
         return jsonify({"error": "unknown engine"}), 404
     logf = pathlib.Path(ENGINES[engine]["dir"]) / "provision.log"
     def generate():
+        if GPU_MODE == "colab_cli":
+            previous = None
+            import time as _time
+            for _ in range(1800):  # 最长约 2 小时，每次远程读取后等待
+                script = f"/content/{engine}/[p]rovision.sh"
+                try:
+                    rc, out = _colab_exec(
+                        f"tail -c 30000 {logf} 2>/dev/null || true; "
+                        f"echo __KOUBO_INSTALLING__; "
+                        f"(pgrep -f '{script}' >/dev/null && echo YES || echo NO)",
+                        timeout=20,
+                    )
+                    text, _, state = out.rpartition("__KOUBO_INSTALLING__")
+                    text = text.replace("\r", "\n")
+                    if text != previous:
+                        yield f"data: {json.dumps({'replace': text, 'remote': True})}\n\n"
+                        previous = text
+                    else:
+                        yield ": keepalive\n\n"
+                    if not state.strip().endswith("YES"):
+                        yield f"data: {json.dumps({'done': True, 'remote': True})}\n\n"
+                        return
+                except Exception as exc:
+                    yield f"data: {json.dumps({'warning': '远程日志暂时不可用，正在重试'})}\n\n"
+                _time.sleep(2)
+            return
         # 先推送已有日志
         if logf.exists():
             try:
@@ -1796,6 +2400,23 @@ def api_engine_install(engine):
     if engine not in ENGINES:
         return jsonify({"error": "unknown engine"}), 404
     cfg = ENGINES[engine]
+    src_dir = SRC_DIR.parent / "scripts/provision" / engine
+    if not src_dir.exists():
+        return jsonify({"error": f"{cfg['name']} 安装脚本目录不存在: {src_dir}"}), 404
+    # colab cli 模式: 上传脚本到远程再执行
+    if GPU_MODE == "colab_cli":
+        remote_dir = cfg["dir"]
+        # 上传整个目录
+        for sf in src_dir.iterdir():
+            if sf.is_file():
+                ok = _colab_upload(sf, f"{remote_dir}/{sf.name}")
+                if not ok:
+                    return jsonify({"error": f"上传 {sf.name} 到 Colab 失败"}), 500
+        # 远程执行 provision.sh
+        script = f"{remote_dir}/provision.sh"
+        rc, out = _colab_exec(f"chmod +x {script} && nohup bash {script} > {remote_dir}/provision.log 2>&1 &", timeout=30)
+        return jsonify({"ok": True, "started": True, "remote": True, "log_path": f"{remote_dir}/provision.log"})
+    # 本机模式
     script = pathlib.Path(cfg["dir"]) / "provision.sh"
     if not script.exists():
         return jsonify({"error": f"{cfg['name']} 安装脚本不存在 — 请先准备 {script}"}), 404

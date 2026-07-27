@@ -217,8 +217,15 @@ async function main() {
       if (run('ffmpeg', ['-y', '-i', outfile, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', audioIn], { stdio: 'ignore' }).status !== 0) die('抽音轨失败');
     }
     if (opt.engine === 'groq') {
-      // Groq whisper-large-v3-turbo:快、准、免费额度大。凭据: $GROQ_API_KEY 或 global.json providers key=groqStt
+      // Groq whisper-large-v3-turbo。凭据优先级:环境变量 → koubo.json → 旧 global.json。
       let gk = process.env.GROQ_API_KEY || '', gu = 'https://api.groq.com/openai/v1';
+      if (!gk) {
+        try {
+          const gj = JSON.parse(fs.readFileSync(path.join(HOME, 'cicy-ai/db/koubo.json'), 'utf8'));
+          const p = ((gj.providers && gj.providers.items) || []).find(x => x.key === 'groq_stt' || x.key === 'groqStt');
+          if (p) { gk = p.apiKey; gu = p.url || gu; }
+        } catch (e) {}
+      }
       if (!gk) {
         try {
           const gj = JSON.parse(fs.readFileSync(path.join(HOME, 'cicy-ai/global.json'), 'utf8'));
