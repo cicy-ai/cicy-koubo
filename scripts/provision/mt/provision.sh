@@ -18,13 +18,37 @@ ENV=$WORK/env
 REPO=$WORK/MuseTalk
 RAW=https://raw.githubusercontent.com/cicy-ai/cicy-tools/main
 export MAMBA_ROOT_PREFIX=$WORK/mamba
+export PIP_CACHE_DIR=/content/.cache/pip
+export HF_HOME=/content/.cache/huggingface
+export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
+export HF_HUB_DOWNLOAD_TIMEOUT=120
+export HF_HUB_ETAG_TIMEOUT=15
+# hf_transfer uses a small global permit pool. Multiple concurrent repository
+# downloads can exhaust it with "no permits available" on Colab. The standard
+# downloader is resumable and more reliable; disable Xet signed-CAS as well.
+export HF_HUB_ENABLE_HF_TRANSFER=0
+export HF_HUB_DISABLE_XET=1
+export PIP_DEFAULT_TIMEOUT=120
+export PIP_RETRIES=8
+export GIT_TERMINAL_PROMPT=0
 
 log() { echo "=== [$(date +%H:%M:%S)] $*"; }
 die() { echo "!!! $*" >&2; exit 1; }
+retry() {
+  local attempt=1
+  until "$@"; do
+    [ "$attempt" -ge 5 ] && return 1
+    log "下载失败，${attempt}/5；稍后续传重试"
+    sleep $((attempt * 3))
+    attempt=$((attempt + 1))
+  done
+}
 
 rm -f $WORK/READY
+mkdir -p "$PIP_CACHE_DIR" "$HUGGINGFACE_HUB_CACHE"
 GPU=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader) || die "no GPU on this runtime"
 log "GPU: $GPU"
+log "下载加速: 共享缓存 + 标准断点续传 + 5 次重试 + 最多 3 路模型并发"
 
 log "1/7 micromamba + python 3.10 env"
 mkdir -p $WORK
@@ -32,7 +56,7 @@ if [ ! -x $WORK/bin/micromamba ]; then
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba download failed"
 fi
 if [ ! -x $ENV/bin/python ]; then
-  $WORK/bin/micromamba create -y -q -p $ENV -c conda-forge python=3.10 pip || die "env create failed"
+  $WORK/bin/micromamba --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.10 pip || die "env create failed"
 fi
 PIP="$ENV/bin/pip"
 PY="$ENV/bin/python"
@@ -43,7 +67,7 @@ $PY -c 'import torch; assert torch.__version__.startswith("2.0.1")' 2>/dev/null 
     --index-url https://download.pytorch.org/whl/cu118 || die "torch install failed"
 
 log "3/7 MuseTalk repo + requirements"
-[ -d $REPO/.git ] || git clone --depth 1 https://github.com/TMElyralab/MuseTalk $REPO || die "clone failed"
+[ -d $REPO/.git ] || retry git clone --depth 1 --filter=blob:none https://github.com/TMElyralab/MuseTalk $REPO || die "clone failed"
 $PIP install -q -r $REPO/requirements.txt || die "requirements failed"
 $PIP install -q -U openmim || die "openmim failed"
 
@@ -62,16 +86,37 @@ $PIP install -q "huggingface_hub[cli]==0.30.2" gdown
 M=$REPO/models
 mkdir -p $M/musetalkV15 $M/syncnet $M/dwpose $M/face-parse-bisent $M/sd-vae $M/whisper
 HF=$ENV/bin/huggingface-cli
-[ -f $M/musetalkV15/unet.pth ] || $HF download TMElyralab/MuseTalk --local-dir $M \
-  --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth" || die "musetalk weights failed"
-[ -f $M/sd-vae/diffusion_pytorch_model.bin ] || $HF download stabilityai/sd-vae-ft-mse --local-dir $M/sd-vae \
-  --include "config.json" "diffusion_pytorch_model.bin" || die "sd-vae failed"
-[ -f $M/whisper/pytorch_model.bin ] || $HF download openai/whisper-tiny --local-dir $M/whisper \
-  --include "config.json" "pytorch_model.bin" "preprocessor_config.json" || die "whisper failed"
-[ -f $M/dwpose/dw-ll_ucoco_384.pth ] || $HF download yzd-v/DWPose --local-dir $M/dwpose \
-  --include "dw-ll_ucoco_384.pth" || die "dwpose failed"
-[ -f $M/syncnet/latentsync_syncnet.pt ] || $HF download ByteDance/LatentSync --local-dir $M/syncnet \
-  --include "latentsync_syncnet.pt" || die "syncnet failed"
+(
+  [ -f $M/musetalkV15/unet.pth ] || retry $HF download TMElyralab/MuseTalk --local-dir $M \
+    --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
+) & P1=$!
+(
+  [ -f $M/sd-vae/diffusion_pytorch_model.bin ] || retry $HF download stabilityai/sd-vae-ft-mse --local-dir $M/sd-vae \
+    --include "config.json" "diffusion_pytorch_model.bin"
+) & P2=$!
+(
+  [ -f $M/whisper/pytorch_model.bin ] || retry $HF download openai/whisper-tiny --local-dir $M/whisper \
+    --include "config.json" "pytorch_model.bin" "preprocessor_config.json"
+) & P3=$!
+DOWNLOAD_FAILED=0
+for PID in "$P1" "$P2" "$P3"; do
+  wait "$PID" || DOWNLOAD_FAILED=1
+done
+[ "$DOWNLOAD_FAILED" -eq 0 ] || die "HuggingFace model download failed (batch 1/2)"
+
+(
+  [ -f $M/dwpose/dw-ll_ucoco_384.pth ] || retry $HF download yzd-v/DWPose --local-dir $M/dwpose \
+    --include "dw-ll_ucoco_384.pth"
+) & P4=$!
+(
+  [ -f $M/syncnet/latentsync_syncnet.pt ] || retry $HF download ByteDance/LatentSync --local-dir $M/syncnet \
+    --include "latentsync_syncnet.pt"
+) & P5=$!
+DOWNLOAD_FAILED=0
+for PID in "$P4" "$P5"; do
+  wait "$PID" || DOWNLOAD_FAILED=1
+done
+[ "$DOWNLOAD_FAILED" -eq 0 ] || die "HuggingFace model download failed (batch 2/2)"
 [ -f $M/face-parse-bisent/79999_iter.pth ] || $ENV/bin/gdown 154JgKpzCPW82qINcVieuPH3fZ2e0P812 \
   -O $M/face-parse-bisent/79999_iter.pth || die "face-parse failed"
 [ -f $M/face-parse-bisent/resnet18-5c106cde.pth ] || curl -sL https://download.pytorch.org/models/resnet18-5c106cde.pth \

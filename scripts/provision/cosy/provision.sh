@@ -15,13 +15,28 @@ ENV=$WORK/env
 REPO=$WORK/CosyVoice
 RAW=https://raw.githubusercontent.com/cicy-ai/cicy-tools/main
 export MAMBA_ROOT_PREFIX=$WORK/mamba
+export PIP_CACHE_DIR=/content/.cache/pip
+export HF_HOME=/content/.cache/huggingface
+export PIP_DEFAULT_TIMEOUT=120
+export PIP_RETRIES=8
+export GIT_TERMINAL_PROMPT=0
 
 log(){ echo "=== [$(date +%H:%M:%S)] $*"; }
 die(){ echo "!!! $*" >&2; exit 1; }
+retry() {
+  local attempt=1
+  until "$@"; do
+    [ "$attempt" -ge 5 ] && return 1
+    log "下载失败，${attempt}/5；稍后续传重试"
+    sleep $((attempt * 3))
+    attempt=$((attempt + 1))
+  done
+}
 
 rm -f $WORK/COSY_READY
-mkdir -p $WORK
+mkdir -p $WORK "$PIP_CACHE_DIR" "$HF_HOME"
 nvidia-smi --query-gpu=name --format=csv,noheader || die "no GPU"
+log "下载加速: 共享缓存 + 并行分片 + 断点续传 + 5 次重试"
 
 log "1/6 micromamba + python 3.10 + pynini(conda-forge)"
 MM=/content/mt/bin/micromamba
@@ -30,7 +45,7 @@ if [ ! -x "$MM" ]; then
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
   MM=$WORK/bin/micromamba
 fi
-[ -x $ENV/bin/python ] || $MM create -y -q -p $ENV -c conda-forge python=3.10 pip "pynini==2.1.5" || die "env create"
+[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.10 pip "pynini==2.1.5" || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python
 
 log "2/6 torch 2.3.1 + cu121"
@@ -38,7 +53,7 @@ $PY -c 'import torch' 2>/dev/null || \
   $PIP install -q torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121 || die "torch"
 
 log "3/6 CosyVoice repo + requirements"
-[ -d $REPO/.git ] || git clone --recursive https://github.com/FunAudioLLM/CosyVoice $REPO || die "clone"
+[ -d $REPO/.git ] || retry git clone --depth 1 --filter=blob:none --recurse-submodules --shallow-submodules https://github.com/FunAudioLLM/CosyVoice $REPO || die "clone"
 # numpy 必须先装:否则一旦 requirements 中断,后续 modelscope 因缺 numpy 崩
 # setuptools<80:新版移除了 pkg_resources,lightning(matcha 依赖)加载时需要它
 $PIP install -q "numpy<2" scipy "setuptools<80" || die "numpy/setuptools"
@@ -46,7 +61,7 @@ $PIP install -q "numpy<2" scipy "setuptools<80" || die "numpy/setuptools"
 grep -v -iE 'openai-whisper|deepspeed' $REPO/requirements.txt > /tmp/cosy-req.txt
 $PIP install -q -r /tmp/cosy-req.txt 2>&1 | tail -3 || log "requirements 部分失败,兜底补装"
 # zero-shot 推理关键依赖兜底
-$PIP install -q modelscope onnxruntime librosa soundfile hyperpyyaml omegaconf \
+$PIP install -q modelscope modelscope-hub onnxruntime librosa soundfile hyperpyyaml omegaconf \
   conformer inflect gdown "diffusers==0.29.0" transformers || die "关键依赖补装失败"
 # openai-whisper:CosyVoice2 加载模型时 import whisper;它在构建隔离下会崩,numpy 就绪后免隔离装
 $PY -c "import whisper" 2>/dev/null || \
@@ -56,8 +71,43 @@ $PY -c "import numpy, modelscope, whisper" || die "关键依赖仍不可用"
 
 log "4/6 下载 CosyVoice2-0.5B 权重(真权重,约 2GB)"
 [ -f $REPO/pretrained_models/CosyVoice2-0.5B/llm.pt ] && \
-  [ $(stat -c%s $REPO/pretrained_models/CosyVoice2-0.5B/llm.pt) -gt 1000000 ] || \
-  $PY -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice2-0.5B', local_dir='$REPO/pretrained_models/CosyVoice2-0.5B')" || die "model download"
+  [ $(stat -c%s $REPO/pretrained_models/CosyVoice2-0.5B/llm.pt) -gt 1000000 ] && \
+  [ -f $REPO/pretrained_models/CosyVoice2-0.5B/CosyVoice-BlankEN/model.safetensors ] || \
+  {
+    # Colab is usually outside mainland China. The global ModelScope endpoint
+    # plus parallel range workers is substantially faster than the legacy
+    # single-stream snapshot downloader. Skip optional JIT exports:
+    # this runtime loads PyTorch weights with load_jit=False/load_trt=False.
+    export MODELSCOPE_DOWNLOAD_PARALLEL_WORKERS="${MODELSCOPE_DOWNLOAD_PARALLEL_WORKERS:-8}"
+    export MODELSCOPE_DOWNLOAD_PARALLEL_THRESHOLD_MB="${MODELSCOPE_DOWNLOAD_PARALLEL_THRESHOLD_MB:-64}"
+    export MODELSCOPE_DOWNLOAD_CHUNK_SIZE_MB="${MODELSCOPE_DOWNLOAD_CHUNK_SIZE_MB:-4}"
+    MSHUB=
+    [ -x "$ENV/bin/ms-hub" ] && MSHUB="$ENV/bin/ms-hub"
+    [ -z "$MSHUB" ] && [ -x "$ENV/bin/modelscope" ] && MSHUB="$ENV/bin/modelscope"
+    if [ -n "$MSHUB" ]; then
+      retry $MSHUB --endpoint https://modelscope.ai download iic/CosyVoice2-0.5B \
+        --local-dir "$REPO/pretrained_models/CosyVoice2-0.5B" \
+        --max-workers 8 \
+        --exclude "flow.cache.pt" "flow.decoder.estimator.fp32.onnx" \
+          "flow.encoder.fp16.zip" "flow.encoder.fp32.zip" \
+          "speech_tokenizer_v2.batch.onnx" || MSHUB=
+    fi
+    if [ -z "$MSHUB" ]; then
+      retry $PY -c "
+from modelscope import snapshot_download
+snapshot_download(
+    'iic/CosyVoice2-0.5B',
+    local_dir='$REPO/pretrained_models/CosyVoice2-0.5B',
+    ignore_file_pattern=[
+        'flow.cache.pt', 'flow.decoder.estimator.fp32.onnx',
+        'flow.encoder.fp16.zip', 'flow.encoder.fp32.zip',
+        'speech_tokenizer_v2.batch.onnx',
+    ],
+    max_workers=8,
+)
+" || die "model download"
+    fi
+  }
 
 log "5/6 TTS 封装脚本"
 curl -fsSL $RAW/cosyvoice_tts.py -o $WORK/cosyvoice_tts.py || die "tts.py download"

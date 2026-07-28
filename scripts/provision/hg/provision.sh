@@ -13,14 +13,29 @@ ENV=$WORK/env
 REPO=$WORK/HeyGem-Linux-Python-Hack
 RAW=https://raw.githubusercontent.com/cicy-ai/cicy-tools/main
 export MAMBA_ROOT_PREFIX=$WORK/mamba
+export PIP_CACHE_DIR=/content/.cache/pip
+export HF_HOME=/content/.cache/huggingface
+export PIP_DEFAULT_TIMEOUT=120
+export PIP_RETRIES=8
+export GIT_TERMINAL_PROMPT=0
 
 log(){ echo "=== [$(date +%H:%M:%S)] $*"; }
 die(){ echo "!!! $*" >&2; exit 1; }
+retry() {
+  local attempt=1
+  until "$@"; do
+    [ "$attempt" -ge 5 ] && return 1
+    log "下载失败，${attempt}/5；稍后续传重试"
+    sleep $((attempt * 3))
+    attempt=$((attempt + 1))
+  done
+}
 
 rm -f $WORK/HG_READY
-mkdir -p $WORK
+mkdir -p $WORK "$PIP_CACHE_DIR" "$HF_HOME"
 GPU_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) || die "no GPU"
 log "0/5 GPU ${GPU_MB}MiB"
+log "下载加速: 共享缓存 + 断点续传 + 5 次重试 + 4 路并发"
 [ "$GPU_MB" -ge 15000 ] || echo "WARN: 显存 <15GB,HeyGem 可能 OOM"
 
 log "1/5 micromamba + python 3.8"
@@ -31,11 +46,11 @@ if [ ! -x "$MM" ]; then
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
   MM=$WORK/bin/micromamba
 fi
-[ -x $ENV/bin/python ] || $MM create -y -q -p $ENV -c conda-forge python=3.8 pip || die "env create"
+[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.8 pip || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python
 
 log "2/5 HeyGem repo"
-[ -d $REPO/.git ] || git clone -q --depth 1 https://github.com/Holasyb918/HeyGem-Linux-Python-Hack $REPO || die "clone"
+[ -d $REPO/.git ] || retry git clone -q --depth 1 --filter=blob:none https://github.com/Holasyb918/HeyGem-Linux-Python-Hack $REPO || die "clone"
 
 log "3/5 requirements(cuda11.8 + onnxruntime-gpu 1.16)"
 cd $REPO

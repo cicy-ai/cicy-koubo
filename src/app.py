@@ -9,16 +9,21 @@
 """
 import json
 import datetime
+import html
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 
 from flask import Flask, request, jsonify, send_file, Response
+
+_edit_lock = threading.Lock()
 
 SRC_DIR = pathlib.Path(__file__).resolve().parent      # src/
 ROOT = SRC_DIR.parent / "app"                            # 项目根下的 app/
@@ -168,12 +173,64 @@ def _colab_base_args(profile):
     colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
     return [colab_bin, "--auth", profile["auth"], "--config", profile["session_config"]]
 
+_COLAB_SESSION_CACHE = {}
+
+
+def _colab_resolve_session(profile, requested=None, force=False):
+    """Resolve stale configured aliases to the active CLI session for this account."""
+    configured = requested or profile["session"]
+    cache_key = (profile["id"], profile["session_config"], configured)
+    cached = _COLAB_SESSION_CACHE.get(cache_key)
+    if not force and cached and time.time() - cached[0] < 30:
+        return cached[1]
+    try:
+        # The state file is keyed by the CLI alias accepted by exec/upload.
+        # `colab sessions` prints the runtime endpoint instead, which is only a
+        # display value and produces "Session not found" when passed to -s.
+        state_path = pathlib.Path(profile["session_config"])
+        if state_path.is_file():
+            state = json.loads(state_path.read_text())
+            if isinstance(state, dict) and configured in state:
+                _COLAB_SESSION_CACHE[cache_key] = (time.time(), configured)
+                return configured
+        result = subprocess.run(
+            _colab_base_args(profile) + ["sessions"],
+            env=_colab_env(profile), capture_output=True, text=True, timeout=20,
+        )
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        names = re.findall(r"^\s*\[[^\]]*\]\s+([^|\r\n]+?)\s*\|", output, re.M)
+        names = [name.strip() for name in names if name.strip()]
+        resolved = configured if configured in names else (names[0] if names else configured)
+        _COLAB_SESSION_CACHE[cache_key] = (time.time(), resolved)
+        if resolved != configured:
+            plog(
+                f"[Colab 会话自动切换] profile={profile['id']}, "
+                f"configured={configured}, active={resolved}"
+            )
+        return resolved
+    except Exception as exc:
+        plog(f"[Colab 会话解析失败] profile={profile['id']}, error={exc}")
+        return configured
+
 
 def _colab_env(profile):
     env = os.environ.copy()
+    # colab-cli 0.6 stores OAuth at ~/.config/colab-cli/token.json. Give every
+    # additional Google profile its own HOME so credentials never bleed across
+    # accounts. Keep the legacy default profile on the user's existing token.
+    if profile.get("auth") == "oauth2" and profile.get("id") != "default":
+        auth_home = pathlib.Path.home() / ".config/cicy-koubo/colab-oauth" / profile["id"]
+        auth_home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(auth_home)
     if profile.get("auth") == "adc" and profile.get("credentials_path"):
         env["GOOGLE_APPLICATION_CREDENTIALS"] = profile["credentials_path"]
     return env
+
+
+def _colab_oauth_token_path(profile):
+    if profile.get("id") == "default":
+        return pathlib.Path.home() / ".config/colab-cli/token.json"
+    return pathlib.Path.home() / ".config/cicy-koubo/colab-oauth" / profile["id"] / ".config/colab-cli/token.json"
 
 
 def _colab_exec(cmd_str, session=None, timeout=300):
@@ -188,7 +245,8 @@ def _colab_exec(cmd_str, session=None, timeout=300):
                 f"sys.stdout.write(r.stdout)\n"
                 f"sys.stdout.write(json.dumps({{'rc':r.returncode}}))\n")
         tmp = f.name
-    args = _colab_base_args(profile) + ["exec", "-s", session or profile["session"], "-f", tmp, "--timeout", str(timeout)]
+    resolved_session = _colab_resolve_session(profile, session)
+    args = _colab_base_args(profile) + ["exec", "-s", resolved_session, "-f", tmp, "--timeout", str(timeout)]
     r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 30,
                        env=_colab_env(profile))
     try:
@@ -207,17 +265,70 @@ def _colab_exec(cmd_str, session=None, timeout=300):
     return rc, output
 
 def _colab_upload(local_path, remote_path, session=None):
-    """上传文件到 Colab"""
+    """上传文件到 Colab；自动纠正失效会话名并重试瞬时网络错误。"""
     profile = _active_colab_profile()
-    r = subprocess.run(_colab_base_args(profile) + ["upload", "-s", session or profile["session"],
-                        str(local_path), remote_path], env=_colab_env(profile),
-                       capture_output=True, text=True, timeout=300)
-    return r.returncode == 0
+    resolved_session = _colab_resolve_session(profile, session)
+    r = None
+    for attempt in range(1, 4):
+        r = subprocess.run(
+            _colab_base_args(profile) + ["upload", "-s", resolved_session,
+                         str(local_path), remote_path],
+            env=_colab_env(profile), capture_output=True, text=True, timeout=300,
+        )
+        if r.returncode == 0:
+            if attempt > 1:
+                plog(f"[Colab 上传恢复] remote={remote_path}, attempt={attempt}/3")
+            return True
+        detail_raw = (r.stderr or r.stdout or "")
+        if "not found" in detail_raw.lower():
+            resolved_session = _colab_resolve_session(profile, session, force=True)
+        if attempt < 3:
+            plog(f"[Colab 上传重试] remote={remote_path}, attempt={attempt}/3")
+            time.sleep(attempt * 2)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "unknown error").strip().replace("\n", " ")
+        detail = re.sub(
+            r"([?&](?:colab-runtime-proxy-token|token)=)[^&\s]+",
+            r"\1<redacted>",
+            detail,
+            flags=re.I,
+        )
+        plog(
+            f"[Colab 上传失败] profile={profile['id']}, session={resolved_session}, "
+            f"local={pathlib.Path(local_path).name}, remote={remote_path}, "
+            f"rc={r.returncode}, error={detail[:500]}"
+        )
+    return False
+
+
+def _colab_session_active():
+    """Check the active profile/session without requiring Whisper to be installed."""
+    profile = _active_colab_profile()
+    colab_bin = pathlib.Path(_colab_base_args(profile)[0])
+    if not colab_bin.exists() and not _sht.which(str(colab_bin)):
+        return False, f"Colab CLI 未安装（当前配置：{profile['name']}）"
+    try:
+        result = subprocess.run(
+            _colab_base_args(profile) + ["sessions"],
+            env=_colab_env(profile),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        active = result.returncode == 0 and "No active" not in output
+        if active:
+            resolved = _colab_resolve_session(profile)
+            return True, f"{profile['name']} · 会话 {resolved} 已连接"
+        return False, f"{profile['name']} 没有活跃 Colab GPU 会话"
+    except Exception as exc:
+        return False, f"检查 Colab 会话失败：{exc}"
 
 def _colab_download(remote_path, local_path, session=None):
     """从 Colab 下载文件"""
     profile = _active_colab_profile()
-    r = subprocess.run(_colab_base_args(profile) + ["download", "-s", session or profile["session"],
+    resolved_session = _colab_resolve_session(profile, session)
+    r = subprocess.run(_colab_base_args(profile) + ["download", "-s", resolved_session,
                         remote_path, str(local_path)], env=_colab_env(profile),
                        capture_output=True, text=True, timeout=300)
     return r.returncode == 0
@@ -242,9 +353,36 @@ def plog(msg):
 def api_logs():
     try:
         lines = open(PLOG, encoding="utf-8").readlines()[-300:]
-        return Response("".join(lines), mimetype="text/plain; charset=utf-8")
+        content = "".join(lines)
     except Exception:
-        return Response("(暂无日志)", mimetype="text/plain; charset=utf-8")
+        content = "(暂无日志)"
+    if request.args.get("raw") == "1":
+        return Response(content, mimetype="text/plain; charset=utf-8")
+    page = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='color-scheme' content='light'>"
+        "<title>cicy-koubo 日志</title>"
+        "<style>html,body{margin:0;min-height:100%;background:#fff;color:#17212b}"
+        "body{box-sizing:border-box;padding:20px}"
+        "pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;"
+        "font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}</style>"
+        "</head><body><pre>" + html.escape(content) + "</pre></body></html>"
+    )
+    return Response(page, mimetype="text/html; charset=utf-8")
+
+
+@app.post("/api/ui-log")
+def api_ui_log():
+    """Persist transient UI errors without storing form contents or secrets."""
+    body = request.get_json(silent=True) or {}
+    level = str(body.get("level") or "error").lower()
+    if level not in {"error", "warn", "info"}:
+        level = "error"
+    message = " ".join(str(body.get("message") or "").split())[:1000]
+    page = str(body.get("page") or "/").split("?", 1)[0][:200]
+    if message:
+        plog(f"[UI {level.upper()}] {page} · {message}")
+    return jsonify({"ok": True})
 
 
 # 持久化各行指纹，避免重启后重复输出
@@ -365,15 +503,44 @@ def tunnel_status():
 
 @app.get("/api/status")
 def status():
-    tstate, tnote = tunnel_status()
-    audio = "ready" if (tstate == "ready" and _cosy_ready_remote()) else \
-            ("installing" if tstate == "ready" else "down")
-    return jsonify({
+    # This is the single global health snapshot used by the header. In Colab
+    # mode every probe must use the active Google profile; bare `colab
+    # sessions` reads the default account and can incorrectly report offline.
+    now = time.monotonic()
+    cached = getattr(status, "_cache", None)
+    force = request.args.get("refresh") == "1"
+    if not force and cached and now - cached[0] < 20:
+        return jsonify(cached[1])
+    if GPU_MODE == "colab_cli":
+        active, tnote = _colab_session_active()
+        tstate = "ready" if active else "offline"
+        mt_ready = cosy_ready = False
+        if active:
+            _, ready_out = _colab_exec(
+                "test -f /content/mt/READY && echo __MT_READY__; "
+                "test -f /content/cosy/COSY_READY && echo __COSY_READY__",
+                timeout=30,
+            )
+            mt_ready = "__MT_READY__" in ready_out
+            cosy_ready = "__COSY_READY__" in ready_out
+        audio = "ready" if cosy_ready else ("installing" if active else "down")
+        video = "ready" if mt_ready else ("installing" if active else "down")
+    else:
+        tstate, tnote = tunnel_status()
+        audio = "ready" if (tstate == "ready" and _cosy_ready_remote()) else \
+                ("installing" if tstate == "ready" else "down")
+        video = "ready" if tstate == "ready" else "down"
+    overall = "ready" if tstate == "ready" and audio == "ready" and video == "ready" else \
+              ("partial" if tstate == "ready" else "down")
+    payload = {
         "tunnel": tstate, "tunnel_note": tnote,
         "gpu_mode": GPU_MODE,
         "audio_service": audio,
-        "video_service": "ready" if tstate == "ready" else "down",
-    })
+        "video_service": video,
+        "overall": overall,
+    }
+    status._cache = (now, payload)
+    return jsonify(payload)
 
 
 def _cosy_ready_remote():
@@ -452,13 +619,50 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 cmd = f"bash /content/mt/synthesize.sh /content/{shlex.quote(rv)} /content/{shlex.quote(ra)} {out_remote} {int(bbox)}"
 
             if GPU_MODE == "colab_cli":
-                log("colab exec: " + cmd[:80])
-                rc, output = _colab_exec(cmd, timeout=600)
-                for line in output.splitlines():
-                    if line.strip():
+                remote_log = f"/content/lipsync_{job_id}.log"
+                remote_done = f"/content/lipsync_{job_id}.done"
+                remote_rc = f"/content/lipsync_{job_id}.rc"
+                inner = (
+                    f"{cmd}; rc=$?; echo $rc > {remote_rc}; "
+                    f"touch {remote_done}; exit $rc"
+                )
+                launch = (
+                    f"rm -f {remote_done} {remote_rc}; "
+                    f"nohup sh -c {shlex.quote(inner)} > {remote_log} 2>&1 </dev/null &"
+                )
+                log("colab background: " + cmd[:80])
+                launch_rc, launch_out = _colab_exec(launch, timeout=30)
+                if launch_rc != 0:
+                    raise RuntimeError("MuseTalk launch failed via colab CLI: " + launch_out[-200:])
+                seen_lines = 0
+                rc = 124
+                for _ in range(180):  # 最长 15 分钟
+                    time.sleep(5)
+                    poll_rc, poll_out = _colab_exec(
+                        f"tail -n 80 {remote_log} 2>/dev/null; "
+                        f"echo __CICY_STATE__; "
+                        f"if [ -f {remote_done} ]; then cat {remote_rc}; else echo RUNNING; fi",
+                        timeout=20,
+                    )
+                    if poll_rc != 0 and any(
+                        marker in poll_out.lower()
+                        for marker in ("session", "lost", "not found", "404/401")
+                    ):
+                        raise RuntimeError("Colab 会话在对口型过程中断开或被 Google 回收，请重新启动会话后重试")
+                    output, _, state = poll_out.rpartition("__CICY_STATE__")
+                    lines = [line for line in output.splitlines() if line.strip()]
+                    for line in lines[seen_lines:]:
                         log(f"[MuseTalk] {line[:120]}")
+                    seen_lines = len(lines)
+                    state = state.strip()
+                    if state != "RUNNING":
+                        try:
+                            rc = int(state.splitlines()[-1])
+                        except Exception:
+                            rc = 1
+                        break
                 if rc != 0:
-                    raise RuntimeError("MuseTalk failed via colab CLI")
+                    raise RuntimeError(f"MuseTalk failed via colab CLI (rc={rc})")
             else:
                 # 实时日志:stream 行写入 j["log"] 供前端轮询
                 local_cmd = _rewrite_local(SSH + [cmd])
@@ -560,9 +764,17 @@ def generate_video():
         if not default_video or not default_video.exists():
             return jsonify({"error": "没有底板视频:请选择文件,或先通过飞书发一条底板视频"}), 400
     if mode != "simple":  # 仅底板合成是纯本机操作,不需要 GPU
-        tstate, _ = tunnel_status()
-        if tstate != "ready":
-            return jsonify({"error": "Colab GPU 未就绪,请先在 Colab 跑引导 cell(或切「仅底板合成」模式)"}), 503
+        if GPU_MODE == "colab_cli":
+            ready_rc, ready_out = _colab_exec(
+                "test -f /content/mt/READY && nvidia-smi --query-gpu=name --format=csv,noheader",
+                timeout=20,
+            )
+            if ready_rc != 0 or not ready_out.strip():
+                return jsonify({"error": "Colab GPU 或 MuseTalk 未就绪，请先启动会话并安装 MuseTalk"}), 503
+        else:
+            tstate, _ = tunnel_status()
+            if tstate != "ready":
+                return jsonify({"error": "Colab GPU 未就绪,请先在 Colab 跑引导 cell(或切「仅底板合成」模式)"}), 503
     job_id = uuid.uuid4().hex[:10]
     jd = WORK / job_id
     jd.mkdir(exist_ok=True)
@@ -621,9 +833,20 @@ def cover(job_id):
     return send_file(f, mimetype="image/jpeg") if f.exists() else ("", 404)
 
 
-def _transcribe(path):
-    """转写参考音频 → 文字。用 CosyVoice 环境里的 whisper medium 模型。"""
-    if GPU_MODE == "colab_cli":
+class GroqTranscriptionError(RuntimeError):
+    """Groq STT request failed with an actionable user-facing reason."""
+
+
+def _transcribe(path, provider="auto"):
+    """转写参考音频 → 文字。优先 Groq，回退 Colab / 本机 Whisper。"""
+    if provider in {"auto", "groq"}:
+        groq_text = _groq_transcribe(path, raise_errors=(provider == "groq"))
+        if groq_text:
+            plog(f"[参考音频转写] Groq 成功: {len(groq_text)}字")
+            return groq_text
+        if provider == "groq":
+            return ""
+    if provider in {"auto", "colab"} and GPU_MODE == "colab_cli":
         # 通过 colab CLI 远程转写
         remote_audio = f"/content/_ref_{pathlib.Path(path).name}"
         if not _colab_upload(path, remote_audio):
@@ -636,6 +859,8 @@ def _transcribe(path):
         )
         rc, out = _colab_exec(f"cd /content/cosy && env/bin/python -c {shlex.quote(script)}", timeout=300)
         return out.strip() if rc == 0 else ""
+    if provider == "colab":
+        return ""
     # 本地 Colab 环境
     cosy_py = pathlib.Path("/content/cosy/env/bin/python")
     if not cosy_py.exists():
@@ -651,19 +876,64 @@ def _transcribe(path):
     except Exception:
         pass
     return ""
+
+
+def _groq_transcribe(path, raise_errors=False):
+    """Fast cloud STT for short media. Returns empty text on any failure."""
+    import requests
     gk = _groq_key()
     if not gk:
         return ""
-    proxy = os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy", ""))
-    cmd = ["curl", "-s", "https://api.groq.com/openai/v1/audio/transcriptions",
-           "-H", f"Authorization: Bearer {gk}", "-F", f"file=@{path}",
-           "-F", "model=whisper-large-v3-turbo", "-F", "language=zh"]
-    if proxy:
-        cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
     try:
-        r = run(cmd, timeout=120)
-        return json.loads(r.stdout).get("text", "").strip()
-    except Exception:
+        session = requests.Session()
+        with open(path, "rb") as audio_file:
+            response = session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {gk}", "User-Agent": "cicy-koubo/0.1"},
+                files={"file": (pathlib.Path(path).name, audio_file, "audio/wav")},
+                data={"model": "whisper-large-v3-turbo", "language": "zh"},
+                timeout=(8, 60),
+            )
+        if not response.ok:
+            detail = ""
+            try:
+                detail = str((response.json().get("error") or {}).get("message") or "").strip()
+            except Exception:
+                detail = ""
+            messages = {
+                401: "Groq API Key 无效或已失效，请打开供应商设置重新配置",
+                403: "Groq 拒绝了转写请求，请检查账号权限或当前网络出口",
+                429: "Groq 请求过于频繁或额度已用尽，请稍后重试",
+            }
+            reason = messages.get(
+                response.status_code,
+                f"Groq 转写服务返回 HTTP {response.status_code}",
+            )
+            if detail and detail.lower() not in {"forbidden", "unauthorized"}:
+                reason += f"：{detail[:180]}"
+            raise GroqTranscriptionError(reason)
+        return response.json().get("text", "").strip()
+    except requests.Timeout as exc:
+        error = GroqTranscriptionError("Groq 转写超时，请检查网络后重试")
+        plog(f"[参考音频转写] Groq 失败: Timeout: {exc}")
+        if raise_errors:
+            raise error from exc
+        return ""
+    except requests.RequestException as exc:
+        error = GroqTranscriptionError(f"无法连接 Groq 转写服务：{exc}")
+        plog(f"[参考音频转写] Groq 失败: {type(exc).__name__}: {exc}")
+        if raise_errors:
+            raise error from exc
+        return ""
+    except GroqTranscriptionError as exc:
+        plog(f"[参考音频转写] Groq 失败: {exc}")
+        if raise_errors:
+            raise
+        return ""
+    except Exception as exc:
+        plog(f"[参考音频转写] Groq 失败: {type(exc).__name__}: {exc}")
+        if raise_errors:
+            raise GroqTranscriptionError(f"Groq 转写失败：{exc}") from exc
         return ""
 
 
@@ -689,13 +959,27 @@ def tts():
     if not text:
         return jsonify({"error": "没有要配音的文案"}), 400
     try:
-        speed = max(0.5, min(1.5, float(request.form.get("speed", "1.0"))))
+        speed = max(0.5, min(1.5, float(request.form.get("speed", "1.15"))))
     except ValueError:
-        speed = 1.0
+        speed = 1.15
 
     jid = uuid.uuid4().hex[:10]
     whole = request.form.get("mode") == "whole"
     plog(f"[配音 {jid}] 开始: {len(text)}字 语速{speed} 模式{'整段' if whole else '分段'}")
+
+    # Groq/Whisper only transcribes the reference. CosyVoice still needs the
+    # configured GPU runtime, so fail early with an actionable message.
+    if GPU_MODE == "colab_cli":
+        session_active, session_hint = _colab_session_active()
+        if not session_active:
+            plog(f"[配音 {jid}] COLAB_NOT_READY · {session_hint}")
+            return jsonify({
+                "error": (
+                    f"{session_hint}。Groq 仅负责参考音频转写；"
+                    "CosyVoice 配音仍需 Colab GPU，请先在系统设置中启动 Colab 会话后重试"
+                ),
+                "code": "colab_session_inactive",
+            }), 503
 
     # 参考音色
     ref_id = (request.form.get("ref_id") or "").strip()
@@ -716,9 +1000,31 @@ def tts():
               "-ar", "16000", "-ac", "1", str(ref_trim)])
     if tr.returncode == 0 and ref_trim.exists():
         ref = ref_trim
-    ref_text = _transcribe(str(ref))
+    stt_provider = (request.form.get("stt_provider") or "auto").strip()
+    if stt_provider == "groq" and not _groq_key():
+        return jsonify({
+            "error": "Groq Whisper 未配置 API Key，请在 cicy-ai/global.json 的 groqStt 中配置，或切换到 Colab Whisper"
+        }), 400
+    if stt_provider == "colab":
+        cli_installed, session_active, whisper_installed = _colab_whisper_status()
+        if not cli_installed:
+            return jsonify({
+                "error": "Colab Whisper 不可用，请先安装 Colab CLI，或切换到已配置的 Whisper API"
+            }), 400
+        if not session_active:
+            return jsonify({
+                "error": "Colab CLI 已安装，但没有活跃 GPU 会话，请先启动会话"
+            }), 400
+        if not whisper_installed:
+            return jsonify({
+                "error": "当前 Colab 会话尚未安装 Whisper，请先完成环境安装"
+            }), 400
+    try:
+        ref_text = _transcribe(str(ref), stt_provider)
+    except GroqTranscriptionError as exc:
+        return jsonify({"error": str(exc), "code": "groq_stt_failed"}), 502
     if not ref_text:
-        return jsonify({"error": "参考音频转写失败 — whisper 未能识别中文，请换清晰的中文人声音频"}), 400
+        return jsonify({"error": f"参考音频转写失败（{stt_provider}），请检查服务状态或更换清晰中文人声音频"}), 400
 
     # 本机直接跑 CosyVoice
     cosy_dir = pathlib.Path("/content/cosy")
@@ -735,12 +1041,18 @@ def tts():
         if not _colab_upload(ref, remote_ref):
             return jsonify({"error": "上传参考音频到 Colab 失败"}), 500
         # 远程执行 CosyVoice TTS
-        cmd = (f"export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
-               f"cd /content/cosy && nohup env/bin/python cosyvoice_tts.py "
-               f"--ref {remote_ref} --ref-text-b64 {rt_b64} "
-               f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} "
-               f"--out /content/tts_{jid}.wav "
-               f"> /content/tts_{jid}.log 2>&1; echo done > /content/tts_{jid}.done &")
+        tts_inner = (
+            f"env/bin/python cosyvoice_tts.py "
+            f"--ref {remote_ref} --ref-text-b64 {rt_b64} "
+            f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} "
+            f"--out /content/tts_{jid}.wav; "
+            f"rc=$?; if [ $rc -eq 0 ]; then echo done > /content/tts_{jid}.done; fi; exit $rc"
+        )
+        cmd = (
+            "export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
+            f"cd /content/cosy && nohup sh -c {shlex.quote(tts_inner)} "
+            f"> /content/tts_{jid}.log 2>&1 </dev/null &"
+        )
         _colab_exec(cmd, timeout=10)
         # 轮询完成
         for _ in range(120):
@@ -754,11 +1066,18 @@ def tts():
             log_out = ""
             _, log_out = _colab_exec(f"tail -5 /content/tts_{jid}.log 2>/dev/null", timeout=10)
             return jsonify({"error": "CosyVoice TTS 失败: " + log_out[:200]}), 500
-        # 入媒体库
-        _media_add({"id": jid, "type": "audio", "file": result_wav.name,
-                    "note": f"CosyVoice 配音({len(text)}字)"})
-        return send_file(result_wav, mimetype="audio/wav",
-                         as_attachment=True, download_name=f"tts_{jid}.wav")
+        _normalize_voice_output(result_wav)
+        # 入媒体库，并与本机分支保持相同 JSON 协议。
+        import shutil as _sh
+        dur = _ffdur(result_wav)
+        dst = MEDIA_DIR / f"voice_{jid}.wav"
+        _sh.copy(result_wav, dst)
+        _media_add({"id": jid, "type": "voice", "file": dst.name,
+                    "text": text[:100], "chars": len(text), "speed": speed,
+                    "duration": dur, "ts": time.strftime("%m-%d %H:%M")})
+        plog(f"[配音 {jid}] ✅ 完成 {dur}s → media/voice_{jid}.wav")
+        return jsonify({"id": jid, "url": f"/api/media/{jid}/file",
+                        "duration": dur, "chars": len(text)})
 
     # 本机 Colab 环境
     if not cosy_script.exists():
@@ -773,11 +1092,14 @@ def tts():
     import shutil as _sh
     _sh.copy(ref, ref_dst)
 
+    local_inner = (
+        f"{cosy_py} {cosy_script} --ref {ref_dst} --ref-text-b64 {rt_b64} "
+        f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} --out {out_wav}; "
+        f"rc=$?; if [ $rc -eq 0 ]; then echo done > {done_file}; fi; exit $rc"
+    )
     launch = (f"export MPLBACKEND=Agg LD_LIBRARY_PATH=/usr/lib64-nvidia; "
-              f"cd {cosy_dir} && nohup {cosy_py} {cosy_script} "
-              f"--ref {ref_dst} --ref-text-b64 {rt_b64} "
-              f"--text-b64 {t_b64} --speed {speed}{' --whole' if whole else ''} --out {out_wav} "
-              f"> {log_file} 2>&1; echo done > {done_file} &")
+              f"cd {cosy_dir} && nohup bash -lc {shlex.quote(local_inner)} "
+              f"> {log_file} 2>&1 </dev/null &")
     subprocess.Popen(["bash", "-lc", launch], start_new_session=True)
 
     # 轮询 done
@@ -798,6 +1120,7 @@ def tts():
     if not out_wav.exists():
         return jsonify({"error": "配音完成后未生成音频文件"}), 500
 
+    _normalize_voice_output(out_wav)
     # 入媒体库
     dur = _ffdur(out_wav)
     dst = MEDIA_DIR / f"voice_{jid}.wav"
@@ -813,6 +1136,17 @@ def tts():
 @app.post("/api/edit")
 def edit():
     """烧录字幕:输入 job_id(取该 job 成片)或上传 video,text=字幕文本,返回带字幕 mp4。"""
+    if not _edit_lock.acquire(blocking=False):
+        plog("[剪辑] 忽略重复请求：已有剪辑任务正在烧录")
+        return jsonify({"error": "已有剪辑任务正在进行，请等待完成，不要重复点击"}), 409
+    try:
+        return _edit_impl()
+    finally:
+        _edit_lock.release()
+
+
+def _edit_impl():
+    """执行单个剪辑任务；由 edit() 保证进程内不并发烧录。"""
     job_id = request.form.get("job_id")
     src = None
     # 只从「原始未加工成片」剪辑,绝不拿剪辑产物再剪(否则字幕/BGM 会叠加)
@@ -836,10 +1170,10 @@ def edit():
     out = WORK / (uuid.uuid4().hex[:8] + "_edit.mp4")
     text = (request.form.get("text") or "").strip()
     style = {
-        "fontsize": int(request.form.get("fontsize") or 0),
+        "fontsize": int(request.form.get("fontsize") or 14),
         "color": request.form.get("color") or "#FFFFFF",
         "outline": request.form.get("outline") or "#000000",
-        "mb": int(request.form.get("mb") or 60),
+        "mb": int(request.form.get("mb") or 300),
         "font_id": request.form.get("font") or "heavy",
     }
     bgm_path = None
@@ -918,6 +1252,7 @@ def edit():
         plog(f"[剪辑] ✅ 完成 → media/video_{eid}.mp4 ({note})")
         return send_file(out, mimetype="video/mp4")
     except Exception as e:  # noqa: BLE001
+        plog(f"[剪辑] ❌ 失败: {e}")
         return jsonify({"error": "subtitle render: " + str(e)}), 500
 
 
@@ -943,8 +1278,8 @@ def _parse_srt(text):
 
 
 FONTS = {
-    "heavy": (str(ROOT / "assets/fonts/SourceHanSansCN-Heavy.otf"), "思源黑体·特粗(抖音风,推荐)"),
-    "bold": (str(ROOT / "assets/fonts/SourceHanSansCN-Bold.otf"), "思源黑体·粗"),
+    "heavy": (str(ROOT / "assets/fonts/SourceHanSansCN-Heavy.otf"), "抖音口播·特粗（推荐）"),
+    "bold": (str(ROOT / "assets/fonts/SourceHanSansCN-Bold.otf"), "抖音口播·粗体"),
     "heiti": ("/System/Library/Fonts/STHeiti Medium.ttc", "系统黑体"),
     "pingfang": ("/System/Library/Fonts/PingFang.ttc", "苹方"),
     "songti": ("/System/Library/Fonts/Supplemental/Songti.ttc", "宋体"),
@@ -1028,26 +1363,32 @@ def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="
     from PIL import Image, ImageDraw
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    fs = fontsize if fontsize and fontsize >= 16 else max(28, int(w * 0.06))
+    # UI 字号按手机端约 160px 的视觉基准等比换算到成片。
+    # 默认 14 在 1080p 竖屏中约为 95px，接近大字抖音口播字幕。
+    ui_fs = max(8, fontsize or 14)
+    fs = max(8, min(180, round(ui_fs * w / 160)))
     fg = _hex_rgba(color, (255, 255, 255, 255))
     og = _hex_rgba(outline, (0, 0, 0, 255))
     font = _load_font(font_id, fs)
-    maxw = w * 0.86
+    # 大字口播字幕每行约 10 个中文字；同时保留 12% 的左右安全区。
+    maxw = w * 0.88
+    max_chars = 10
     lines, cur = [], ""
     for ch in text:
-        if d.textlength(cur + ch, font=font) > maxw and cur:
+        if (d.textlength(cur + ch, font=font) > maxw or len(cur) >= max_chars) and cur:
             lines.append(cur); cur = ch
         else:
             cur += ch
     if cur:
         lines.append(cur)
-    lh = fs + 12
+    lh = round(fs * 1.10)
     y = h - lh * len(lines) - max(10, mb)
     for ln in lines:
         tw = d.textlength(ln, font=font)
         x = (w - tw) / 2
-        for dx in (-2, 2):
-            for dy in (-2, 2):
+        stroke = max(2, round(fs * 0.06))
+        for dx in (-stroke, stroke):
+            for dy in (-stroke, stroke):
                 d.text((x + dx, y + dy), ln, font=font, fill=og)
         d.text((x, y), ln, font=font, fill=fg)
         y += lh
@@ -1240,7 +1581,9 @@ def gen_cover():
             img = Image.alpha_composite(img, Image.new("RGBA", (w, h), (0, 0, 0, alpha)))
         if title:
             d = ImageDraw.Draw(img)
-            fs = max(48, int(w * 0.09))
+            # Render as a 16px visual size in the 320px-wide UI preview while
+            # preserving equivalent proportions in the full-resolution cover.
+            fs = max(16, round(w * 16 / 320))
             font = _load_font("heavy", fs)
             maxw = w * 0.88
             lines, cur = [], ""
@@ -1251,12 +1594,13 @@ def gen_cover():
                     cur += ch
             if cur:
                 lines.append(cur)
-            lh = fs + 16
-            y = h * 0.32 - lh * len(lines) / 2
+            lh = fs + max(4, round(fs * 0.22))
+            y = (h - lh * len(lines)) / 2
             for ln in lines:
                 x = (w - d.textlength(ln, font=font)) / 2
-                for dx in (-3, 3):
-                    for dy in (-3, 3):
+                stroke = max(1, round(fs * 0.035))
+                for dx in (-stroke, stroke):
+                    for dy in (-stroke, stroke):
                         d.text((x + dx, y + dy), ln, font=font, fill=(0, 0, 0, 255))
                 d.text((x, y), ln, font=font, fill=(255, 255, 255, 255))
                 y += lh
@@ -1440,51 +1784,306 @@ def _resolve_vid(url):
         return ""
 
 
-def _openai_provider():
-    """直接从 global.json 选择可用的 OpenAI 协议 provider。"""
+def _json_data(output):
+    payload = json.loads(output or "{}")
+    return payload.get("data", payload)
+
+
+def _extract_log(trace_id, started_at, stage, detail=""):
+    elapsed = time.monotonic() - started_at
+    suffix = f" · {detail}" if detail else ""
+    plog(f"[文案提取 {trace_id}] +{elapsed:.2f}s {stage}{suffix}")
+
+
+def _electron_media_download(url, job_dir, trace_id, started_at, cached_video_ids=None):
+    """Resolve and download Douyin media only through Electron profile 0."""
+    electron = _sht.which("agent-electron")
+    desktop = _sht.which("agent-desktop")
+    if not electron or not desktop:
+        raise RuntimeError("缺少 agent-electron / agent-desktop，无法打开抖音页面")
+
+    _extract_log(trace_id, started_at, "ELECTRON_OPEN_START", "profile=0, 独立 BrowserWindow")
+    open_started = time.monotonic()
+    opened = run(
+        [electron, "open", url, "--idx", "0", "--no-reuse", "--json"],
+        timeout=30,
+    )
+    if opened.returncode != 0:
+        raise RuntimeError("Electron profile 0 打开失败: " + (opened.stderr or "")[-300:])
+    win_id = int(_json_data(opened.stdout).get("winId") or 0)
+    if not win_id:
+        raise RuntimeError("Electron 未返回 BrowserWindow ID")
+    _extract_log(
+        trace_id, started_at, "ELECTRON_OPEN_DONE",
+        f"window={win_id}, command={time.monotonic() - open_started:.2f}s",
+    )
+
+    expression = r"""(() => {
+      const match = location.pathname.match(/\/video\/(\d+)/);
+      const vid = match ? match[1] : "";
+      const el = document.querySelector("#RENDER_DATA");
+      const pageVideos = Array.from(document.querySelectorAll("video"));
+      const directVideo = pageVideos.find(node => {
+        const src = node.currentSrc || node.src || "";
+        return /^https?:/.test(src) && (!vid || src.includes(vid) || src.includes("__vid="));
+      }) || pageVideos.find(node => /^https?:/.test(node.currentSrc || node.src || ""));
+      if (vid && directVideo) {
+        const directUrl = directVideo.currentSrc || directVideo.src;
+        return JSON.stringify({
+          vid, ready: document.readyState, renderData: !!el,
+          candidates: 1, matchedVideoId: vid,
+          duration: Number.isFinite(directVideo.duration) ? directVideo.duration * 1000 : 0,
+          media: {url: directUrl, size: 0, bitrate: 0},
+          variants: 1, fallback: "video-currentSrc"
+        });
+      }
+      if (!vid || !el) return JSON.stringify({
+        vid, ready: document.readyState, renderData: !!el,
+        candidates: 0, media: null
+      });
+      let root;
+      try { root = JSON.parse(decodeURIComponent(el.textContent)); } catch (_) { return ""; }
+      const seen = new Set(), found = [];
+      function walk(value) {
+        if (!value) return;
+        if (typeof value === "string" && /^[\[{]/.test(value.trim())) {
+          try { walk(JSON.parse(value)); } catch (_) {}
+          return;
+        }
+        if (typeof value !== "object" || seen.has(value)) return;
+        seen.add(value);
+        if (value.video) {
+          const candidateId = String(value.awemeId || value.aweme_id || value.id || "");
+          const candidateVideo = value.video;
+          const hasMedia = (candidateVideo.playAddr && candidateVideo.playAddr.length) ||
+            (candidateVideo.bitRateList && candidateVideo.bitRateList.length) ||
+            (candidateVideo.bit_rate && candidateVideo.bit_rate.length);
+          if (hasMedia) found.push({ value, candidateId });
+        }
+        Object.values(value).forEach(walk);
+      }
+      walk(root);
+      const selected = found.find(item => item.candidateId === vid) || found[0];
+      const video = selected && selected.value.video;
+      if (!video) {
+        const raw = decodeURIComponent(el.textContent);
+        const idAt = raw.indexOf(vid);
+        const searchFrom = idAt >= 0 ? idAt : 0;
+        const playAt = raw.indexOf('"playAddr"', searchFrom);
+        const block = playAt >= 0 ? raw.slice(playAt, playAt + 12000) : "";
+        const srcMatch = block.match(/"src":"((?:\\.|[^"])*)"/);
+        let fallbackUrl = "";
+        if (srcMatch) {
+          try { fallbackUrl = JSON.parse('"' + srcMatch[1] + '"'); } catch (_) {}
+        }
+        const durationBlock = raw.slice(Math.max(0, playAt - 500), playAt + 500);
+        const durationMatch = durationBlock.match(/"duration":(\d+)/);
+        const sizeMatch = block.match(/"playAddrSize":(\d+)/);
+        return JSON.stringify({
+          vid, ready: document.readyState, renderData: true,
+          candidates: found.length, matchedVideoId: "",
+          duration: durationMatch ? Number(durationMatch[1]) : 0,
+          media: /^https?:/.test(fallbackUrl) ? {
+            url: fallbackUrl, size: sizeMatch ? Number(sizeMatch[1]) : 0, bitrate: 0
+          } : null,
+          variants: fallbackUrl ? 1 : 0, fallback: "playAddr-regex"
+        });
+      }
+      const rates = video.bitRateList || video.bit_rate || [];
+      const variants = rates.map(item => ({
+        url: (item.playAddr?.src || item.play_addr?.url_list || [])[0] || "",
+        size: item.playAddr?.dataSize || item.play_addr?.data_size || 0,
+        bitrate: item.bitRate || item.bit_rate || 0
+      })).filter(item => /^https?:/.test(item.url));
+      const base = (video.playAddr || []).map(item => ({
+        url: item.src || "", size: video.playAddrSize || video.dataSize || 0, bitrate: 0
+      })).filter(item => /^https?:/.test(item.url));
+      const choices = variants.length ? variants : base;
+      choices.sort((a, b) => (a.size || a.bitrate) - (b.size || b.bitrate));
+      return JSON.stringify({
+        vid, ready: document.readyState, renderData: true,
+        candidates: found.length, matchedVideoId: selected?.candidateId || "",
+        duration: video.duration || 0, media: choices[0] || null, variants: choices.length
+      });
+    })()"""
+
+    completed = False
+    try:
+        media_info = None
+        discovery_started = time.monotonic()
+        _extract_log(trace_id, started_at, "MEDIA_DISCOVERY_START", f"window={win_id}")
+        attempts = 0
+        for attempts in range(1, 25):
+            evaluated = run([
+                electron, "cdp", str(win_id), "Runtime.evaluate",
+                json.dumps({"expression": expression, "returnByValue": True}),
+            ], timeout=20)
+            if evaluated.returncode == 0:
+                try:
+                    value = json.loads(evaluated.stdout).get("result", {}).get("value")
+                    if value:
+                        media_info = json.loads(value)
+                        if (media_info.get("media") or {}).get("url"):
+                            break
+                except Exception:
+                    pass
+            if attempts in {1, 6, 12, 18, 24}:
+                diagnostic = media_info or {}
+                _extract_log(
+                    trace_id, started_at, "MEDIA_DISCOVERY_WAIT",
+                    f"window={win_id}, attempt={attempts}/24, "
+                    f"ready={diagnostic.get('ready', '-')}, "
+                    f"render_data={diagnostic.get('renderData', False)}, "
+                    f"candidates={diagnostic.get('candidates', 0)}",
+                )
+            time.sleep(0.5)
+        if not media_info or not (media_info.get("media") or {}).get("url"):
+            raise RuntimeError("Electron 页面已打开，但未发现可下载 media")
+
+        vid = media_info["vid"]
+        if vid and vid in (cached_video_ids or set()):
+            completed = True
+            _extract_log(
+                trace_id, started_at, "MEDIA_DOWNLOAD_SKIPPED",
+                f"window={win_id}, video={vid}, reason=已有文案缓存",
+            )
+            return None, vid
+        media_path = job_dir / f"dy_{vid}.mp4"
+        media_url = media_info["media"]["url"]
+        selected_size = int((media_info.get("media") or {}).get("size") or 0)
+        page_duration = float(media_info.get("duration") or 0) / 1000
+        _extract_log(
+            trace_id, started_at, "MEDIA_DISCOVERY_DONE",
+            f"window={win_id}, video={vid}, attempts={attempts}, "
+            f"discovery={time.monotonic() - discovery_started:.2f}s, "
+            f"duration={page_duration:.1f}s, variants={media_info.get('variants', 0)}, "
+            f"selected={selected_size / 1024 / 1024:.1f}MB",
+        )
+        _extract_log(trace_id, started_at, "SESSION_DOWNLOAD_START", f"window={win_id}, video={vid}")
+        download_started = time.monotonic()
+        download_env = os.environ.copy()
+        # agent-desktop defaults to a 30s RPC ACK timeout. Large Douyin media
+        # routinely needs longer even though session_download_url itself is
+        # configured for five minutes.
+        download_env["CICY_AGENT_TIMEOUT_MS"] = "330000"
+        downloaded = subprocess.run(_rewrite_local([
+            desktop, "rpc", "session_download_url",
+            json.dumps({
+                "win_id": win_id, "url": media_url,
+                "save_path": str(media_path), "timeout": 300000,
+            }),
+            "--json",
+        ]), capture_output=True, text=True, timeout=340, env=download_env)
+        if downloaded.returncode != 0:
+            raise RuntimeError("Electron Session 下载失败: " + (downloaded.stderr or downloaded.stdout)[-500:])
+        if not media_path.exists() or media_path.stat().st_size < 10_000:
+            raise RuntimeError("Electron 报告下载完成，但媒体文件不存在或不完整")
+        duration = _ffdur(str(media_path))
+        if duration <= 0:
+            raise RuntimeError("媒体下载完成，但 ffprobe 校验失败")
+        completed = True
+        _extract_log(
+            trace_id, started_at, "SESSION_DOWNLOAD_DONE",
+            f"window={win_id}, download={time.monotonic() - download_started:.2f}s, "
+            f"file={media_path.stat().st_size / 1024 / 1024:.1f}MB",
+        )
+        _extract_log(
+            trace_id, started_at, "MEDIA_VERIFY_DONE",
+            f"ffprobe_duration={duration:.1f}s, path={media_path.name}",
+        )
+        return str(media_path), vid
+    finally:
+        if completed:
+            _extract_log(trace_id, started_at, "ELECTRON_CLOSE_START", f"window={win_id}")
+            closed = run([electron, "close", str(win_id)], timeout=20)
+            _extract_log(
+                trace_id, started_at, "ELECTRON_CLOSE_DONE",
+                f"window={win_id}, rc={closed.returncode}, reason=下载完成",
+            )
+        else:
+            # Keep the failed page visible for diagnosis. The user can inspect
+            # the exact BrowserWindow instead of losing the failure state.
+            focused = run([
+                desktop, "rpc", "control_electron_BrowserWindow",
+                json.dumps({
+                    "win_id": win_id,
+                    "code": "(win.isMinimized()&&win.restore(),win.show(),win.focus(),true)",
+                }),
+                "--json",
+            ], timeout=20)
+            _extract_log(
+                trace_id, started_at, "ELECTRON_KEPT_OPEN",
+                f"window={win_id}, focus_rc={focused.returncode}, reason=失败现场保留",
+            )
+
+
+def _is_text_llm_provider(item):
+    """AI rewrite accepts text LLMs only, never STT or vision-only models."""
+    if (item.get("protocol") or "").lower() != "openai":
+        return False
+    key = (item.get("key") or "").lower()
+    models = [str(model).lower() for model in (item.get("models") or [])]
+    default_model = str(item.get("defaultModel") or "").lower()
+    if key.startswith("custom_") and not (item.get("apiKey") or "").strip():
+        return False
+    if key in {"groqstt", "zhipu"} or "stt" in key:
+        return False
+    if "whisper" in default_model or any("whisper" in model for model in models):
+        return False
+    return True
+
+
+def _openai_provider(provider_key="defaultOpenAi"):
+    """按 key 使用 global.json 中的 OpenAI 协议服务。"""
     try:
         providers = load_global_cfg().get("providers", {})
         items = providers.get("items") or []
-        by_key = {p.get("key"): p for p in items}
-        preferred = [
-            "defaultOpenAi",
-            (providers.get("default") or {}).get("cicy"),
-            "deepseek",
-            "deepseek_openai",
-        ]
-        for key in preferred:
-            p = by_key.get(key)
-            if p and (p.get("protocol") or "").lower() == "openai" and (p.get("apiKey") or "").strip():
-                return p
-        for p in items:
-            if (p.get("protocol") or "").lower() == "openai" and (p.get("apiKey") or "").strip():
-                return p
+        p = next((item for item in items if item.get("key") == provider_key), None)
+        if p and _is_text_llm_provider(p) and (p.get("apiKey") or "").strip():
+            return p
     except Exception:
         pass
-    if os.environ.get("OPENAI_API_KEY"):
-        return {"url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
-                "apiKey": os.environ["OPENAI_API_KEY"],
-                "defaultModel": os.environ.get("OPENAI_MODEL", "")}
     return None
 
 
-def _chat(messages, model=None, max_tokens=1200, timeout=90):
-    import urllib.request
-    p = _openai_provider()
+def _chat(messages, model=None, max_tokens=1200, timeout=90, provider_key="defaultOpenAi"):
+    import requests
+    p = _openai_provider(provider_key)
     if not p:
-        raise RuntimeError("global.json 缺 defaultOpenAi")
+        raise RuntimeError(f"global.json 中供应商 {provider_key} 不可用")
     mdl = model or p.get("defaultModel") or "deepseek-v4-flash"
-    body = json.dumps({"model": mdl, "messages": messages,
-                       "max_tokens": max_tokens, "temperature": 0.9}).encode()
     endpoint = (p.get("url") or "").rstrip("/")
     if not endpoint.endswith("/chat/completions"):
         endpoint += "/chat/completions" if endpoint.endswith("/v1") else "/v1/chat/completions"
-    req = urllib.request.Request(endpoint, data=body,
-                                 headers={"Authorization": "Bearer " + p["apiKey"],
-                                          "Content-Type": "application/json",
-                                          "User-Agent": "cicy-koubo/0.1"})
-    r = json.load(urllib.request.urlopen(req, timeout=timeout))
-    return r["choices"][0]["message"].get("content", "").strip()
+    # OpenCode Zen's public models authenticate with the literal public token.
+    # The configured provider key is used by cicy's local gateway and is not a
+    # valid direct Zen bearer credential.
+    bearer_token = "public" if provider_key == "opencodeZen" else p["apiKey"]
+    headers = {
+        "Authorization": "Bearer " + bearer_token,
+        "Content-Type": "application/json",
+        "User-Agent": "cicy-koubo/0.1",
+    }
+    payload = {"model": mdl, "messages": messages,
+               "max_tokens": max_tokens, "temperature": 0.9}
+    request_timeout = (8, min(float(timeout), 90))
+    session = requests.Session()
+    # The desktop browsing proxy may inject a self-signed certificate.
+    # LLM API requests use a direct connection instead.
+    session.trust_env = False
+    try:
+        response = session.post(endpoint, headers=headers, json=payload, timeout=request_timeout)
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"].get("content") or ""
+        if not content.strip():
+            raise RuntimeError(f"{provider_key} 返回了空内容，请切换模型后重试")
+        return content.strip()
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        last_error = exc
+    if isinstance(last_error, requests.Timeout):
+        raise RuntimeError(f"{provider_key} 响应超时，请稍后重试或切换模型")
+    raise RuntimeError(f"{provider_key} 连接失败: {last_error}")
 
 
 DEFAULT_REWRITE_PROMPT = (
@@ -1493,6 +2092,11 @@ DEFAULT_REWRITE_PROMPT = (
     "要求:开头3秒强钩子抓停留;中间给足干货或情绪;结尾引导关注。"
     "只输出改写后的正文,不要解释、不要小标题、不要序号。"
 )
+DEFAULT_TITLE_PROMPT = (
+    "你是短视频内容策划专家。根据用户提供的口播文案，生成3个适合发布的高点击标题，"
+    "每个标题带1到2个相关话题标签；再生成一句简洁有力的封面文案。"
+    "直接输出结果，结构清晰，不要解释创作过程。"
+)
 
 
 @app.get("/api/rewrite-prompt")
@@ -1500,34 +2104,292 @@ def rewrite_prompt_default():
     return jsonify({"prompt": DEFAULT_REWRITE_PROMPT})
 
 
+@app.get("/api/title-prompt")
+def title_prompt_default():
+    return jsonify({"prompt": DEFAULT_TITLE_PROMPT})
+
+
+@app.get("/api/llm-options")
+def llm_options():
+    """Return safe provider/model metadata; never expose API keys."""
+    items = load_global_cfg().get("providers", {}).get("items") or []
+    providers = []
+    seen_endpoints = set()
+    for item in items:
+        if _is_text_llm_provider(item):
+            endpoint = (item.get("url") or "").strip().rstrip("/").lower()
+            if endpoint and endpoint in seen_endpoints:
+                continue
+            if endpoint:
+                seen_endpoints.add(endpoint)
+            default_model = (item.get("defaultModel") or "").strip()
+            models = item.get("models") or ([default_model] if default_model else [])
+            providers.append({
+                "key": item.get("key"),
+                "name": item.get("name") or item.get("key"),
+                "configured": bool((item.get("apiKey") or "").strip()),
+                "defaultModel": default_model,
+                "models": [str(model) for model in models if model],
+            })
+    return jsonify({"providers": providers, "defaultProvider": "defaultOpenAi"})
+
+
+def _colab_whisper_status():
+    colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
+    if not pathlib.Path(colab_bin).exists():
+        return False, False, False
+    try:
+        sessions = subprocess.run(
+            [colab_bin, "sessions"], capture_output=True, text=True, timeout=15
+        )
+        active = sessions.returncode == 0 and "No active" not in (sessions.stdout or "")
+    except Exception:
+        active = False
+    if not active:
+        return True, False, False
+    try:
+        rc, _ = _colab_exec(
+            "test -x /content/cosy/env/bin/python && "
+            "/content/cosy/env/bin/python -c 'import whisper'",
+            timeout=20,
+        )
+        return True, True, rc == 0
+    except Exception:
+        return True, True, False
+
+
+@app.get("/api/stt-options")
+def stt_options():
+    items = load_global_cfg().get("providers", {}).get("items") or []
+    groq = next((item for item in items if item.get("key") in {"groqStt", "groq_stt"}), None)
+    cli_installed, session_active, whisper_installed = _colab_whisper_status()
+    if not cli_installed:
+        colab_hint = "Colab CLI 未安装"
+    elif not session_active:
+        colab_hint = "Colab CLI 已安装，但没有活跃 GPU 会话"
+    elif not whisper_installed:
+        colab_hint = "Colab 会话可用，但 Whisper 尚未安装"
+    else:
+        colab_hint = "Colab CLI、GPU 会话和 Whisper 均已就绪"
+    return jsonify({
+        "options": [
+            {
+                "key": "groq", "name": "Groq Whisper",
+                "available": bool(groq and (groq.get("apiKey") or "").strip()),
+                "hint": "读取 global.json 的 groqStt",
+            },
+            {
+                "key": "colab", "name": "Colab Whisper",
+                "available": cli_installed and session_active and whisper_installed,
+                "hint": colab_hint,
+                "cliInstalled": cli_installed,
+                "sessionActive": session_active,
+                "whisperInstalled": whisper_installed,
+            },
+        ],
+        "default": "groq",
+    })
+
+
+def _desktop_rpc(tool, args, timeout=15, connect_retries=6):
+    """Call one cicy-desktop tool and unwrap its occasionally nested JSON."""
+    desktop = _sht.which("agent-desktop")
+    if not desktop:
+        raise RuntimeError("未安装 agent-desktop，无法打开 cicy-code")
+    payload = {}
+    for attempt in range(connect_retries):
+        result = run(
+            [desktop, "rpc", tool, json.dumps(args, ensure_ascii=False), "--json"],
+            timeout=timeout,
+        )
+        raw = result.stdout or result.stderr or ""
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        disconnected = (
+            "no cicy-desktop client connected" in raw
+            or "no cicy-desktop client connected" in str(payload)
+        )
+        if disconnected and attempt + 1 < connect_retries:
+            time.sleep(0.6)
+            continue
+        if disconnected:
+            raise RuntimeError("cicy-desktop 当前未连接，请确认桌面端正在运行后重试")
+        if result.returncode != 0:
+            raise RuntimeError((raw or "cicy-desktop 调用失败")[-500:])
+        break
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "cicy-desktop 调用失败"))
+    data = payload.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            pass
+    return data
+
+
+@app.post("/api/open-provider-settings")
+def open_provider_settings():
+    """Activate cicy-code's profile-0 tab and click its provider button."""
+    target_hosts = {"localhost:8008", "127.0.0.1:8008"}
+    def find_cicy_code_tab():
+        tabs_data = _desktop_rpc("electron_tabs", {"accountIdx": 0})
+        tabs = tabs_data.get("tabs", []) if isinstance(tabs_data, dict) else []
+        return next((
+            item for item in tabs
+            if urllib.parse.urlsplit(item.get("url") or "").netloc in target_hosts
+        ), None)
+
+    try:
+        tab = find_cicy_code_tab()
+        if tab:
+            web_contents_id = int(tab["webContentsId"])
+            _desktop_rpc("electron_tab_activate", {"webContentsId": web_contents_id})
+        else:
+            _desktop_rpc("electron_tab_open", {
+                "accountIdx": 0,
+                "url": "http://127.0.0.1:8008/",
+                "trusted": True,
+                "activate": True,
+            })
+            # Different desktop versions return different shapes from tab_open.
+            # Query the authoritative tab list instead of trusting that response.
+            tab = None
+            for _ in range(20):
+                tab = find_cicy_code_tab()
+                if tab:
+                    break
+                time.sleep(0.25)
+            if not tab:
+                raise RuntimeError("已请求打开 cicy-code，但 profile 0 中未找到对应 tab")
+            web_contents_id = int(tab["webContentsId"])
+            _desktop_rpc("electron_tab_activate", {"webContentsId": web_contents_id})
+
+        click_code = """new Promise(resolve => {
+          const deadline = Date.now() + 10000;
+          const click = () => {
+            const button = document.querySelector('[data-id="btn-providers"]');
+            if (button) {
+              button.click();
+              resolve({clicked: true, title: document.title});
+            } else if (Date.now() >= deadline) {
+              resolve({clicked: false, title: document.title});
+            } else {
+              setTimeout(click, 250);
+            }
+          };
+          click();
+        })"""
+        clicked = _desktop_rpc("electron_tab_eval", {
+            "webContentsId": web_contents_id,
+            "code": click_code,
+        }, timeout=15)
+        if isinstance(clicked, dict):
+            clicked = clicked.get("result", clicked)
+        if isinstance(clicked, dict) and not clicked.get("clicked", True):
+            raise RuntimeError("cicy-code 已打开，但没有找到供应商设置按钮")
+        plog(f"[模型配置] 已激活 cicy-code profile=0 tab={web_contents_id} 并打开供应商设置")
+        return jsonify({"ok": True, "webContentsId": web_contents_id})
+    except Exception as exc:
+        plog(f"[模型配置] 打开失败: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.post("/api/rewrite")
 def rewrite():
     body = request.json or {}
     src = (body.get("text") or "").strip()
-    style = (body.get("style") or "").strip()
     if not src:
         return jsonify({"error": "没有可改写的文案"}), 400
     sys = (body.get("system") or "").strip() or DEFAULT_REWRITE_PROMPT
-    user = (f"对标文案:\n{src}\n\n" + (f"改写风格/行业要求:{style}\n\n" if style else "") +
-            "请输出仿写后的口播文案。")
+    provider_key = (body.get("provider") or "defaultOpenAi").strip()
+    model = (body.get("model") or "").strip() or None
+    plog(f"[AI仿写] REQUEST · provider={provider_key}, model={model or 'default'}")
+    if not _openai_provider(provider_key):
+        return jsonify({
+            "error": f"供应商 {provider_key} 未配置 API Key，请在 cicy-ai/global.json 中完成配置"
+        }), 400
+    language_code = (body.get("outputLanguage") or "").strip()
+    language_names = {
+        "zh-CN": "简体中文", "zh-TW": "繁体中文", "en": "英语",
+        "ja": "日语", "ko": "韩语", "es": "西班牙语", "fr": "法语",
+        "de": "德语", "th": "泰语", "vi": "越南语", "id": "印度尼西亚语",
+    }
+    if language_code in language_names:
+        sys += (
+            "\n\n输出语言要求：请将最终口播文案翻译并输出为"
+            f"{language_names[language_code]}（{language_code}）。"
+            "只输出该语言的最终文案，不要附带原文、翻译说明或语言标签。"
+        )
     try:
-        out = _chat([{"role": "system", "content": sys}, {"role": "user", "content": user}])
+        out = _chat(
+            [{"role": "system", "content": sys}, {"role": "user", "content": src}],
+            model=model, provider_key=provider_key,
+        )
+        plog(f"[AI仿写] SUCCESS · provider={provider_key}, model={model or 'default'}, chars={len(out)}")
         return jsonify({"text": out})
     except Exception as e:  # noqa: BLE001
+        plog(f"[AI仿写] FAILED · provider={provider_key}, model={model or 'default'}, error={type(e).__name__}: {e}")
         return jsonify({"error": "改写失败: " + str(e)}), 500
 
 
 @app.post("/api/title")
 def title():
-    src = ((request.json or {}).get("text") or "").strip()
+    body = request.json or {}
+    src = (body.get("text") or "").strip()
     if not src:
         return jsonify({"error": "没有文案"}), 400
+    provider_key = (body.get("provider") or "defaultOpenAi").strip()
+    model = (body.get("model") or "").strip() or None
+    system_prompt = (body.get("system") or "").strip() or DEFAULT_TITLE_PROMPT
+    language_code = (body.get("outputLanguage") or "").strip()
+    language_names = {
+        "zh-CN": "简体中文", "zh-TW": "繁体中文", "en": "英语",
+        "ja": "日语", "ko": "韩语", "es": "西班牙语", "fr": "法语",
+        "de": "德语", "th": "泰语", "vi": "越南语", "id": "印度尼西亚语",
+    }
+    if language_code in language_names:
+        system_prompt += (
+            f"\n\n输出语言要求：全部内容必须使用{language_names[language_code]}"
+            f"（{language_code}）输出，不要附带原文或翻译说明。"
+        )
+    system_prompt += (
+        '\n\n输出格式要求：只返回合法 JSON 对象，不要使用 Markdown 代码块。'
+        '对象必须且只能包含三个字段：'
+        '"title"（3个候选标题组成的数组）、'
+        '"tags"（话题标签字符串数组，不带#）、'
+        '"coverText"（一句封面文案字符串）。'
+    )
+    plog(f"[标题文案] REQUEST · provider={provider_key}, model={model or 'default'}, chars={len(src)}")
     try:
-        out = _chat([{"role": "user", "content":
-                      "根据这段口播文案,给出3个抖音爆款标题(带1-2个话题#)和一句封面文案。"
-                      "直接列出,不要解释。\n\n" + src}], max_tokens=400)
-        return jsonify({"text": out})
+        out = _chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": src}],
+            model=model, max_tokens=1600, provider_key=provider_key,
+        )
+        raw = out.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(raw)
+        titles = result.get("title") or []
+        if isinstance(titles, str):
+            titles = [titles]
+        tags = result.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tag.strip().lstrip("#") for tag in tags.replace("，", ",").split(",") if tag.strip()]
+        cover_text = str(result.get("coverText") or "").strip()
+        if not titles or not cover_text:
+            raise RuntimeError("模型返回的标题文案结构不完整")
+        payload = {
+            "title": [str(title).strip() for title in titles if str(title).strip()][:3],
+            "tags": [str(tag).strip().lstrip("#") for tag in tags if str(tag).strip()],
+            "coverText": cover_text,
+        }
+        plog(f"[标题文案] SUCCESS · provider={provider_key}, model={model or 'default'}, titles={len(payload['title'])}, tags={len(payload['tags'])}")
+        return jsonify(payload)
     except Exception as e:  # noqa: BLE001
+        plog(f"[标题文案] FAILED · provider={provider_key}, model={model or 'default'}, error={type(e).__name__}: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1550,75 +2412,121 @@ def _groq_key():
 @app.post("/api/extract")
 def extract():
     """抖音链接 → 下载音频 → Groq 转写 → 返回文案。"""
+    started_at = time.monotonic()
     body = request.json or {}
     url = body.get("url", "").strip()
-    media_url = body.get("media_url", "").strip()
     force = body.get("force", False)
+    trace_id = "".join(ch for ch in str(body.get("trace_id") or "") if ch.isalnum() or ch in "-_")[:32]
+    trace_id = trace_id or uuid.uuid4().hex[:10]
+    _extract_log(trace_id, started_at, "REQUEST_RECEIVED", f"force={bool(force)}")
     if "douyin.com" not in url:
+        _extract_log(trace_id, started_at, "REQUEST_REJECTED", "未识别到 douyin.com")
         return jsonify({"error": "请粘贴抖音分享链接(含 v.douyin.com)"}), 400
     jd = WORK / ("dy_" + uuid.uuid4().hex[:8])
     jd.mkdir(exist_ok=True)
+    _extract_log(trace_id, started_at, "JOB_CREATED", f"dir={jd.name}")
     try:
-        # 第一层:按链接字符串直接查缓存,零网络秒回(短链解析要 7s,能免则免)
+        # 第一层:按链接字符串直接查缓存，零网络秒回。
         import re
         code = ""
         cm = re.search(r"douyin\.com/(?:video/)?([A-Za-z0-9_]+)", url)
         if cm:
             code = cm.group(1)
+        scripts = _load_scripts()
+        _extract_log(trace_id, started_at, "CACHE_CHECK_START", f"entries={len(scripts)}")
         if not force:
-            for e in _load_scripts():
+            for e in scripts:
                 eu = e.get("url", "")
                 if url == eu or (code and code in eu) or (code and code == e.get("id")):
-                    return jsonify({"text": e["text"], "audio": e.get("audio"), "cached": True})
-        # 第二层:解析短链拿数字ID再查(处理换了短链但同一视频的情况)。
-        # agent-electron 已从登录页面拿到 media 时不再走慢短链/CDP 下载链路。
-        if not force and not media_url:
-            pre_vid = _resolve_vid(url)
-            if pre_vid:
-                for e in _load_scripts():
-                    if e.get("id") == pre_vid:
-                        return jsonify({"text": e["text"], "audio": e.get("audio"), "cached": True})
-        media, vid = "", ""
-        if media_url:
-            import urllib.request
-            import urllib.parse
-            parsed = urllib.parse.urlparse(url)
-            vm = re.search(r"/video/(\d+)", parsed.path)
-            qm = urllib.parse.parse_qs(urllib.parse.urlparse(media_url).query).get("__vid", [])
-            vid = (vm.group(1) if vm else "") or (qm[0] if qm else "") or uuid.uuid4().hex[:12]
-            media = str(jd / f"dy_{vid}.mp4")
-            req = urllib.request.Request(media_url, headers={
-                "User-Agent": request.headers.get("User-Agent") or "Mozilla/5.0",
-                "Referer": "https://www.douyin.com/",
-            })
-            with urllib.request.urlopen(req, timeout=180) as src, open(media, "wb") as dst:
-                _sht.copyfileobj(src, dst)
-        else:
-            dl = _douyin_dl()
-            if not dl:
-                return jsonify({"error": "本机没有 douyin-dl 提取组件(设 KOUBO_DOUYIN_DL 指向脚本,或升级 cicy-koubo)"}), 500
-            dlcmd = [str(dl)] if os.access(dl, os.X_OK) else ["node", str(dl)]
-            r = run(dlcmd + [url, "-o", str(jd)], timeout=180)
-            for line in (r.stdout or "").splitlines():
-                if line.startswith("media="):
-                    media = line.split("=", 1)[1].strip()
-                    vid = pathlib.Path(media).stem.replace("dy_", "")
+                    _extract_log(trace_id, started_at, "CACHE_HIT", f"video={e.get('id') or 'share-link'}")
+                    _extract_log(trace_id, started_at, "RESPONSE_SUCCESS", "cached=true")
+                    return jsonify({
+                        "text": e["text"], "audio": e.get("audio"), "cached": True,
+                        "trace_id": trace_id, "elapsed": round(time.monotonic() - started_at, 1),
+                    })
+        _extract_log(trace_id, started_at, "CACHE_MISS")
+        # 唯一路径:Electron profile 0 BrowserWindow + 同 Session 下载。
+        # 不调用 yt-dlp，也不回退 Chrome CDP。
+        media, vid = _electron_media_download(
+            url, jd, trace_id, started_at,
+            cached_video_ids={str(e.get("id")) for e in scripts if e.get("id")},
+        )
         # 命中缓存(同一视频)直接返回,除非 force;下载失败也回退到缓存
         if vid and not force:
-            for e in _load_scripts():
+            _extract_log(trace_id, started_at, "VIDEO_CACHE_CHECK_START", f"video={vid}")
+            for e in scripts:
                 if e.get("id") == vid:
-                    return jsonify({"text": e["text"], "audio": e.get("audio"), "cached": True})
+                    # Remember the share URL as an alias. The next click can
+                    # return before opening Electron or downloading media.
+                    if e.get("url") != url:
+                        e["url"] = url
+                        _save_script(e)
+                    _extract_log(trace_id, started_at, "VIDEO_CACHE_HIT", f"video={vid}")
+                    _extract_log(trace_id, started_at, "RESPONSE_SUCCESS", "cached=true, media下载已跳过")
+                    return jsonify({
+                        "text": e["text"], "audio": e.get("audio"), "cached": True,
+                        "trace_id": trace_id, "elapsed": round(time.monotonic() - started_at, 1),
+                    })
         if not media or not os.path.exists(media):
+            _extract_log(trace_id, started_at, "MEDIA_MISSING", f"video={vid or '-'}")
             for e in _load_scripts():  # 下载失败但曾缓存过 → 用缓存
                 if url in (e.get("url") or "") or (vid and e.get("id") == vid):
-                    return jsonify({"text": e["text"], "cached": True, "note": "下载失败,返回历史缓存"})
-            detail = "" if media_url else (r.stdout or r.stderr)[-200:]
-            return jsonify({"error": "下载失败(抖音风控),稍后重试。日志:" + detail}), 502
-        # 转写: Colab whisper
+                    _extract_log(trace_id, started_at, "CACHE_FALLBACK", "下载失败，返回历史缓存")
+                    return jsonify({
+                        "text": e["text"], "cached": True, "note": "下载失败,返回历史缓存",
+                        "trace_id": trace_id, "elapsed": round(time.monotonic() - started_at, 1),
+                    })
+            return jsonify({"error": "Electron 下载失败，请查看日志"}), 502
+        # 短视频优先走 Groq。先只提取低码率单声道音频，上传更小、更快；
+        # 长视频不占用云端 STT，直接回退 Colab / 本机 Whisper。
         text = ""
+        provider = ""
+        duration = _ffdur(media)
+        _extract_log(
+            trace_id, started_at, "STT_ROUTE",
+            f"duration={duration:.1f}s, groq_configured={bool(_groq_key())}, gpu_mode={GPU_MODE}",
+        )
+        if 0 < duration <= 600 and _groq_key():
+            stt_audio = jd / f"dy_{vid or 'audio'}.mp3"
+            _extract_log(trace_id, started_at, "AUDIO_COMPRESS_START", "mono=1, rate=16kHz, bitrate=32k")
+            compress_started = time.monotonic()
+            audio_result = run([
+                "ffmpeg", "-v", "error", "-y", "-i", media,
+                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", str(stt_audio),
+            ], timeout=120)
+            if audio_result.returncode == 0 and stt_audio.exists():
+                _extract_log(
+                    trace_id, started_at, "AUDIO_COMPRESS_DONE",
+                    f"elapsed={time.monotonic() - compress_started:.2f}s, "
+                    f"file={stt_audio.stat().st_size / 1024 / 1024:.1f}MB",
+                )
+                _extract_log(trace_id, started_at, "GROQ_STT_START", "model=whisper-large-v3-turbo")
+                stt_started = time.monotonic()
+                text = _groq_transcribe(str(stt_audio))
+                if text:
+                    provider = "groq"
+                    _extract_log(
+                        trace_id, started_at, "GROQ_STT_DONE",
+                        f"elapsed={time.monotonic() - stt_started:.2f}s, chars={len(text)}",
+                    )
+                else:
+                    _extract_log(trace_id, started_at, "GROQ_STT_EMPTY", "准备回退")
+            else:
+                _extract_log(
+                    trace_id, started_at, "AUDIO_COMPRESS_FAILED",
+                    f"rc={audio_result.returncode}",
+                )
+
+        # Groq 不可用、请求失败或长视频:回退 Colab whisper。
         if GPU_MODE == "colab_cli":
-            remote_audio = f"/content/_dy_{pathlib.Path(media).name}"
-            if _colab_upload(media, remote_audio):
+            stt_input = str(stt_audio) if 'stt_audio' in locals() and stt_audio.exists() else media
+            remote_audio = f"/content/_dy_{pathlib.Path(stt_input).name}"
+            if not text:
+                _extract_log(trace_id, started_at, "COLAB_UPLOAD_START", f"file={pathlib.Path(stt_input).name}")
+            if not text and _colab_upload(stt_input, remote_audio):
+                _extract_log(trace_id, started_at, "COLAB_UPLOAD_DONE")
+                _extract_log(trace_id, started_at, "COLAB_STT_START", "model=whisper-medium")
+                colab_started = time.monotonic()
                 script = (
                     "import whisper,sys,json; "
                     "m=whisper.load_model('medium',device='cuda'); "
@@ -1628,10 +2536,17 @@ def extract():
                 rc, out = _colab_exec(f"cd /content/cosy && env/bin/python -c {shlex.quote(script)}", timeout=300)
                 if rc == 0:
                     text = out.strip()
+                    if text:
+                        provider = "colab-whisper"
+                        _extract_log(
+                            trace_id, started_at, "COLAB_STT_DONE",
+                            f"elapsed={time.monotonic() - colab_started:.2f}s, chars={len(text)}",
+                        )
         if not text:
             # fallback: 本机 CosyVoice 环境
             cosy_py = pathlib.Path("/content/cosy/env/bin/python")
             if cosy_py.exists():
+                _extract_log(trace_id, started_at, "LOCAL_STT_START", "model=whisper-medium")
                 try:
                     r = subprocess.run([str(cosy_py), "-c", (
                         "import whisper,sys; m=whisper.load_model('medium',device='cuda'); "
@@ -1639,14 +2554,32 @@ def extract():
                         "print(r['text'].strip())"
                     )], capture_output=True, text=True, timeout=300)
                     text = r.stdout.strip() if r.returncode == 0 else ""
-                except Exception:
-                    pass
+                    if text:
+                        provider = "local-whisper"
+                        _extract_log(trace_id, started_at, "LOCAL_STT_DONE", f"chars={len(text)}")
+                except Exception as local_error:
+                    _extract_log(trace_id, started_at, "LOCAL_STT_FAILED", str(local_error)[:300])
         if not text:
+            _extract_log(trace_id, started_at, "STT_FAILED", "所有转写路径均不可用")
             return jsonify({"error": "转写失败:无可用 whisper 环境(Colab/本地)"}), 500
+        _extract_log(trace_id, started_at, "SCRIPT_SAVE_START", f"video={vid}, chars={len(text)}")
         _save_script({"id": vid, "url": url, "text": text, "audio": media,
                       "ts": time.strftime("%Y-%m-%d %H:%M")})
-        return jsonify({"text": text, "audio": media, "cached": False})
+        _extract_log(trace_id, started_at, "SCRIPT_SAVE_DONE", f"video={vid}")
+        _extract_log(
+            trace_id, started_at, "RESPONSE_SUCCESS",
+            f"cached=false, provider={provider}, total={time.monotonic() - started_at:.2f}s",
+        )
+        return jsonify({
+            "text": text, "audio": media, "cached": False,
+            "provider": provider, "elapsed": round(time.monotonic() - started_at, 1),
+            "trace_id": trace_id,
+        })
     except Exception as e:  # noqa: BLE001
+        _extract_log(
+            trace_id, started_at, "REQUEST_FAILED",
+            f"{type(e).__name__}: {str(e)[:500]}",
+        )
         return jsonify({"error": str(e)}), 500
 
 
@@ -1702,6 +2635,53 @@ def _next_free(pattern, fmt):
     return fmt.format(n)
 
 
+def _process_reference_voice(raw, dst, mode):
+    """Convert a reference recording while preserving its original upload."""
+    filters = {
+        "raw": "anull",
+        "auto": "highpass=f=70,loudnorm=I=-20:LRA=7:TP=-2",
+        "denasal": (
+            "highpass=f=70,"
+            "equalizer=f=850:t=q:w=1.1:g=-2.5,"
+            "equalizer=f=1400:t=q:w=1.2:g=-1.5,"
+            "loudnorm=I=-20:LRA=7:TP=-2"
+        ),
+    }
+    mode = mode if mode in filters else "auto"
+    original_dir = ROOT / "assets" / "originals"
+    original_dir.mkdir(parents=True, exist_ok=True)
+    original = original_dir / dst.name
+    original_cmd = [
+        "ffmpeg", "-v", "error", "-y", "-i", str(raw),
+        "-ar", "16000", "-ac", "1", str(original),
+    ]
+    converted = run(original_cmd, timeout=120)
+    if converted.returncode != 0 or not original.exists():
+        return converted, mode
+    processed = run([
+        "ffmpeg", "-v", "error", "-y", "-i", str(original),
+        "-af", filters[mode], "-ar", "16000", "-ac", "1", str(dst),
+    ], timeout=120)
+    return processed, mode
+
+
+def _normalize_voice_output(path):
+    """Normalize generated speech for short-video playback without changing speed."""
+    src = pathlib.Path(path)
+    normalized = src.with_name(src.stem + "_normalized.wav")
+    result = run([
+        "ffmpeg", "-v", "error", "-y", "-i", str(src),
+        "-af", "loudnorm=I=-16:LRA=7:TP=-1.5",
+        "-ar", "24000", "-ac", "1", str(normalized),
+    ], timeout=120)
+    if result.returncode == 0 and normalized.exists() and normalized.stat().st_size > 1024:
+        normalized.replace(src)
+        return True
+    normalized.unlink(missing_ok=True)
+    plog(f"[配音响度标准化] 跳过: {result.stderr[-200:]}")
+    return False
+
+
 @app.post("/api/voices/upload")
 def voice_upload():
     if "file" not in request.files or not request.files["file"].filename:
@@ -1711,16 +2691,37 @@ def voice_upload():
     request.files["file"].save(raw)
     vid = _next_free("voice", "voice-sample-{:02d}.wav")
     dst = ROOT / "assets" / vid
-    r = run(["ffmpeg", "-v", "error", "-y", "-i", str(raw), "-ar", "16000", "-ac", "1", str(dst)], timeout=120)
+    r, optimize = _process_reference_voice(
+        raw, dst, (request.form.get("optimize") or "auto").strip().lower()
+    )
     raw.unlink(missing_ok=True)
     if r.returncode != 0 or not dst.exists():
         return jsonify({"error": "音频转换失败: " + r.stderr[:200]}), 400
+    # Reject recordings that contain no usable microphone signal. Electron
+    # may grant getUserMedia while the selected input device still yields
+    # digital silence.
+    try:
+        import array
+        import wave
+        with wave.open(str(dst), "rb") as wav:
+            samples = array.array("h", wav.readframes(wav.getnframes()))
+        peak = max((abs(sample) for sample in samples), default=0)
+        if peak < 200:
+            dst.unlink(missing_ok=True)
+            return jsonify({
+                "error": "录音中未检测到声音，请检查麦克风权限和系统输入设备后重试"
+            }), 400
+    except Exception:
+        pass
     name = (request.form.get("name") or "").strip()
     if name:
         import datetime
         name = f"{name}-{datetime.datetime.now().strftime('%m%d%H%M')}"
         _meta_set("voice", vid, name)
-    return jsonify({"id": vid, "name": name or vid, "duration": _ffdur(dst)})
+    return jsonify({
+        "id": vid, "name": name or vid, "duration": _ffdur(dst),
+        "optimize": optimize,
+    })
 
 
 @app.post("/api/voices/delete")
@@ -1729,6 +2730,7 @@ def voice_delete():
     if not vid.startswith("voice-sample-") or ".." in vid:
         return jsonify({"error": "bad id"}), 400
     (ROOT / "assets" / vid).unlink(missing_ok=True)
+    (ROOT / "assets" / "originals" / vid).unlink(missing_ok=True)
     _meta_set("voice", vid, remove=True)
     return jsonify({"ok": True})
 
@@ -1883,13 +2885,30 @@ _ensure_cjk_font()
 
 # ═══════════ 安装管理 ═══════════
 ENGINES = {
-    "mt":       {"name": "MuseTalk",  "ready": "/content/mt/READY",        "dir": "/content/mt",   "est_min": 23, "est_size_gb": 15},
-    "cosy":     {"name": "CosyVoice", "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "est_min": 24, "est_size_gb": 18},
+    "mt":       {
+        "name": "MuseTalk",
+        "ready": "/content/mt/READY",
+        "dir": "/content/mt",
+        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
+    },
+    "cosy":     {
+        "name": "CosyVoice",
+        "ready": "/content/cosy/COSY_READY",
+        "dir": "/content/cosy",
+        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
+    },
     "whisper":  {"name": "Whisper",   "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "builtin": True},
-    "hg":       {"name": "HeyGem",    "ready": "/content/hg/HG_READY",     "dir": "/content/hg",   "est_min":  5, "est_size_gb": 2.6},
+    "hg":       {
+        "name": "HeyGem",
+        "ready": "/content/hg/HG_READY",
+        "dir": "/content/hg",
+        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
+        "note": "可以先安装；生成时可能需要更多 GPU 显存，建议 ≥16GB，T4 可能 OOM",
+    },
 }
 
 COLAB_GPUS = ("T4", "L4", "G4", "H100", "A100")
+_COLAB_OAUTH_PROCESSES = {}
 
 
 @app.get("/api/colab/profiles")
@@ -1902,11 +2921,99 @@ def api_colab_profiles():
         p["auth"] = (p.get("auth") or "oauth2").lower()
         cred = pathlib.Path(os.path.expanduser(p.get("credentials_path") or ""))
         if p["auth"] == "oauth2":
-            p["credentials_ready"] = (pathlib.Path.home() / ".config/colab-cli/token.json").is_file()
+            p["credentials_ready"] = _colab_oauth_token_path({
+                "id": p.get("id") or "default"
+            }).is_file()
         else:
             p["credentials_ready"] = bool(p.get("credentials_path")) and cred.is_file()
         items.append(p)
     return jsonify({"active": colab["active"], "profiles": items, "gpu_options": COLAB_GPUS})
+
+
+@app.post("/api/colab/oauth/start")
+def api_colab_oauth_start():
+    """Start colab-cli's copy/paste OAuth flow and return its Google URL."""
+    profile = _active_colab_profile()
+    if profile["auth"] != "oauth2":
+        return jsonify({"error": "当前账号不是 OAuth2 模式"}), 400
+    old = _COLAB_OAUTH_PROCESSES.pop(profile["id"], None)
+    if old and old.poll() is None:
+        old.terminate()
+    token_path = _colab_oauth_token_path(profile)
+    token_path.unlink(missing_ok=True)  # “授权”也可用于安全地切换/重新授权账号
+    try:
+        proc = subprocess.Popen(
+            _colab_base_args(profile) + ["whoami"],
+            env=_colab_env(profile), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=False,
+        )
+        _COLAB_OAUTH_PROCESSES[profile["id"]] = proc
+        import selectors
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        selector.register(proc.stderr, selectors.EVENT_READ)
+        chunks = []
+        deadline = time.time() + 15
+        auth_url = ""
+        while time.time() < deadline and proc.poll() is None:
+            for key, _ in selector.select(timeout=0.5):
+                chunk = os.read(key.fileobj.fileno(), 8192)
+                if chunk:
+                    chunks.append(chunk.decode("utf-8", errors="replace"))
+            output = "".join(chunks)
+            match = re.search(r"https://accounts\.google\.com/[^\s]+", output)
+            if match:
+                auth_url = match.group(0)
+                break
+        selector.close()
+        if not auth_url:
+            output = "".join(chunks)
+            if proc.poll() is None:
+                proc.terminate()
+            _COLAB_OAUTH_PROCESSES.pop(profile["id"], None)
+            return jsonify({"error": "未能取得 Google 授权地址：" + output[-300:]}), 500
+        plog(f"[Colab OAuth] profile={profile['id']} 等待用户授权")
+        return jsonify({"ok": True, "auth_url": auth_url})
+    except Exception as exc:
+        return jsonify({"error": f"启动 OAuth2 失败：{exc}"}), 500
+
+
+@app.post("/api/colab/oauth/complete")
+def api_colab_oauth_complete():
+    profile = _active_colab_profile()
+    code = ((request.get_json(silent=True) or {}).get("code") or "").strip()
+    proc = _COLAB_OAUTH_PROCESSES.get(profile["id"])
+    if not code:
+        return jsonify({"error": "请粘贴 Google 页面显示的授权码"}), 400
+    if not proc or proc.poll() is not None:
+        return jsonify({"error": "授权流程已失效，请重新点击授权"}), 409
+    try:
+        proc.stdin.write((code + "\n").encode())
+        proc.stdin.flush()
+        stdout, stderr = proc.communicate(timeout=90)
+        output = (stdout + stderr).decode("utf-8", errors="replace")
+        _COLAB_OAUTH_PROCESSES.pop(profile["id"], None)
+        if proc.returncode != 0 or not _colab_oauth_token_path(profile).is_file():
+            return jsonify({"error": "Google 授权失败，请重新授权：" + output[-300:]}), 400
+        email_match = re.search(r"Email:\s+([^\s]+)", output)
+        email = email_match.group(1) if email_match else ""
+        if email:
+            cfg, colab = _colab_profiles_cfg()
+            current = next(
+                (item for item in colab["profiles"] if item.get("id") == profile["id"]),
+                None,
+            )
+            if current is not None:
+                current["email"] = email
+                current["authorized_at"] = time.time()
+                save_global_cfg(cfg)
+        plog(f"[Colab OAuth] profile={profile['id']} 授权成功 email={email or '-'}")
+        return jsonify({"ok": True, "email": email})
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        _COLAB_OAUTH_PROCESSES.pop(profile["id"], None)
+        return jsonify({"error": "Google 授权超时，请重试"}), 408
 
 
 @app.post("/api/colab/profiles")
@@ -1934,6 +3041,7 @@ def api_colab_profiles_save():
                                                f"~/.config/colab-cli/{profile_id}-sessions.json").strip()),
         "session": (profile.get("session") or f"koubo-{profile_id}").strip(),
         "gpu": gpu,
+        "email": (profile.get("email") or "").strip(),
     }
     if normalized["auth"] not in ("oauth2", "adc"):
         return jsonify({"error": "授权方式仅支持 oauth2 或 adc"}), 400
@@ -1941,6 +3049,8 @@ def api_colab_profiles_save():
         return jsonify({"error": "请填写该 Google 账号的 ADC 凭据文件路径"}), 400
     existing = next((p for p in colab["profiles"] if p.get("id") == profile_id), None)
     if existing:
+        if not normalized["email"]:
+            normalized["email"] = (existing.get("email") or "").strip()
         existing.update(normalized)
     else:
         colab["profiles"].append(normalized)
@@ -1960,7 +3070,35 @@ def api_colab_session_start():
         r = subprocess.run(args, capture_output=True, text=True, timeout=180,
                            env=_colab_env(profile))
         if r.returncode:
-            return jsonify({"error": (r.stderr or r.stdout)[-800:]}), 500
+            raw_error = (r.stderr or r.stdout or "").strip()
+            plog(
+                f"[Colab 会话启动失败] profile={profile['id']}, "
+                f"gpu={profile['gpu']}, error={raw_error[-1200:]}"
+            )
+            lowered = raw_error.lower()
+            if "toomanyassignmentserror" in lowered or \
+                    ("precondition failed" in lowered and "412" in lowered):
+                return jsonify({
+                    "error": (
+                        "当前 Google 账号仍占用一个旧的 Colab GPU 会话。"
+                        "请先点击“停止”释放旧会话，等待片刻后再启动"
+                    ),
+                    "code": "colab_assignment_conflict",
+                }), 409
+            if "service unavailable" in lowered or "503" in lowered:
+                return jsonify({
+                    "error": "Google Colab 暂时无法分配 GPU，请稍后重试",
+                    "code": "colab_service_unavailable",
+                }), 503
+            if "unauthorized" in lowered or "authentication" in lowered or "401" in lowered:
+                return jsonify({
+                    "error": "Google 授权已失效，请重新授权后再启动会话",
+                    "code": "colab_auth_expired",
+                }), 401
+            return jsonify({
+                "error": "Colab 会话创建失败，请查看系统日志了解详细原因",
+                "code": "colab_start_failed",
+            }), 500
         cfg, colab = _colab_profiles_cfg()
         current = next((p for p in colab["profiles"] if p.get("id") == colab["active"]), None)
         if current is not None:
@@ -1968,8 +3106,17 @@ def api_colab_session_start():
             save_global_cfg(cfg)
         return jsonify({"ok": True, "session": profile["session"], "gpu": profile["gpu"],
                         "output": (r.stdout or "").strip()[-500:]})
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "error": "创建 Colab 会话超时，Google 暂未返回结果，请稍后重试",
+            "code": "colab_start_timeout",
+        }), 504
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        plog(f"[Colab 会话启动异常] profile={profile['id']}, error={type(exc).__name__}: {exc}")
+        return jsonify({
+            "error": "Colab 会话启动异常，请查看系统日志了解详细原因",
+            "code": "colab_start_failed",
+        }), 500
 
 
 @app.post("/api/colab/session/stop")
@@ -2159,10 +3306,9 @@ def api_system():
     # whisper: CosyVoice 环境自带
     info["whisper_local"] = ""
     if GPU_MODE == "colab_cli":
-        # 远程检测 /content/cosy/env/bin/python 是否有 whisper
-        rc, out = _colab_exec("test -f /content/cosy/env/bin/python && /content/cosy/env/bin/python -c 'import whisper;print(whisper.__version__,end=\"\")' 2>/dev/null || echo ''", timeout=30)
-        if rc == 0 and out.strip():
-            info["whisper_local"] = out.strip()
+        # Remote engine readiness is loaded independently by /api/engines.
+        # Never block local system information on a slow or stale Colab session.
+        info["whisper_local"] = "随 CosyVoice 远程提供"
     else:
         cosy_python = pathlib.Path.home() / "cosyvoice-venv/bin/python"
         if cosy_python.exists():
@@ -2255,19 +3401,34 @@ def api_engines():
     # 远程检测: colab cli 模式下通过 exec 检查 READY 文件
     remote_status = {}
     if is_remote:
+        checks = []
         for key, cfg in ENGINES.items():
             ready_remote = cfg["ready"]
             script = f"/content/{key}/[p]rovision.sh"
-            rc, out_txt = _colab_exec(
-                f"(test -f {ready_remote} && cat {ready_remote} || true); "
+            checks.append(
+                f"echo __KOUBO_ENGINE_{key}_BEGIN__; "
+                f"(test -f {shlex.quote(ready_remote)} && "
+                f"{{ echo __KOUBO_INSTALLED_YES__; cat {shlex.quote(ready_remote)}; }} || true); "
                 f"echo __KOUBO_INSTALLING__; "
-                f"(pgrep -f '{script}' >/dev/null && echo YES || echo NO)",
-                timeout=30,
+                f"(pgrep -f {shlex.quote(script)} >/dev/null && echo YES || echo NO); "
+                f"echo __KOUBO_ENGINE_{key}_END__"
             )
-            before, _, after = out_txt.rpartition("__KOUBO_INSTALLING__")
+        # A single Colab round-trip avoids four sequential 30-second checks.
+        _, batch_out = _colab_exec("; ".join(checks), timeout=30)
+        for key in ENGINES:
+            begin = f"__KOUBO_ENGINE_{key}_BEGIN__"
+            end = f"__KOUBO_ENGINE_{key}_END__"
+            segment = (
+                batch_out.split(begin, 1)[1].split(end, 1)[0]
+                if begin in batch_out and end in batch_out else ""
+            )
+            installed_marker = "__KOUBO_INSTALLED_YES__"
+            installed = installed_marker in segment
+            version_and_state = segment.split(installed_marker, 1)[1] if installed else segment
+            before, _, after = version_and_state.rpartition("__KOUBO_INSTALLING__")
             remote_status[key] = {
-                "installed": bool(before.strip()),
-                "version_text": before.strip(),
+                "installed": installed,
+                "version_text": before.strip() if installed else "",
                 "installing": after.strip().endswith("YES"),
             }
     for key, cfg in ENGINES.items():
@@ -2298,7 +3459,8 @@ def api_engines():
                     "installed": installed, "installing": installing,
                     "version_info": version_info, "has_script": has_script,
                     "remote": is_remote, "builtin": cfg.get("builtin", False),
-                    "est_min": cfg.get("est_min"), "est_size_gb": cfg.get("est_size_gb")})
+                    "install_hint": cfg.get("install_hint", ""),
+                    "note": cfg.get("note", "")})
     return jsonify({"engines": out})
 
 
@@ -2338,6 +3500,7 @@ def api_engine_stream(engine):
     def generate():
         if GPU_MODE == "colab_cli":
             previous = None
+            stopped_checks = 0
             import time as _time
             for _ in range(1800):  # 最长约 2 小时，每次远程读取后等待
                 script = f"/content/{engine}/[p]rovision.sh"
@@ -2355,7 +3518,14 @@ def api_engine_stream(engine):
                         previous = text
                     else:
                         yield ": keepalive\n\n"
-                    if not state.strip().endswith("YES"):
+                    if state.strip().endswith("YES"):
+                        stopped_checks = 0
+                    else:
+                        stopped_checks += 1
+                    # Remote shells can briefly miss the process while bash
+                    # replaces a child command. Require three consecutive
+                    # stopped observations before ending the stream.
+                    if stopped_checks >= 3:
                         yield f"data: {json.dumps({'done': True, 'remote': True})}\n\n"
                         return
                 except Exception as exc:
@@ -2406,15 +3576,59 @@ def api_engine_install(engine):
     # colab cli 模式: 上传脚本到远程再执行
     if GPU_MODE == "colab_cli":
         remote_dir = cfg["dir"]
+        remote_log = f"{remote_dir}/provision.log"
+        mkdir_rc, mkdir_out = _colab_exec(
+            f"mkdir -p {shlex.quote(remote_dir)}",
+            timeout=30,
+        )
+        if mkdir_rc != 0:
+            return jsonify({
+                "error": f"创建 Colab 安装目录失败：{mkdir_out[-300:] or remote_dir}"
+            }), 500
+        _colab_exec(
+            f"printf '\\n[%s] 开始准备 {shlex.quote(cfg['name'])} 安装环境\\n' "
+            f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
+            timeout=30,
+        )
         # 上传整个目录
-        for sf in src_dir.iterdir():
+        upload_files = [sf for sf in src_dir.iterdir() if sf.is_file()]
+        for index, sf in enumerate(upload_files, 1):
+            _colab_exec(
+                f"printf '[%s] 上传文件 {index}/{len(upload_files)}: %s ... ' "
+                f"\"$(date '+%H:%M:%S')\" {shlex.quote(sf.name)} >> {shlex.quote(remote_log)}",
+                timeout=30,
+            )
             if sf.is_file():
                 ok = _colab_upload(sf, f"{remote_dir}/{sf.name}")
                 if not ok:
+                    _colab_exec(
+                        f"printf '失败\\n' >> {shlex.quote(remote_log)}",
+                        timeout=30,
+                    )
                     return jsonify({"error": f"上传 {sf.name} 到 Colab 失败"}), 500
+                _colab_exec(
+                    f"printf '完成\\n' >> {shlex.quote(remote_log)}",
+                    timeout=30,
+                )
         # 远程执行 provision.sh
         script = f"{remote_dir}/provision.sh"
-        rc, out = _colab_exec(f"chmod +x {script} && nohup bash {script} > {remote_dir}/provision.log 2>&1 &", timeout=30)
+        _colab_exec(
+            f"printf '[%s] 文件上传完成，启动安装脚本\\n' "
+            f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
+            timeout=30,
+        )
+        rc, out = _colab_exec(
+            f"chmod +x {shlex.quote(script)} && "
+            f"nohup bash {shlex.quote(script)} >> {shlex.quote(remote_log)} 2>&1 &",
+            timeout=30,
+        )
+        if rc != 0:
+            _colab_exec(
+                f"printf '[%s] 启动安装脚本失败\\n' "
+                f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
+                timeout=30,
+            )
+            return jsonify({"error": f"启动 {cfg['name']} 安装失败：{out[-300:]}"}), 500
         return jsonify({"ok": True, "started": True, "remote": True, "log_path": f"{remote_dir}/provision.log"})
     # 本机模式
     script = pathlib.Path(cfg["dir"]) / "provision.sh"

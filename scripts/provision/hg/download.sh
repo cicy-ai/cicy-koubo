@@ -1,32 +1,39 @@
-set -e
-set -u
+#!/bin/bash
+set -uo pipefail
 
-# face attr
-mkdir -p face_attr_detect
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/face_attr_epoch_12_220318.onnx -O face_attr_detect/face_attr_epoch_12_220318.onnx
+BASE=https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx
 
-# face detect
-mkdir -p face_detect_utils/resources
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/pfpld_robust_sim_bs1_8003.onnx -O face_detect_utils/resources/pfpld_robust_sim_bs1_8003.onnx
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/scrfd_500m_bnkps_shape640x640.onnx -O face_detect_utils/resources/scrfd_500m_bnkps_shape640x640.onnx
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/model_float32.onnx -O face_detect_utils/resources/model_float32.onnx
+download() {
+  local url=$1 out=$2 part="${2}.part" attempt=1
+  mkdir -p "$(dirname "$out")"
+  [ -s "$out" ] && { echo "cache hit: $out"; return 0; }
+  while true; do
+    echo "download: $out (attempt $attempt/5)"
+    if curl -fL --connect-timeout 15 --max-time 0 --retry 3 --retry-delay 2 \
+      --retry-all-errors -C - -o "$part" "$url"; then
+      mv -f "$part" "$out"
+      return 0
+    fi
+    [ "$attempt" -ge 5 ] && return 1
+    attempt=$((attempt + 1))
+    sleep $((attempt * 3))
+  done
+}
 
-# dh model
-mkdir -p landmark2face_wy/checkpoints/anylang
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/dinet_v1_20240131.pth -O landmark2face_wy/checkpoints/anylang/dinet_v1_20240131.pth
+export -f download
 
-# face parsing
-mkdir -p pretrain_models/face_lib/face_parsing
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/79999_iter.onnx -O pretrain_models/face_lib/face_parsing/79999_iter.onnx
+TMP_LIST=$(mktemp)
+trap 'rm -f "$TMP_LIST"' EXIT
+cat > "$TMP_LIST" <<EOF
+$BASE/face_attr_epoch_12_220318.onnx face_attr_detect/face_attr_epoch_12_220318.onnx
+$BASE/pfpld_robust_sim_bs1_8003.onnx face_detect_utils/resources/pfpld_robust_sim_bs1_8003.onnx
+$BASE/scrfd_500m_bnkps_shape640x640.onnx face_detect_utils/resources/scrfd_500m_bnkps_shape640x640.onnx
+$BASE/model_float32.onnx face_detect_utils/resources/model_float32.onnx
+$BASE/dinet_v1_20240131.pth landmark2face_wy/checkpoints/anylang/dinet_v1_20240131.pth
+$BASE/79999_iter.onnx pretrain_models/face_lib/face_parsing/79999_iter.onnx
+$BASE/GFPGANv1.4.onnx pretrain_models/face_lib/face_restore/gfpgan/GFPGANv1.4.onnx
+$BASE/xseg_211104_4790000.onnx xseg/xseg_211104_4790000.onnx
+$BASE/wenetmodel.pt wenet/examples/aishell/aidata/exp/conformer/wenetmodel.pt
+EOF
 
-# gfpgan
-mkdir -p pretrain_models/face_lib/face_restore/gfpgan
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/GFPGANv1.4.onnx -O pretrain_models/face_lib/face_restore/gfpgan/GFPGANv1.4.onnx
-
-# xseg
-mkdir -p xseg
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/xseg_211104_4790000.onnx -O xseg/xseg_211104_4790000.onnx
-
-# wenet
-mkdir -p wenet/examples/aishell/aidata/exp/conformer
-wget https://github.com/Holasyb918/HeyGem-Linux-Python-Hack/releases/download/ckpts_and_onnx/wenetmodel.pt -O wenet/examples/aishell/aidata/exp/conformer/wenetmodel.pt
+xargs -P 4 -n 2 bash -c 'download "$0" "$1"' < "$TMP_LIST"

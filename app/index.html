@@ -64,10 +64,10 @@ input[type=range]{-webkit-appearance:none;height:4px;border-radius:3px;backgroun
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--teal);cursor:pointer}
 .kv{font-size:12px;color:var(--mut)}
 audio{width:100%;height:34px;margin-top:6px}
-video.prev{width:100%;max-height:480px;background:#0d1418;border-radius:8px;margin-top:6px;display:none;object-fit:contain}
+video.prev,img.cover{width:min(100%,320px);height:auto;max-height:570px;border-radius:8px;margin:6px auto 0;display:none;object-fit:contain}
+video.prev{background:transparent}
 video.prev::-webkit-media-controls{transition:opacity 0.5s}
 video.prev.no-controls::-webkit-media-controls{opacity:0;pointer-events:none}
-img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 .stage{font-size:12px;color:var(--teal-d);background:var(--teal-l);border-radius:8px;
   padding:7px 10px;margin-top:8px;display:none;line-height:1.5}
 .stage.err{color:var(--red);background:#fdf0ee}
@@ -143,6 +143,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
   padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:99;
   max-width:80vw}
 #toast.show{opacity:.96}
+.title-result{display:none;margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.title-result.show{display:block}.title-field+.title-field{margin-top:10px}
+.title-label{font-size:11px;color:var(--mut);margin-bottom:5px}
 .mask{position:fixed;inset:0;background:rgba(20,30,38,.45);display:none;z-index:60}
 .modal{position:fixed;left:50%;top:12%;transform:translateX(-50%);width:min(680px,92vw);
   background:#fff;border-radius:12px;padding:16px;z-index:61;display:none}
@@ -200,7 +203,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 .provider-fields .inp{font-size:11px;padding:6px 8px}
 .colab-panel{margin-top:10px}.colab-profile{border:1px solid var(--line);border-radius:10px;
   padding:10px;margin-bottom:8px}.colab-profile.active{border-color:#9bd8c4;background:#fbfffd}
-.colab-profile-grid{display:grid;grid-template-columns:minmax(120px,.7fr) 92px minmax(180px,1.4fr) 90px auto;
+.colab-profile-grid{display:grid;grid-template-columns:92px minmax(180px,1fr) auto;
   gap:6px;margin-top:8px}.colab-profile-grid .inp{font-size:11px;padding:6px 8px}
 .colab-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .settings-note{font-size:11px;color:var(--mut);line-height:1.6;background:#f6f8fa;border-radius:8px;padding:8px 10px}
@@ -228,7 +231,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 <div class="topbar">
   <h1>爆款口播视频制作 <span class="ver">v8</span></h1>
   <div class="pills">
-    <span class="pill"><i class="dot" id="d-tun"></i>GPU隧道 <b id="t-tun" style="font-weight:500">检测中</b></span>
+    <span class="pill"><i class="dot" id="d-tun"></i>Colab GPU <b id="t-tun" style="font-weight:500">检测中</b></span>
     <span class="pill"><i class="dot" id="d-au"></i>配音 <b id="t-au" style="font-weight:500">-</b></span>
     <span class="pill"><i class="dot" id="d-vi"></i>出片 <b id="t-vi" style="font-weight:500">-</b></span>
     <a class="btn" id="colabBtn" style="text-decoration:none;padding:7px 12px;cursor:pointer;background:var(--teal);color:#fff;font-weight:600"
@@ -249,31 +252,52 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <input class="inp" id="dyUrl" placeholder="1.58 复制打开抖音… https://v.douyin.com/xxxx/">
       <button class="btn ghost" onclick="$('dyUrl').value='';persist($('dyUrl'))" title="清空">✕</button>
     </div>
-    <button class="btn big" id="btn-extract" onclick="extract()">1. 提取视频文案</button>
+    <button class="btn big" id="btn-extract" onclick="extract()">1.提取视频文案</button>
     <div class="lbl">原始文案(可手动输入)</div>
     <textarea class="ta" id="script1" placeholder="粘贴抖音链接点提取,或手动输入原始文案"></textarea>
     <div class="row">
-      <input class="inp" id="style" placeholder="改写风格/行业(选填,如:改成乡镇奶茶店)">
-      <button class="btn ghost" onclick="openPrompt()" title="编辑改写提示词">⚙</button>
+      <button class="btn ghost" id="rewriteSettingsBtn" onclick="openPrompt()" title="配置供应商、模型与 System Prompt" aria-label="AI 仿写设置">⚙</button>
+      <button class="btn big" style="margin-top:0;flex:1" id="btn-rewrite" onclick="rewrite()">2.AI 仿写改写</button>
     </div>
-    <button class="btn big" id="btn-rewrite" onclick="rewrite()">2. AI 仿写改写</button>
     <div class="lbl">改写后文案(配音优先用这份)</div>
     <textarea class="ta" id="script2" placeholder="改写结果;也可直接编辑"></textarea>
-    <button class="btn big ghost" id="btn-title" onclick="genTitle()">生成标题 / 话题 / 封面文案</button>
-    <textarea class="ta small" id="titleOut" placeholder="标题 / 话题 / 封面文案…"></textarea>
+    <div class="row">
+      <button class="btn ghost" onclick="openTitlePrompt()" title="配置标题文案" aria-label="标题文案设置">⚙</button>
+      <button class="btn big" style="margin-top:0;flex:1" id="btn-title" onclick="genTitle()">3.生成标题和文案</button>
+    </div>
+    <div class="title-result" id="titleResult">
+      <div class="title-field"><div class="title-label">title（多个标题用；分隔）</div>
+        <input class="inp" id="titleField" oninput="saveTitleFields()"></div>
+      <div class="title-field"><div class="title-label">tags（多个标签用空格分隔）</div>
+        <input class="inp" id="tagsField" oninput="saveTitleFields()"></div>
+      <div class="title-field"><div class="title-label">coverText</div>
+        <input class="inp" id="coverTextField" oninput="saveTitleFields()"></div>
+    </div>
+    <textarea id="titleOut" hidden></textarea>
   </div>
 
   <!-- ② 配音 -->
   <div class="card">
     <div class="step"><h2>配音</h2><span class="tip">CosyVoice 声音克隆</span></div>
-    <div class="lbl">参考音色(素材库可增删改) <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-left:6px" onclick="$('upVoice').click()">+ 上传</button></div>
+    <div class="row" style="margin-top:0">
+      <button class="btn ghost" id="btn-record" onclick="toggleRecord()">⏺ 开始录音</button>
+      <button class="btn ghost" onclick="$('audFile').click()">⬆ 上传音频</button>
+      <span class="kv" id="recordTime"></span>
+    </div>
+    <div class="lbl">音色优化</div>
+    <select id="voiceOptimize">
+      <option value="auto" selected>自动优化（推荐）· 清理低频并统一响度</option>
+      <option value="denasal">轻度去鼻音 · 自动优化并柔和削弱鼻腔共鸣</option>
+      <option value="raw">原声 · 仅转换为兼容格式</option>
+    </select>
+    <div class="lbl">参考音色(素材库可增删改)</div>
     <div class="row" style="margin-top:0">
       <select id="refSel"></select>
       <span class="play" onclick="togglePlay(this,()=>'/api/voices/'+$('refSel').value)">▶</span>
     </div>
-    <div class="lbl">语速 <b id="spdV" style="color:var(--ink)">1.00</b>x</div>
+    <div class="lbl">语速 <b id="spdV" style="color:var(--ink)">1.15</b>x</div>
     <div class="row" style="margin-top:0">
-      <input type="range" id="speed" min="0.5" max="1.5" step="0.05" value="1"
+      <input type="range" id="speed" min="0.5" max="1.5" step="0.05" value="1.15"
         oninput="$('spdV').textContent=(+this.value).toFixed(2)">
     </div>
     <div class="lbl">生成方式</div>
@@ -282,12 +306,14 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <option value="whole">整段生成(语气连贯,长文可能截断)</option>
     </select>
     <div style="height:10px"></div>
-    <button class="btn big" id="btn-tts" onclick="genAudio()">3. 🎙 生成配音</button>
+    <div class="row">
+      <button class="btn ghost" onclick="openSttSettings()" title="参考音频转写设置" aria-label="参考音频转写设置">⚙</button>
+      <button class="btn big" style="margin-top:0;flex:1" id="btn-tts" onclick="genAudio()">4. 🎙 生成配音</button>
+    </div>
     <div class="stage" id="ttsStage"></div>
     <div class="lbl" style="margin-top:12px">配音结果 <span class="kv" id="ttsInfo"></span></div>
     <audio id="ttsPlayer" controls style="display:none"></audio>
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-tts-dl" onclick="dlTts()" disabled>⬇ 下载配音</button></div>
-    <div class="lbl" style="margin-top:10px">或上传现成音频代替配音</div>
     <input type="file" id="audFile" accept="audio/*" hidden>
   </div>
 
@@ -311,7 +337,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
     </div>
-    <button class="btn big" id="btn-gen" onclick="genVideo()">4. 🎬 生成视频</button>
+    <button class="btn big" id="btn-gen" onclick="genVideo()">5. 🎬 生成视频</button>
     <div class="stage" id="genStage"></div>
     <div class="lbl" style="margin-top:12px">成片 <span class="kv" id="genInfo"></span></div>
     <video class="prev" id="resultPrev" controls playsinline></video>
@@ -327,12 +353,12 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <textarea class="ta small" id="subText" placeholder="点「按配音生成」得到逐句时间轴字幕,或手写"></textarea>
     <div class="subgrid" style="margin-top:6px">
       <div class="cell">字体<select id="subFont"></select></div>
-      <div class="cell">字号<input id="subSize" type="number" value="0" title="0=自动"></div>
+      <div class="cell">字号(px)<input id="subSize" type="number" min="8" value="14"></div>
       <div class="cell">字色<input id="subColor" type="color" value="#FFFFFF"></div>
       <div class="cell">描边<input id="subOutline" type="color" value="#000000"></div>
     </div>
-    <div class="row"><span class="kv">底边距</span><input type="range" id="subMb" min="20" max="400" step="10" value="60"
-      oninput="$('mbV').textContent=this.value"><b class="kv" id="mbV">60</b></div>
+    <div class="row"><span class="kv">字幕安全区</span><input type="range" id="subMb" min="20" max="500" step="10" value="300"
+      oninput="$('mbV').textContent=this.value"><b class="kv" id="mbV">300</b></div>
     <div class="lbl">背景音乐(素材库可增删改)</div>
     <div class="row" style="margin-top:0">
       <select id="bgmSel"><option value="">不用 BGM</option></select>
@@ -340,13 +366,13 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     </div>
     <div class="row"><span class="kv">音量</span><input type="range" id="bgmVol" min="0.05" max="0.8" step="0.05" value="0.2"
       oninput="$('bgmV').textContent=Math.round(this.value*100)+'%'"><b class="kv" id="bgmV">20%</b></div>
-    <button class="btn big" id="btn-edit" onclick="editVideo()">5. ✂️ 剪辑(烧字幕 + 混BGM)</button>
+    <button class="btn big" id="btn-edit" onclick="editVideo()">6. ✂️ 剪辑(烧字幕 + 混BGM)</button>
     <div class="stage" id="editStage"></div>
     <video class="prev" id="editPrev" controls playsinline></video>
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-edit-dl" onclick="dlEdit()" disabled>⬇ 下载剪辑成片</button></div>
     <div class="lbl" style="margin-top:12px">封面</div>
     <div class="row" style="margin-top:0">
-      <input class="inp" id="coverTitle" placeholder="封面标题(留空取步骤1标题第一条)">
+      <input class="inp" id="coverTitle" placeholder="封面标题（留空使用生成的封面文案）">
       <select id="coverTpl" style="width:110px;flex:none">
         <option value="dark1">暗色蒙版1</option><option value="dark2">暗色蒙版2</option><option value="none">无蒙版</option>
       </select>
@@ -360,12 +386,11 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 <!-- 素材库 -->
 <div class="card assets" id="assetPanel">
   <div class="step"><span class="n">📦</span><h2>素材库</h2>
-    <span class="tip">音色·底板·BGM·文案·成品,全部可增查改删;文件直接拖进本区即入库</span></div>
+    <span class="tip">音色·底板·BGM·成品,全部可增查改删;文件直接拖进本区即入库</span></div>
   <div class="tabs">
     <div class="tab on" data-t="voice" onclick="switchTab('voice')">🎤 音色 <span class="cnt" id="cnt-voice">0</span></div>
     <div class="tab" data-t="base" onclick="switchTab('base')">🎬 底板 <span class="cnt" id="cnt-base">0</span></div>
     <div class="tab" data-t="bgm" onclick="switchTab('bgm')">🎵 BGM <span class="cnt" id="cnt-bgm">0</span></div>
-    <div class="tab" data-t="script" onclick="switchTab('script')">📄 文案 <span class="cnt" id="cnt-script">0</span></div>
     <div class="tab" data-t="media" onclick="switchTab('media')">🎁 成品 <span class="cnt" id="cnt-media">0</span></div>
   </div>
   <div class="toolrow" id="assetTools"></div>
@@ -380,15 +405,72 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 <div class="mask" id="vmask" onclick="closeVideo()"></div>
 <div id="vmodal"><button class="vx" onclick="closeVideo()">✕</button><video controls playsinline></video></div>
 
-<!-- 改写提示词 modal -->
+<!-- AI 仿写设置 modal -->
 <div class="mask" id="mask" onclick="closePrompt()"></div>
 <div class="modal" id="pModal">
-  <h3>改写提示词(系统 Prompt)</h3>
+  <h3>AI 仿写设置</h3>
+  <div class="lbl">供应商</div>
+      <select id="rewriteProvider" onchange="onRewriteProviderChange()"></select>
+  <div class="lbl" style="margin-top:12px">模型</div>
+  <select id="rewriteModel"></select>
+  <div class="row" style="margin-top:12px;align-items:center">
+    <label class="switch" style="flex:none">
+      <input type="checkbox" id="rewriteTranslate" onchange="toggleRewriteLanguage()">输出为指定语言
+    </label>
+    <select id="rewriteLanguage">
+      <option value="zh-CN">简体中文</option>
+      <option value="zh-TW">繁體中文</option>
+      <option value="en">English</option>
+      <option value="ja">日本語</option>
+      <option value="ko">한국어</option>
+      <option value="es">Español</option>
+      <option value="fr">Français</option>
+      <option value="de">Deutsch</option>
+      <option value="th">ไทย</option>
+      <option value="vi">Tiếng Việt</option>
+      <option value="id">Bahasa Indonesia</option>
+    </select>
+  </div>
+  <div class="lbl" style="margin-top:12px">System Prompt</div>
   <textarea class="ta" id="pText" style="min-height:180px"></textarea>
   <div class="row" style="justify-content:flex-end">
+    <button class="btn ghost" onclick="openProviderSettings(this)">打开 Provider 配置</button>
+    <button class="btn ghost" onclick="refreshLlmSettings(this)">↻ 刷新配置</button>
     <button class="btn ghost" onclick="resetPrompt()">恢复默认</button>
     <button class="btn" onclick="savePrompt()">保存</button>
     <button class="btn ghost" onclick="closePrompt()">关闭</button>
+  </div>
+</div>
+
+<!-- 标题文案设置 modal -->
+<div class="mask" id="titleMask" onclick="closeTitlePrompt()"></div>
+<div class="modal" id="titleModal">
+  <h3>标题和文案设置</h3>
+  <div class="lbl">System Prompt</div>
+  <textarea class="ta" id="titlePromptText" style="min-height:180px"></textarea>
+  <div class="lbl" style="margin-top:10px">输出语言跟随“AI 仿写设置”</div>
+  <div class="lbl" id="titleProviderHint" style="margin-top:6px"></div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn ghost" onclick="openProviderSettings(this)">打开 Provider 配置</button>
+    <button class="btn ghost" onclick="refreshTitleProvider(this)">↻ 刷新配置</button>
+    <button class="btn ghost" onclick="resetTitlePrompt()">恢复默认</button>
+    <button class="btn" onclick="saveTitlePrompt()">保存</button>
+    <button class="btn ghost" onclick="closeTitlePrompt()">关闭</button>
+  </div>
+</div>
+
+<!-- 参考音频转写设置 modal -->
+<div class="mask" id="sttMask" onclick="closeSttSettings()"></div>
+<div class="modal" id="sttModal">
+  <h3>参考音频转写设置</h3>
+  <div class="lbl">Whisper 服务</div>
+  <select id="sttProvider"></select>
+  <div class="lbl" id="sttHint" style="margin-top:10px"></div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn ghost" onclick="openProviderSettings(this)">打开 Provider 配置</button>
+    <button class="btn ghost" onclick="refreshSttSettings(this)">↻ 刷新配置</button>
+    <button class="btn" onclick="saveSttSettings()">保存</button>
+    <button class="btn ghost" onclick="closeSttSettings()">关闭</button>
   </div>
 </div>
 
@@ -399,7 +481,7 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
 <div class="modal" id="iModal" style="width:min(780px,94vw);height:min(82vh,760px)">
   <div class="settings-head">
     <h3>⚙️ 系统设置 <span style="font-size:12px;color:var(--mut);font-weight:400" id="iTitle">加载中…</span></h3>
-    <button class="btn ghost" id="settingsRefresh" style="padding:6px 10px;font-size:12px" onclick="refreshSystemSettings()">↻ 刷新</button>
+    <button class="btn ghost" id="settingsRefresh" style="padding:6px 10px;font-size:12px" onclick="refreshSystemSettings(true)">↻ 刷新</button>
   </div>
   <div class="settings-summary" id="settingsSummary">
     <div class="health-icon">⏳</div><div><div class="health-title">正在检查运行环境</div><div class="health-detail">请稍候</div></div>
@@ -417,6 +499,9 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
     <section class="settings-panel" data-settings-panel="engines">
       <div class="settings-section-head"><div><div class="settings-section-title">生成引擎</div><div class="settings-section-desc">配音、数字人与字幕能力的安装状态</div></div></div>
       <div id="engineHint"></div>
+      <div style="margin:10px 0 12px">
+        <button class="btn" id="installCoreEnginesBtn" onclick="installCoreEngines(this)">⚡ 一键并发安装 MuseTalk + CosyVoice</button>
+      </div>
       <div id="engineList"></div>
     </section>
   </div>
@@ -425,11 +510,37 @@ img.cover{width:100%;border-radius:8px;margin-top:6px;display:none}
   </div>
 </div>
 
+<!-- Colab OAuth modal -->
+<div class="mask" id="colabOauthMask" style="z-index:80" onclick="closeColabOauthModal()"></div>
+<div class="modal" id="colabOauthModal" style="z-index:81;width:min(620px,92vw)">
+  <h3>授权 Google 账号</h3>
+  <div class="lbl">1. 复制授权地址，在你自己的浏览器中打开并登录 Google</div>
+  <textarea class="ta" id="colabOauthUrl" readonly style="min-height:110px;word-break:break-all"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button class="btn" id="colabOauthCopy" onclick="copyColabOauthUrl(this)">复制 URL</button>
+  </div>
+  <div class="lbl" style="margin-top:14px">2. 粘贴 Google 页面显示的授权码</div>
+  <input class="inp" id="colabOauthCode" placeholder="粘贴授权码">
+  <div class="row" style="justify-content:flex-end;margin-top:14px">
+    <button class="btn ghost" onclick="closeColabOauthModal()">取消</button>
+    <button class="btn" id="colabOauthSubmit" onclick="completeColabOauth(this)">完成授权</button>
+  </div>
+</div>
+
 <script>
 const $=id=>document.getElementById(id);
 const PK='krv8:';
-function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');
-  clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3200)}
+function logUiError(message,level='error'){
+  fetch('/api/ui-log',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({level,message:String(message).slice(0,1000),page:location.pathname}),
+    keepalive:true}).catch(()=>{});
+}
+function toast(m){const text=String(m);const t=$('toast');t.textContent=text;t.classList.add('show');
+  const isError=/失败|错误|异常|超时|断开|不可用|❌|error|failed|timeout/i.test(text);
+  if(isError)logUiError(text);
+  clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),isError?6500:3200)}
+window.addEventListener('error',e=>logUiError(`未捕获异常: ${e.message||'unknown'} @ ${e.filename||location.pathname}:${e.lineno||0}`));
+window.addEventListener('unhandledrejection',e=>logUiError(`Promise 异常: ${e.reason?.message||String(e.reason||'unknown')}`));
 function persist(el){if(!el.id||el.type==='file')return;
   localStorage.setItem(PK+el.id,el.type==='checkbox'?(el.checked?'1':'0'):el.value)}
 function persistInit(){document.querySelectorAll('input[id],textarea[id],select[id]').forEach(el=>{
@@ -437,21 +548,54 @@ function persistInit(){document.querySelectorAll('input[id],textarea[id],select[
   const v=localStorage.getItem(PK+el.id);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
   el.addEventListener('input',()=>persist(el));el.addEventListener('change',()=>persist(el));});
+  // One-time migration: move captions above Douyin's title/tag overlay.
+  if(localStorage.getItem(PK+'subtitleSafeAreaV3')!=='1'){
+    $('subMb').value='300';
+    localStorage.setItem(PK+'subMb','300');
+    localStorage.setItem(PK+'subtitleSafeAreaV3','1');
+  }
+  if(localStorage.getItem(PK+'subtitleFont14V1')!=='1'){
+    $('subSize').value='14';
+    localStorage.setItem(PK+'subSize','14');
+    localStorage.setItem(PK+'subtitleFont14V1','1');
+  }
+  if(localStorage.getItem(PK+'subtitleTypefaceHeavyV1')!=='1'){
+    localStorage.setItem(PK+'subFont','heavy');
+    localStorage.setItem(PK+'subtitleTypefaceHeavyV1','1');
+  }
   $('spdV').textContent=(+$('speed').value).toFixed(2);
   $('bgmV').textContent=Math.round($('bgmVol').value*100)+'%';
   $('mbV').textContent=$('subMb').value;}
 
 /* ---------- 状态 ---------- */
-async function refreshStatus(){
+async function refreshStatus(force=false){
+  const now=Date.now();
+  if(!force&&_globalHealth&&now-_globalHealthAt<15000){
+    applyGlobalHealth(_globalHealth);
+    return _globalHealth;
+  }
+  if(_statusRequest)return _statusRequest;
+  _statusRequest=(async()=>{
   try{
-    const s=await (await fetch('/api/status')).json();
-    setPill('tun', s.tunnel==='ready'?'ok':'bad', s.tunnel==='ready'?'在线':'离线·重跑cell');
+    const s=await (await fetch('/api/status'+(force?'?refresh=1':''),{cache:'no-store'})).json();
+    _globalHealth=s;
+    _globalHealthAt=Date.now();
+    applyGlobalHealth(s);
+    return s;
+  }catch(e){setPill('tun','bad','后端断开');setPill('au','bad','-');setPill('vi','bad','-');return null}
+  finally{_statusRequest=null}
+  })();
+  return _statusRequest;
+}
+function applyGlobalHealth(s){
+    if(!s)return;
+    setPill('tun', s.tunnel==='ready'?'ok':'bad', s.tunnel==='ready'?'在线':'离线');
     setPill('au', s.audio_service==='ready'?'ok':(s.tunnel!=='ready'?'bad':'wait'),
       s.audio_service==='ready'?'就绪':(s.tunnel!=='ready'?'离线':'装载中'));
     setPill('vi', s.video_service==='ready'?'ok':(s.tunnel!=='ready'?'bad':'wait'),
       s.video_service==='ready'?'就绪':(s.tunnel!=='ready'?'离线':'装载中'));
     const cb=$('colabBtn');if(cb)cb.className='btn ghost';
-  }catch(e){setPill('tun','bad','后端断开');setPill('au','bad','-');setPill('vi','bad','-')}
+    renderSettingsHealth();
 }
 function setPill(k,cls,txt){$('d-'+k).className='dot '+cls;$('t-'+k).textContent=txt}
 
@@ -471,58 +615,331 @@ async function extract(){
   const raw=$('dyUrl').value.trim();
   const m=raw.match(/https?:\/\/[^\s]+douyin\.com[^\s]*/);
   if(!m)return toast('没识别到抖音链接');
-  const b=$('btn-extract');b.disabled=true;b.textContent='提取中(约30秒)…';
+  const traceId='x'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+  const started=performance.now();
+  logUiError(`[文案提取 ${traceId}] CLICK · 已识别抖音链接`,'info');
+  const b=$('btn-extract');b.disabled=true;b.textContent='正在下载并识别…';
   try{
-    const d=await (await fetch('/api/extract',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:m[0]})})).json();
-    if(d.error)toast('提取失败:'+d.error);
+    logUiError(`[文案提取 ${traceId}] REQUEST_START · POST /api/extract`,'info');
+    const response=await fetch('/api/extract',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:m[0],trace_id:traceId})});
+    logUiError(`[文案提取 ${traceId}] RESPONSE_HEADERS · HTTP ${response.status} · ${((performance.now()-started)/1000).toFixed(2)}s`,'info');
+    const d=await response.json();
+    if(d.error){logUiError(`[文案提取 ${traceId}] RESPONSE_ERROR · ${d.error}`);toast('提取失败:'+d.error)}
     else{$('script1').value=d.text;persist($('script1'));
-      toast(d.cached?'命中缓存,秒回':'提取成功,已存入文案库');loadScriptsTab()}
-  }catch(e){toast('提取失败:'+e)}
-  b.disabled=false;b.textContent='提取视频文案';
+      logUiError(`[文案提取 ${traceId}] UI_APPLY · chars=${d.text?.length||0} · cached=${!!d.cached} · provider=${d.provider||'-'} · total=${((performance.now()-started)/1000).toFixed(2)}s`,'info');
+      toast('提取成功，文案已准备好 ✨');
+      await loadScriptsTab();
+      logUiError(`[文案提取 ${traceId}] COMPLETE · 文案已回填并刷新素材库`,'info')}
+  }catch(e){logUiError(`[文案提取 ${traceId}] FRONTEND_FAILED · ${e?.message||e}`);toast('提取失败:'+e)}
+  finally{logUiError(`[文案提取 ${traceId}] BUTTON_RESET · ${((performance.now()-started)/1000).toFixed(2)}s`,'info')}
+  b.disabled=false;b.textContent='1.提取视频文案';
 }
 let customPrompt=localStorage.getItem(PK+'rewritePrompt')||'';
+let rewriteOptions=[];
+function maybeOpenProviderForError(error){
+  const message=String(error||'');
+  if(!/api[\s_-]*key|未配置|no .*provider|whisper.*不可用/i.test(message))return;
+  if(confirm(message+'\n\n是否现在打开 cicy-code Provider 配置？'))openProviderSettings();
+}
 async function rewrite(){
   const src=$('script1').value.trim();if(!src)return toast('先填原始文案');
   const b=$('btn-rewrite');b.disabled=true;b.textContent='改写中…';
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),100000);
+  const provider=localStorage.getItem(PK+'rewriteProvider')||'defaultOpenAi';
+  const model=localStorage.getItem(PK+'rewriteModel')||undefined;
+  logUiError(`[AI仿写] CLICK · provider=${provider}, model=${model||'default'}, chars=${src.length}`,'info');
   try{
+    logUiError('[AI仿写] REQUEST_START · POST /api/rewrite','info');
     const d=await (await fetch('/api/rewrite',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:src,style:$('style').value.trim(),system:customPrompt||undefined})})).json();
-    if(d.error)toast(d.error);else{$('script2').value=d.text;persist($('script2'));toast('改写完成')}
-  }catch(e){toast('失败:'+e)}
-  b.disabled=false;b.textContent='AI 仿写改写';
+      body:JSON.stringify({text:src,system:customPrompt||undefined,
+        provider,model,
+        outputLanguage:localStorage.getItem(PK+'rewriteTranslate')==='1'
+          ?localStorage.getItem(PK+'rewriteLanguage')||'zh-CN':undefined}),
+      signal:controller.signal})).json();
+    if(d.error){logUiError('[AI仿写] RESPONSE_ERROR · '+d.error);toast('AI 仿写失败：'+d.error+'。请重试，仍失败请切换供应商或模型');maybeOpenProviderForError(d.error)}
+    else{$('script2').value=d.text;persist($('script2'));logUiError(`[AI仿写] COMPLETE · chars=${d.text?.length||0}`,'info');toast('AI 仿写完成 ✨')}
+  }catch(e){
+    logUiError('[AI仿写] FRONTEND_FAILED · '+(e?.message||e));
+    toast(e?.name==='AbortError'?'AI 仿写超时，请重试，仍失败请切换供应商或模型':'AI 仿写失败：'+(e?.message||e)+'。请重试，仍失败请切换供应商或模型')
+  }finally{
+    clearTimeout(timeoutId);b.disabled=false;b.textContent='2.AI 仿写改写';
+  }
 }
 async function genTitle(){
   const t=$('script2').value.trim()||$('script1').value.trim();if(!t)return toast('先有文案');
   const b=$('btn-title');b.disabled=true;b.textContent='生成中…';
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),60000);
+  const provider=localStorage.getItem(PK+'rewriteProvider')||'defaultOpenAi';
+  const model=localStorage.getItem(PK+'rewriteModel')||undefined;
+  const system=localStorage.getItem(PK+'titlePrompt')||undefined;
+  const outputLanguage=localStorage.getItem(PK+'rewriteTranslate')==='1'
+    ?localStorage.getItem(PK+'rewriteLanguage')||'zh-CN':undefined;
+  logUiError(`[标题文案] CLICK · provider=${provider}, model=${model||'default'}, chars=${t.length}`,'info');
   try{
     const d=await (await fetch('/api/title',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:t})})).json();
-    if(d.error)toast(d.error);else{$('titleOut').value=d.text;persist($('titleOut'));toast('已生成')}
-  }catch(e){toast('失败:'+e)}
-  b.disabled=false;b.textContent='生成标题 / 话题 / 封面文案';
+      body:JSON.stringify({text:t,provider,model,system,outputLanguage}),signal:controller.signal})).json();
+    if(d.error){logUiError('[标题文案] RESPONSE_ERROR · '+d.error);toast('生成失败：'+d.error+'。请重试，仍失败请切换供应商或模型');maybeOpenProviderForError(d.error)}
+    else{
+      const titles=Array.isArray(d.title)?d.title:[d.title].filter(Boolean);
+      const tags=Array.isArray(d.tags)?d.tags:[d.tags].filter(Boolean);
+      $('titleOut').value=[
+        '标题：',...titles.map((x,i)=>`${i+1}. ${x}`),
+        '',`标签：${tags.map(x=>'#'+String(x).replace(/^#/,'')).join(' ')}`,
+        '',`封面文案：${d.coverText||''}`
+      ].join('\n');
+      localStorage.setItem(PK+'titleData',JSON.stringify({title:titles,tags,coverText:d.coverText||''}));
+      localStorage.setItem(PK+'generatedCoverText',d.coverText||'');
+      persist($('titleOut'));
+      renderTitleResult({title:titles,tags,coverText:d.coverText||''});
+      logUiError(`[标题文案] COMPLETE · titles=${titles.length}, tags=${tags.length}`,'info');
+      toast('标题和文案已生成 ✨')
+    }
+  }catch(e){
+    logUiError('[标题文案] FRONTEND_FAILED · '+(e?.message||e));
+    toast(e?.name==='AbortError'?'生成标题和文案超时，请重试，仍失败请切换供应商或模型':'生成失败：'+(e?.message||e)+'。请重试，仍失败请切换供应商或模型')
+  }finally{
+    clearTimeout(timeoutId);b.disabled=false;b.textContent='3.生成标题和文案';
+  }
+}
+function renderTitleResult(data){
+  const box=$('titleResult');if(!box)return;
+  const titles=Array.isArray(data?.title)?data.title:[data?.title].filter(Boolean);
+  const tags=Array.isArray(data?.tags)?data.tags:[data?.tags].filter(Boolean);
+  $('titleField').value=titles.join('；');
+  $('tagsField').value=tags.map(x=>'#'+String(x).replace(/^#/,'')).join(' ');
+  $('coverTextField').value=data?.coverText||'';
+  box.classList.add('show');
+}
+function saveTitleFields(){
+  const titles=$('titleField').value.split(/[；\n]/).map(x=>x.trim()).filter(Boolean);
+  const tags=$('tagsField').value.split(/[\s,，]+/).map(x=>x.trim().replace(/^#/,'')).filter(Boolean);
+  const coverText=$('coverTextField').value.trim();
+  localStorage.setItem(PK+'titleData',JSON.stringify({title:titles,tags,coverText}));
+  localStorage.setItem(PK+'generatedCoverText',coverText);
+}
+async function openTitlePrompt(){
+  $('titleMask').style.display='block';$('titleModal').style.display='block';
+  try{
+    const [promptData]=await Promise.all([
+      !$('titlePromptText').value?fetch('/api/title-prompt').then(r=>r.json()):Promise.resolve(null),
+      refreshTitleProvider()
+    ]);
+    if(promptData){
+      $('titlePromptText').value=localStorage.getItem(PK+'titlePrompt')||promptData.prompt;
+    }
+  }catch(e){toast('标题设置加载失败：'+(e?.message||e))}
+}
+async function refreshTitleProvider(btn){
+  if(btn){btn.disabled=true;btn.textContent='刷新中…'}
+  try{
+    const d=await (await fetch('/api/llm-options',{cache:'no-store'})).json();
+    const key=localStorage.getItem(PK+'rewriteProvider')||d.defaultProvider||'defaultOpenAi';
+    const item=(d.providers||[]).find(x=>x.key===key);
+    $('titleProviderHint').textContent=item
+      ?`当前 LLM：${item.name}${item.configured?' · API Key 已配置':' · 未配置 API Key'}`
+      :'当前 LLM 不可用，请打开 Provider 配置';
+    if(btn)toast('LLM 配置已刷新');
+    return item;
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='↻ 刷新配置'}
+  }
+}
+function closeTitlePrompt(){$('titleMask').style.display='none';$('titleModal').style.display='none'}
+function saveTitlePrompt(){
+  localStorage.setItem(PK+'titlePrompt',$('titlePromptText').value.trim());
+  toast('标题和文案设置已保存');closeTitlePrompt();
+}
+async function resetTitlePrompt(){
+  const d=await (await fetch('/api/title-prompt')).json();
+  $('titlePromptText').value=d.prompt;
+  localStorage.removeItem(PK+'titlePrompt');
+  toast('已恢复默认');
 }
 async function openPrompt(){
-  if(!$('pText').value){
-    const d=await (await fetch('/api/rewrite-prompt')).json();
-    $('pText').value=customPrompt||d.prompt;
-  }
   $('mask').style.display='block';$('pModal').style.display='block';
+  const provider=$('rewriteProvider');
+  provider.innerHTML='<option>正在加载供应商…</option>';provider.disabled=true;
+  $('rewriteModel').innerHTML='<option>正在加载模型…</option>';$('rewriteModel').disabled=true;
+  $('rewriteTranslate').checked=localStorage.getItem(PK+'rewriteTranslate')==='1';
+  $('rewriteLanguage').value=localStorage.getItem(PK+'rewriteLanguage')||'zh-CN';
+  toggleRewriteLanguage();
+  try{
+    const [options,promptData]=await Promise.all([
+      fetch('/api/llm-options',{cache:'no-store'}).then(r=>r.json()),
+      $('pText').value?Promise.resolve(null):fetch('/api/rewrite-prompt').then(r=>r.json())
+    ]);
+    rewriteOptions=options.providers||[];
+    provider.innerHTML=rewriteOptions.map(p=>`<option value="${esc(p.key)}">${esc(p.name)}${p.configured?'':'（未配置 API Key）'}</option>`).join('');
+    provider.disabled=false;
+    provider.value=localStorage.getItem(PK+'rewriteProvider')||options.defaultProvider||'defaultOpenAi';
+    if(!provider.value&&rewriteOptions[0])provider.value=rewriteOptions[0].key;
+    $('rewriteModel').disabled=false;renderRewriteModels();
+    if(promptData)$('pText').value=customPrompt||promptData.prompt;
+  }catch(e){
+    provider.innerHTML='<option>供应商加载失败</option>';
+    toast('AI 仿写设置加载失败：'+(e?.message||e));
+  }
+}
+async function refreshLlmSettings(btn){
+  if(btn){btn.disabled=true;btn.textContent='刷新中…'}
+  try{
+    await openPrompt();
+    toast('LLM Provider 配置已刷新');
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='↻ 刷新配置'}
+  }
+}
+function renderRewriteModels(){
+  const provider=$('rewriteProvider').value;
+  const item=rewriteOptions.find(p=>p.key===provider)||{};
+  const saved=localStorage.getItem(PK+'rewriteModel');
+  const models=(item.models&&item.models.length?item.models:[item.defaultModel]).filter(Boolean);
+  $('rewriteModel').innerHTML=models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+  $('rewriteModel').value=(saved&&models.includes(saved))?saved:(item.defaultModel||models[0]||'');
+}
+function onRewriteProviderChange(){
+  renderRewriteModels();
+  const item=rewriteOptions.find(p=>p.key===$('rewriteProvider').value);
+  if(item&&!item.configured){
+    const message=`供应商 ${item.name} 未配置 API Key`;
+    toast(message);maybeOpenProviderForError(message);
+  }
+}
+function toggleRewriteLanguage(){
+  $('rewriteLanguage').disabled=!$('rewriteTranslate').checked;
 }
 function closePrompt(){$('mask').style.display='none';$('pModal').style.display='none'}
 function savePrompt(){customPrompt=$('pText').value.trim();
-  localStorage.setItem(PK+'rewritePrompt',customPrompt);toast('提示词已保存');closePrompt()}
+  const item=rewriteOptions.find(p=>p.key===$('rewriteProvider').value);
+  if(item&&!item.configured){
+    const message=`供应商 ${item.name} 未配置 API Key`;
+    toast(message);maybeOpenProviderForError(message);return;
+  }
+  localStorage.setItem(PK+'rewritePrompt',customPrompt);
+  localStorage.setItem(PK+'rewriteProvider',$('rewriteProvider').value);
+  localStorage.setItem(PK+'rewriteModel',$('rewriteModel').value);
+  localStorage.setItem(PK+'rewriteTranslate',$('rewriteTranslate').checked?'1':'0');
+  localStorage.setItem(PK+'rewriteLanguage',$('rewriteLanguage').value);
+  updateRewriteSettingsLabel();
+  toast('AI 仿写设置已保存');closePrompt()}
+function updateRewriteSettingsLabel(){
+  const provider=localStorage.getItem(PK+'rewriteProvider')||'defaultOpenAi';
+  const model=localStorage.getItem(PK+'rewriteModel')||'默认模型';
+  const btn=$('rewriteSettingsBtn');
+  if(btn){btn.textContent='⚙';btn.title=`当前：${provider} / ${model}；点击配置`}
+}
 async function resetPrompt(){const d=await (await fetch('/api/rewrite-prompt')).json();
   $('pText').value=d.prompt;customPrompt='';localStorage.removeItem(PK+'rewritePrompt');toast('已恢复默认')}
 
 async function aj(r) { try { return await r.json(); } catch(e) { throw new Error(r.status+' '+(r.statusText||'')); } }
 let voiceId=localStorage.getItem(PK+'voiceId')||'';   // 最近一次配音的媒体库 id
 let audioBlob=null;                                    // 上传的现成音频
+let mediaRecorder=null,recordStream=null,recordChunks=[],recordStarted=0,recordTimer=null,audioPreviewUrl='';
+function useLocalAudio(blob,label){
+  audioBlob=blob;voiceId='';localStorage.removeItem(PK+'voiceId');
+  if(audioPreviewUrl)URL.revokeObjectURL(audioPreviewUrl);
+  audioPreviewUrl=URL.createObjectURL(blob);
+  $('ttsPlayer').src=audioPreviewUrl;$('ttsPlayer').style.display='block';
+  $('ttsInfo').textContent=label;$('btn-tts-dl').disabled=false;
+}
+async function toggleRecord(){
+  const btn=$('btn-record');
+  if(mediaRecorder&&mediaRecorder.state==='recording'){mediaRecorder.stop();return}
+  if(!navigator.mediaDevices?.getUserMedia)return toast('当前环境不支持麦克风录音');
+  try{
+    // Request once to unlock device labels, then avoid virtual loopback
+    // devices such as BlackHole which may be the macOS default input.
+    const probe=await navigator.mediaDevices.getUserMedia({audio:true});
+    const devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput');
+    const virtual=/blackhole|soundflower|loopback|virtual|multi-output/i;
+    const preferred=devices.find(d=>/macbook.*microphone|built-in.*microphone|内建.*麦克风/i.test(d.label))
+      ||devices.find(d=>d.label&&!virtual.test(d.label));
+    if(preferred&&preferred.deviceId!==probe.getAudioTracks()[0]?.getSettings()?.deviceId){
+      probe.getTracks().forEach(t=>t.stop());
+      recordStream=await navigator.mediaDevices.getUserMedia({audio:{
+        deviceId:{exact:preferred.deviceId},echoCancellation:true,noiseSuppression:true,autoGainControl:true
+      }});
+    }else recordStream=probe;
+    const activeLabel=recordStream.getAudioTracks()[0]?.label||preferred?.label||'麦克风';
+    const mime=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus']
+      .find(x=>MediaRecorder.isTypeSupported(x))||'';
+    mediaRecorder=new MediaRecorder(recordStream,mime?{mimeType:mime}:undefined);
+    recordChunks=[];recordStarted=Date.now();
+    mediaRecorder.ondataavailable=e=>{if(e.data.size)recordChunks.push(e.data)};
+    mediaRecorder.onstop=()=>{
+      clearInterval(recordTimer);recordStream?.getTracks().forEach(t=>t.stop());
+      const seconds=Math.max(1,Math.round((Date.now()-recordStarted)/1000));
+      const blob=new Blob(recordChunks,{type:mediaRecorder.mimeType||'audio/webm'});
+      btn.textContent='⏺ 重新录音';$('recordTime').textContent=`${seconds}s`;
+      const ext=blob.type.includes('ogg')?'ogg':'webm';
+      const file=new File([blob],`现场录音-${new Date().toLocaleTimeString().replace(/:/g,'-')}.${ext}`,{type:blob.type});
+      uploadAsset(file,UP_EP.voice).then(d=>{if(d?.id)toast('录音已保存到音色库 ✨')});
+    };
+    mediaRecorder.start(250);btn.textContent='⏹ 停止录音';
+    recordTimer=setInterval(()=>$('recordTime').textContent=
+      `${Math.floor((Date.now()-recordStarted)/1000)}s`,500);
+    toast(`正在录音 · ${activeLabel}`);
+  }catch(e){toast(e?.name==='NotAllowedError'?'请允许麦克风权限':'录音失败：'+(e?.message||e))}
+}
 function setVoice(id,dur,chars){
   voiceId=id;localStorage.setItem(PK+'voiceId',id);
   $('ttsPlayer').src='/api/media/'+id+'/file';$('ttsPlayer').style.display='block';
   $('ttsInfo').textContent=(chars?chars+'字 · ':'')+(dur?dur+'s':'');
   $('btn-tts-dl').disabled=false;
+}
+let sttOptions=[];
+async function openSttSettings(){
+  $('sttMask').style.display='block';$('sttModal').style.display='block';
+  try{
+    const d=await (await fetch('/api/stt-options',{cache:'no-store'})).json();
+    sttOptions=d.options||[];
+    $('sttProvider').innerHTML=sttOptions.map(x=>
+      `<option value="${esc(x.key)}" ${x.available?'':'disabled'}>${esc(x.name)}${x.available?'':'（未安装或未配置）'}</option>`
+    ).join('');
+    const saved=localStorage.getItem(PK+'sttProvider')||d.default;
+    if(sttOptions.some(x=>x.key===saved&&x.available))$('sttProvider').value=saved;
+    else{
+      const first=sttOptions.find(x=>x.available);if(first)$('sttProvider').value=first.key;
+    }
+    updateSttHint();$('sttProvider').onchange=updateSttHint;
+  }catch(e){toast('转写设置加载失败：'+(e?.message||e))}
+}
+async function refreshSttSettings(btn){
+  if(btn){btn.disabled=true;btn.textContent='刷新中…'}
+  try{
+    await openSttSettings();
+    toast('Whisper 配置已刷新');
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='↻ 刷新配置'}
+  }
+}
+function updateSttHint(){
+  const item=sttOptions.find(x=>x.key===$('sttProvider').value);
+  $('sttHint').textContent=item?.hint||'';
+}
+function closeSttSettings(){$('sttMask').style.display='none';$('sttModal').style.display='none'}
+async function openProviderSettings(btn){
+  const old=btn?.textContent;
+  if(btn){btn.disabled=true;btn.textContent='正在打开…'}
+  try{
+    const r=await fetch('/api/open-provider-settings',{method:'POST'});
+    const d=await aj(r);
+    if(!r.ok||!d.ok)throw new Error(d.error||'打开失败');
+    toast('已打开 cicy-code 模型供应商设置');
+  }catch(e){
+    toast('无法打开模型供应商设置：'+(e?.message||e));
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent=old}
+  }
+}
+function saveSttSettings(){
+  const item=sttOptions.find(x=>x.key===$('sttProvider').value);
+  if(!item?.available)return toast('该 Whisper 服务尚未安装或配置');
+  localStorage.setItem(PK+'sttProvider',item.key);
+  toast(`已选择 ${item.name}`);closeSttSettings();
 }
 async function genAudio(){
   const s2=$('script2').value.trim(),s1=$('script1').value.trim();
@@ -534,18 +951,30 @@ async function genAudio(){
   try{
     const fd=new FormData();
     fd.append('text',text);fd.append('speed',$('speed').value);
+    fd.append('stt_provider',localStorage.getItem(PK+'sttProvider')||'groq');
     if($('ttsMode').value==='whole')fd.append('mode','whole');
     if($('refSel').value)fd.append('ref_id',$('refSel').value);
     const r=await fetch('/api/tts',{method:'POST',body:fd});
     const d=await aj(r);
-    if(d.error){stage('ttsStage','❌ '+d.error,true);toast('配音失败')}
+    if(d.error){
+      stage('ttsStage','❌ '+d.error,true);toast('配音失败：'+d.error);maybeOpenProviderForError(d.error);
+      if(d.code==='colab_session_inactive'){
+        closeSttSettings();
+        openInstallModal();
+        switchSettingsTab('runtime');
+      }
+    }
     else{setVoice(d.id,d.duration,d.chars);audioBlob=null;
       stage('ttsStage','');$('ttsStage').style.display='none';
       toast(`✅ 配音完成 ${d.chars}字 → ${d.duration}s,已入成品库`);loadMediaTab()}
   }catch(e){stage('ttsStage','❌ '+e,true)}
-  b.disabled=false;b.textContent='🎙 生成配音';
+  b.disabled=false;b.textContent='4. 🎙 生成配音';
 }
-function dlTts(){if(voiceId)location.href='/api/media/'+voiceId+'/file'}
+function dlTts(){
+  if(voiceId){location.href='/api/media/'+voiceId+'/file';return}
+  if(audioBlob){const a=document.createElement('a');a.href=audioPreviewUrl||URL.createObjectURL(audioBlob);
+    a.download='recording.webm';a.click()}
+}
 function stage(id,msg,err){const el=$(id);el.style.display=msg?'block':'none';
   el.textContent=msg;el.className='stage'+(err?' err':'')}
 
@@ -584,10 +1013,10 @@ async function genVideo(){
     fd.append('sharp',$('optSharp').checked?'1':'0');
     fd.append('randstart',$('optRand').checked?'1':'0');
     const d=await (await fetch('/api/generate-video',{method:'POST',body:fd})).json();
-    if(d.error){stage('genStage','❌ '+d.error,true);b.disabled=false;b.textContent='🎬 生成视频';return}
+    if(d.error){stage('genStage','❌ '+d.error,true);b.disabled=false;b.textContent='5. 🎬 生成视频';return}
     curJob=d.job_id;localStorage.setItem(PK+'curJob',curJob);
     pollJob(d.job_id,b,mode);
-  }catch(e){stage('genStage','❌ '+e,true);b.disabled=false;b.textContent='🎬 生成视频'}
+  }catch(e){stage('genStage','❌ '+e,true);b.disabled=false;b.textContent='5. 🎬 生成视频'}
 }
 function toggleGenMode(){
   const m=$('genMode').value;
@@ -598,15 +1027,15 @@ function toggleGenMode(){
 async function pollJob(jid,btn,mode){
   try{
     const d=await (await fetch('/api/job/'+jid)).json();
-    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);btn.disabled=false;btn.textContent='🎬 生成视频';return}
+    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);btn.disabled=false;btn.textContent='5. 🎬 生成视频';return}
     else if(d.result){
       stage('genStage','');$('genStage').style.display='none';
       $('resultPrev').src='/api/result/'+jid;$('resultPrev').style.display='block';
       $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+jid;
       toast('✅ 成片完成,已入成品库');loadMediaTab();
-      btn.disabled=false;btn.textContent='🎬 生成视频';return;
+      btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
     }else if(d.error){stage('genStage','❌ '+d.error,true);
-      btn.disabled=false;btn.textContent='🎬 生成视频';return;
+      btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
     }else{stage('genStage','⏳ '+d.stage+(d.log&&d.log.length?' · '+d.log[d.log.length-1].slice(0,60):''))}
     setTimeout(()=>pollJob(jid,btn),mode==='simple'?1000:4000);
   }catch(e){setTimeout(()=>pollJob(jid,btn),mode==='simple'?2000:6000)}
@@ -614,7 +1043,7 @@ async function pollJob(jid,btn,mode){
 function dlResult(){if(curJob)location.href='/api/result/'+curJob}
 
 /* ---------- ④ 剪辑 · 封面 ---------- */
-let editUrl='',coverUrl='';
+let editUrl='',coverUrl='',editRunning=false;
 async function genSrt(){
   if(!voiceId&&!audioBlob)return toast('先生成配音(或上传音频)');
   const b=$('btn-srt');b.disabled=true;b.textContent='识别中…';
@@ -630,6 +1059,11 @@ async function genSrt(){
   b.disabled=false;b.textContent='按配音生成';
 }
 async function editVideo(){
+  if(editRunning){
+    toast('剪辑正在进行，请勿重复点击');
+    return;
+  }
+  editRunning=true;
   const bgm=$('bgmSel').value,vol=$('bgmVol').value;
   const b=$('btn-edit');b.disabled=true;
   b.textContent=`剪辑中(字幕${$('subText').value.trim()?'✓':'✗'}·BGM ${bgm?Math.round(vol*100)+'%':'无'})…`;
@@ -656,7 +1090,8 @@ async function editVideo(){
       loadMediaTab();
     }
   }catch(e){stage('editStage','❌ '+e,true)}
-  b.disabled=false;b.textContent='✂️ 剪辑(烧字幕 + 混BGM)';
+  editRunning=false;
+  b.disabled=false;b.textContent='6. ✂️ 剪辑(烧字幕 + 混BGM)';
 }
 function dlEdit(){if(!editUrl)return;const a=document.createElement('a');
   a.href=editUrl;a.download='edited.mp4';a.click()}
@@ -665,6 +1100,8 @@ async function genCover(){
   try{
     const fd=new FormData();
     let t=$('coverTitle').value.trim();
+    if(!t&&$('coverTextField'))t=$('coverTextField').value.trim();
+    if(!t)t=localStorage.getItem(PK+'generatedCoverText')||'';
     if(!t)t=($('titleOut').value.split('\n').find(l=>l.trim())||'').replace(/^[\*\s#•\-0-9\.、:：]+/,'').slice(0,20);
     fd.append('title',t);fd.append('tpl',$('coverTpl').value);
     if($('baseSel').value)fd.append('base_id',$('baseSel').value);
@@ -683,18 +1120,28 @@ function dlCover(){if(!coverUrl)return;const a=document.createElement('a');
   a.href=coverUrl;a.download='cover.jpg';a.click()}
 
 /* ---------- 下拉数据 ---------- */
-async function loadSelects(){
+async function loadSelects(preferVoiceId=''){
+  const stamp=Date.now();
   const [vs,bs,gs,fs,es]=await Promise.all([
-    fetch('/api/voices').then(r=>r.json()),fetch('/api/basevideos').then(r=>r.json()),
+    fetch('/api/voices?_='+stamp,{cache:'no-store'}).then(r=>r.json()),
+    fetch('/api/basevideos?_='+stamp,{cache:'no-store'}).then(r=>r.json()),
     fetch('/api/bgms').then(r=>r.json()),fetch('/api/fonts').then(r=>r.json()),
     fetch('/api/engines').then(r=>r.json())]);
-  fillSel('refSel',vs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'refSel'));
+  _engineState=es.engines||[];
+  _engineStateAt=Date.now();
+  fillSel('refSel',[['','-- 请选择参考音色 --'],...vs.map(v=>[v.id,`${v.name}(${v.duration}s)`])],
+    preferVoiceId||localStorage.getItem(PK+'refSel'));
   fillSel('baseSel',bs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'baseSel'));
   // 选中值存在但后台初始化会丢: fillSel 确认后主动触发 onchange 同步预览
   if ($('baseSel').value) previewBase();
   fillSel('bgmSel',[['','不用 BGM'],...gs.map(v=>[v.id,`${v.name}(${Math.round(v.duration)}s)`])],localStorage.getItem(PK+'bgmSel'));
   fillSel('subFont',fs.map(f=>[f.id,f.name]),localStorage.getItem(PK+'subFont'));
   $('cnt-voice').textContent=vs.length;$('cnt-base').textContent=bs.length;$('cnt-bgm').textContent=gs.length;
+  applyLipsyncEngineSelect(es);
+  toggleGenMode();
+  return {vs,bs,gs};
+}
+function applyLipsyncEngineSelect(es){
   // 引擎:只显示已安装的口型引擎(排除cosy等非口型引擎)
   const LIPSYNC_KEYS=['mt','hg'];
   const engEl=$('engine'), keep=engEl.value;
@@ -703,8 +1150,6 @@ async function loadSelects(){
   if(!ready.length) engEl.innerHTML='<option value="">-- 请先安装引擎 --</option>';
   else ready.forEach(e=>{const o=new Option(e.name,e.key);engEl.appendChild(o);});
   if(keep&&[...engEl.options].some(o=>o.value===keep)) engEl.value=keep;
-  toggleGenMode();
-  return {vs,bs,gs};
 }
 function fillSel(id,pairs,keep){
   const el=$(id);el.innerHTML='';
@@ -812,7 +1257,7 @@ async function renderTab(){
       <button class="btn ghost" onclick="saveScript(selScriptId)" ${selScriptId?'':'disabled'}>💾 更新所选</button>
       <button class="btn danger" onclick="delScript(null,true)">清空</button>`);
     const list=prep(await (await fetch('/api/scripts')).json());
-    window._scripts=list;$('cnt-script').textContent=list.length;
+    window._scripts=list;if($('cnt-script'))$('cnt-script').textContent=list.length;
     body.innerHTML=list.length?`<div class="agrid">${list.map(s=>`
       <div class="acard scard ${s.id===selScriptId?'using':''}">
         <div class="abody">
@@ -889,10 +1334,10 @@ function videoModal(src){$('vmask').style.display='block';const m=$('vmodal');
 function closeVideo(){const m=$('vmodal'),v=m.querySelector('video');
   v.pause();v.removeAttribute('src');v.load();m.style.display='none';$('vmask').style.display='none'}
 /* 选用 */
-function useVoiceAsset(id){$('refSel').value=id;persist($('refSel'));toast('已设为配音参考音色(步骤②)');renderTab()}
-function useBgm(id){$('bgmSel').value=id;persist($('bgmSel'));toast('已设为剪辑 BGM(步骤④)');renderTab()}
+function useVoiceAsset(id){$('refSel').value=id;persist($('refSel'));toast('已设为配音参考音色(步骤4)');renderTab()}
+function useBgm(id){$('bgmSel').value=id;persist($('bgmSel'));toast('已设为剪辑 BGM(步骤6)');renderTab()}
 function useBase(id){$('baseSel').value=id;persist($('baseSel'));previewBase();
-  toast('已选中该底板并预览(步骤③)');renderTab()}
+  toast('已选中该底板并预览(步骤5)');renderTab()}
 /* 内联重命名 */
 function renameInline(btn){
   const nm=btn.closest('.acard').querySelector('.aname');
@@ -915,7 +1360,13 @@ async function delAsset(kind,id,name){
   if(!confirm(`删除「${name}」?文件将被移除,不可恢复`))return;
   const ep={voice:'/api/voices/delete',base:'/api/basevideos/delete',bgm:'/api/bgms/delete'}[kind];
   const d=await postJ(ep,{id});
-  if(d.error)toast(d.error);else{toast('已删除');renderTab();loadSelects()}
+  if(d.error)toast(d.error);else{
+    if(kind==='voice'){
+      if($('refSel').value===id){localStorage.removeItem(PK+'refSel');$('refSel').value=''}
+      $('refSel').querySelector(`option[value="${CSS.escape(id)}"]`)?.remove();
+    }
+    toast('已删除');await loadSelects();await renderTab();
+  }
 }
 /* 文案 CRUD */
 function loadScript(id){
@@ -946,7 +1397,7 @@ function useMedia(id){
   const m=(window._media||[]).find(x=>x.id===id);if(!m)return;
   if(m.type!=='voice')return;
   setVoice(m.id,m.duration,m.chars);
-  toast('✅ 已设为当前配音(步骤②)——直接点「生成视频」即可用它出片,不用重新合成');
+  toast('✅ 已设为当前配音(步骤4)——直接点「生成视频」即可用它出片,不用重新合成');
   window.scrollTo({top:0,behavior:'smooth'});
 }
 async function noteMedia(id){
@@ -962,7 +1413,7 @@ async function delMedia(id,all){
   toast('已删除');renderTab();
 }
 async function loadScriptsTab(){if(curTab==='script')renderTab();else{
-  const l=await (await fetch('/api/scripts')).json();$('cnt-script').textContent=l.length}}
+  const l=await (await fetch('/api/scripts')).json();if($('cnt-script'))$('cnt-script').textContent=l.length}}
 async function loadMediaTab(){if(curTab==='media')renderTab();else{
   const l=await (await fetch('/api/media')).json();$('cnt-media').textContent=l.length}}
 
@@ -971,6 +1422,7 @@ const UP_EP={voice:'/api/voices/upload',base:'/api/basevideos/upload',bgm:'/api/
 async function uploadAsset(file,ep){
   const fd=new FormData();fd.append('file',file);
   fd.append('name',file.name.replace(/\.[^.]+$/,'').slice(0,40));
+  if(ep===UP_EP.voice)fd.append('optimize',$('voiceOptimize')?.value||'auto');
   toast('⬆️ 上传处理中:'+file.name);
   try {
     const d=await aj(await fetch(ep,{method:'POST',body:fd}));
@@ -983,12 +1435,17 @@ async function uploadAsset(file,ep){
         $('baseSel').value = d.id;
         previewBase();
         renderTab();
+      } else if (ep === UP_EP.voice && d.id) {
+        await loadSelects(d.id);$('refSel').value=d.id;persist($('refSel'));await renderTab();
       } else { renderTab(); loadSelects(); }
+      return d;
     }
-  } catch(e) { toast('上传失败: '+e.message); }
+  } catch(e) { toast('上传失败: '+e.message);return null }
 }
 async function uploadMany(files,ep){for(const f of files)await uploadAsset(f,ep)}
 function bindUploads(){
+  $('audFile').onchange=e=>{const f=e.target.files[0];if(!f)return;
+    uploadAsset(f,UP_EP.voice);e.target.value=''};
   $('upVoice').onchange=e=>{uploadMany([...e.target.files],UP_EP.voice);e.target.value=''};
   $('upBase').onchange=e=>{uploadMany([...e.target.files],UP_EP.base);e.target.value=''};
   $('upBgm').onchange=e=>{uploadMany([...e.target.files],UP_EP.bgm);e.target.value=''};
@@ -1007,10 +1464,8 @@ function bindUploads(){
   $('vidFile').onchange=e=>{const f=e.target.files[0];if(!f)return;videoBlob=f;
     $('basePrev').src=URL.createObjectURL(f);$('basePrev').style.display='block';
     toast('已选本地底板，上传中...');
-    uploadAsset(f, UP_EP.base).then(() => {
-      $('baseSel').value = ''; // 刷新 select
-      loadSelects();
-    });
+    uploadAsset(f, UP_EP.base);
+    e.target.value='';
   };
 }
 
@@ -1022,14 +1477,33 @@ let _systemState = null;
 let _engineState = null;
 let _colabState = null;
 let _colabSessionState = null;
+let _globalHealth = null;
+let _globalHealthAt = 0;
+let _engineStateAt = 0;
+let _statusRequest = null;
+let _engineStatusRequest = null;
 let _colabRuntimeTimer = null;
 let _colabMetricsTimer = null;
 function fmtGB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
 
 async function openInstallModal() {
+  // System settings is the destination for configuration problems. Ensure an
+  // already-open step modal cannot remain above it and hide the controls.
+  closePrompt();
+  closeTitlePrompt();
+  closeSttSettings();
   $('imask').style.display = 'block'; $('iModal').style.display = 'flex';
   switchSettingsTab(localStorage.getItem(PK+'settingsTab') || 'runtime');
-  await refreshSystemSettings();
+  // The header poll owns the global health snapshot. Opening settings reads
+  // that snapshot immediately; detailed hardware/account data refreshes in
+  // the background and never blocks the modal.
+  if (_globalHealth) renderSettingsHealth();
+  else await refreshStatus();
+  if (_engineState?.length) {
+    $('engineList').innerHTML=_engineState.map(engineCardHTML).join('');
+    applyLipsyncEngineSelect({engines:_engineState});
+  }
+  refreshSystemSettings(false);
 }
 
 function switchSettingsTab(tab) {
@@ -1042,6 +1516,15 @@ function switchSettingsTab(tab) {
 function renderSettingsHealth() {
   const box = $('settingsSummary');
   if (!_systemState || !_engineState) {
+    if (_globalHealth) {
+      const ready=_globalHealth.overall==='ready';
+      const partial=_globalHealth.overall==='partial';
+      box.className='settings-summary '+(ready?'ok':'warn');
+      box.innerHTML=ready
+        ? '<div class="health-icon">✅</div><div><div class="health-title">系统已就绪</div><div class="health-detail">Colab GPU、配音与出片服务均可用；详细信息正在后台同步</div></div>'
+        : `<div class="health-icon">${partial?'⚠️':'🔴'}</div><div><div class="health-title">${partial?'部分服务待就绪':'运行环境离线'}</div><div class="health-detail">${esc(_globalHealth.tunnel_note||'正在同步详细状态')}</div></div>`;
+      return;
+    }
     box.className = 'settings-summary';
     box.innerHTML = '<div class="health-icon">⏳</div><div><div class="health-title">正在检查运行环境</div><div class="health-detail">正在汇总基础工具与引擎状态</div></div>';
     return;
@@ -1054,24 +1537,34 @@ function renderSettingsHealth() {
     const cp = _colabState?.profiles?.find(p => p.id === _colabState.active);
     if (!cp?.credentials_ready) issues.push('当前 Google 账号未授权');
   }
-  const requiredEngines = _engineState.filter(e => !e.builtin);
+  // MuseTalk + CosyVoice are the core pipeline. HeyGem is optional and
+  // Whisper is bundled with CosyVoice, so neither should decide core health.
+  const requiredEngines = _engineState.filter(e => ['mt','cosy'].includes(e.key));
   const readyCount = requiredEngines.filter(e => e.installed).length;
-  if (!readyCount) issues.push('生成引擎尚未就绪');
+  const missingEngines = requiredEngines.filter(e => !e.installed).map(e => e.name);
+  if (missingEngines.length) issues.push(`${missingEngines.join('、')} 尚未就绪`);
   box.className = 'settings-summary ' + (issues.length ? 'warn' : 'ok');
   box.innerHTML = issues.length
     ? `<div class="health-icon">⚠️</div><div><div class="health-title">还需完成 ${issues.length} 项配置</div><div class="health-detail">${issues.join(' · ')}；引擎 ${readyCount}/${requiredEngines.length} 就绪</div></div>`
     : `<div class="health-icon">✅</div><div><div class="health-title">系统已就绪</div><div class="health-detail">基础工具与生成引擎配置完整；模型服务使用 cicy-ai/global.json</div></div>`;
 }
 
-async function refreshSystemSettings() {
+async function refreshSystemSettings(force=false) {
   const btn = $('settingsRefresh');
-  btn.disabled = true; btn.textContent = '刷新中…';
-  $('iTitle').textContent = '';
-  $('sysBar').innerHTML = '<div class="empty" style="padding:12px">正在读取运行环境…</div>';
-  $('engineList').innerHTML = '<div class="empty" style="padding:12px">正在检查生成引擎…</div>';
-  $('colabProfiles').innerHTML = '';
-  _systemState = _engineState = _colabState = null;
-  renderSettingsHealth();
+  if(force){btn.disabled = true;btn.textContent = '刷新中…'}
+  // Remote health probes run independently. A slow Colab response must not
+  // block local system details, modal interaction, or another status area.
+  const healthTask=Promise.allSettled([refreshEngines(force),refreshStatus(force)])
+    .then(()=>renderSettingsHealth());
+  // Only show skeletons on the first load. Subsequent refreshes keep the
+  // current DOM visible and replace sections after fresh data arrives.
+  const firstLoad = !_systemState && !_engineState && !_colabState;
+  if (firstLoad) {
+    $('iTitle').textContent = '';
+    $('sysBar').innerHTML = '<div class="empty" style="padding:12px">正在读取运行环境…</div>';
+    $('engineList').innerHTML = '<div class="empty" style="padding:12px">正在检查生成引擎…</div>';
+    renderSettingsHealth();
+  }
   // 系统信息
   try {
     const r = await fetch('/api/system');
@@ -1108,9 +1601,10 @@ async function refreshSystemSettings() {
     $('iTitle').textContent = '· ' + gpuModeLabel + (s.gpu_name ? ' · '+s.gpu_name : '');
     if (s.gpu_mode === 'colab_cli') await loadColabProfiles();
   } catch (e) { $('sysBar').innerHTML = '<span style="color:var(--red)">加载系统信息失败</span>'; }
-  await refreshEngines();
   renderSettingsHealth();
-  btn.disabled = false; btn.textContent = '↻ 刷新';
+  healthTask.finally(()=>{
+    if(force){btn.disabled=false;btn.textContent='↻ 刷新'}
+  });
 }
 
 async function loadColabProfiles() {
@@ -1119,7 +1613,9 @@ async function loadColabProfiles() {
     if (!r.ok) throw new Error('HTTP '+r.status);
     _colabState = await r.json();
     renderColabProfiles();
-    await loadColabSessionStatus();
+    // Runtime metrics are optional detail and may be slow; never hold up the
+    // profile list or the rest of system settings.
+    loadColabSessionStatus();
     renderSettingsHealth();
   } catch (e) {
     $('colabProfiles').innerHTML = '<div class="settings-note" style="color:var(--red)">Google 账号配置加载失败</div>';
@@ -1134,13 +1630,11 @@ function renderColabProfiles() {
     return `<div class="colab-profile ${active?'active':''}" id="colab-profile-${p.id}">
       <div class="provider-main">
         <input type="radio" name="colab-active" ${active?'checked':''} onchange="setActiveColabProfile('${p.id}')">
-        <div class="provider-meta"><div class="provider-name">${p.name} ${active?'<span class="badge2 yes">当前账号</span>':''}</div>
-          <div class="provider-sub">${p.credentials_ready?'授权已就绪':'尚未授权'} · ${p.auth==='adc'?'独立 ADC':'本机 OAuth2'} · 会话 ${p.session} · GPU ${p.gpu}</div></div>
+        <div class="provider-meta"><div class="provider-name">${esc(p.email||p.name||'未授权 Google 账号')} ${active?'<span class="badge2 yes">当前账号</span>':''}</div>
+          <div class="provider-sub">${p.credentials_ready?'OAuth2 授权已就绪':(p.email?'凭据已失效，可重新授权':'尚未授权')} · 独立 Google OAuth2 · 会话 ${p.session} · GPU ${p.gpu}</div></div>
       </div>
       <div class="colab-profile-grid">
-        <input class="inp" id="colab-name-${p.id}" value="${p.name}" placeholder="显示名称">
-        <select id="colab-auth-${p.id}" onchange="toggleColabAuthField('${p.id}')"><option value="oauth2" ${p.auth==='oauth2'?'selected':''}>OAuth2</option><option value="adc" ${p.auth==='adc'?'selected':''}>ADC</option></select>
-        <input class="inp" id="colab-cred-${p.id}" value="${p.credentials_path||''}" placeholder="${p.auth==='adc'?'ADC 凭据 JSON 路径':'使用本机已登录的 OAuth2'}" ${p.auth==='adc'?'':'disabled'}>
+        <button class="btn ${p.credentials_ready?'ghost':''}" onclick="authorizeColabProfile('${p.id}',this)">授权</button>
         <select id="colab-gpu-${p.id}">${gpuOptions}</select>
         <button class="btn ghost" onclick="saveColabProfile('${p.id}',this)">保存配置</button>
       </div>
@@ -1153,9 +1647,9 @@ function renderColabProfiles() {
   }).join('');
   $('colabProfiles').innerHTML = `<div class="settings-section-head" style="margin-top:12px">
       <div><div class="settings-section-title">Google 账号与 Colab GPU</div>
-      <div class="settings-section-desc">每个账号使用独立 ADC 凭据和会话状态，切换后所有远程操作立即生效</div></div>
+      <div class="settings-section-desc">每个账号使用独立 OAuth2 凭据和会话状态，切换后所有远程操作立即生效</div></div>
       <button class="btn ghost" style="padding:5px 9px;font-size:11px" onclick="addColabProfileForm()">+ 添加账号</button>
-    </div>${cards}<div class="settings-note">新增账号前，请为该 Google 身份生成独立的 ADC JSON；GPU 可选 T4、L4、G4、H100、A100，实际能否创建取决于账号套餐和当前配额。</div>`;
+    </div>${cards}<div class="settings-note">新增账号后点击“授权 Google 账号”，在浏览器登录并粘贴授权码。GPU 可选 T4、L4、G4、H100、A100，实际能否创建取决于账号套餐和当前配额。</div>`;
 }
 
 function formatRuntime(seconds) {
@@ -1172,16 +1666,20 @@ function renderColabSessionStatus() {
   const d = _colabSessionState;
   const startBtn = $('colabStartBtn');
   const stopBtn = $('colabStopBtn');
+  const activeProfile = (_colabState?.profiles || []).find(p => p.id === _colabState.active);
+  const authorized = activeProfile?.credentials_ready === true;
   if (startBtn) {
-    startBtn.disabled = d.running;
-    startBtn.title = d.running ? '当前会话已在运行，请先停止后再重新创建' : '';
+    startBtn.disabled = d.running || !authorized;
+    startBtn.title = !authorized ? '请先授权 Google 账号' : (d.running ? '当前会话已在运行，请先停止后再重新创建' : '');
   }
   if (stopBtn) {
-    stopBtn.disabled = !d.running;
-    stopBtn.title = d.running ? '' : '当前没有运行中的会话';
+    stopBtn.disabled = !authorized;
+    stopBtn.title = d.running ? '停止当前会话' : '释放 Google 端可能残留的旧会话占用';
   }
   if (!d.running) {
-    el.innerHTML = `<span style="color:var(--mut)">● 未运行</span>${d.account_email?' · '+d.account_email:''}`;
+    el.innerHTML = !authorized
+      ? '<span style="color:var(--red)">● 未授权，请先点击“授权”</span>'
+      : `<span style="color:var(--mut)">● 未运行</span>${d.account_email?' · '+d.account_email:''}`;
     return;
   }
   const elapsed = d.started_at ? Math.max(0, Math.floor(Date.now()/1000 - d.started_at)) : d.runtime_seconds;
@@ -1212,52 +1710,130 @@ async function loadColabSessionStatus() {
 
 function addColabProfileForm() {
   const id = 'google-' + Date.now();
-  _colabState.profiles.push({id,name:'新 Google 账号',auth:'adc',credentials_path:'',session:'koubo-'+id,gpu:'T4',credentials_ready:false});
+  _colabState.profiles.push({id,name:'新 Google 账号',auth:'oauth2',credentials_path:'',session:'koubo-'+id,gpu:'T4',credentials_ready:false});
   renderColabProfiles();
-  document.getElementById('colab-cred-'+id)?.focus();
-}
-
-function toggleColabAuthField(id) {
-  const inp = $('colab-cred-'+id);
-  const adc = $('colab-auth-'+id).value === 'adc';
-  inp.disabled = !adc;
-  inp.placeholder = adc ? 'ADC 凭据 JSON 路径' : '使用本机已登录的 OAuth2';
 }
 
 async function saveColabProfile(id, btn) {
   const old = _colabState.profiles.find(p => p.id === id);
-  const profile = {id, name:$('colab-name-'+id).value.trim(), auth:$('colab-auth-'+id).value,
-    credentials_path:$('colab-cred-'+id).value.trim(),
-    session:old?.session || 'koubo-'+id, gpu:$('colab-gpu-'+id).value};
+  const profile = {id, name:old?.email||old?.name||'Google 账号', auth:'oauth2',
+    credentials_path:'',
+    session:old?.session || 'koubo-'+id, gpu:$('colab-gpu-'+id).value,
+    email:old?.email||''};
   btn.disabled = true;
   try {
     const r = await fetch('/api/colab/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile})});
     const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error||'HTTP '+r.status);
-    toast('✅ Google 账号配置已保存'); await refreshSystemSettings();
+    toast('✅ Google 账号配置已保存');
+    await loadColabProfiles();
+    await refreshEngines();
   } catch(e) { toast('保存失败: '+e.message); }
   finally { btn.disabled = false; }
+}
+
+async function authorizeColabProfile(id, btn) {
+  if (_colabState.active !== id) {
+    await setActiveColabProfile(id);
+  }
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '授权中…';
+  $('colabOauthUrl').value = '正在生成授权地址…';
+  $('colabOauthCode').value = '';
+  $('colabOauthCopy').disabled = true;
+  $('colabOauthSubmit').disabled = true;
+  $('colabOauthMask').style.display = 'block';
+  $('colabOauthModal').style.display = 'block';
+  try {
+    const sr = await fetch('/api/colab/oauth/start',{method:'POST'});
+    const sd = await sr.json();
+    if (!sr.ok || sd.error) throw new Error(sd.error||'HTTP '+sr.status);
+    $('colabOauthUrl').value = sd.auth_url;
+    $('colabOauthCopy').disabled = false;
+    $('colabOauthSubmit').disabled = false;
+  } catch(e) {
+    $('colabOauthUrl').value = '生成授权地址失败：'+e.message;
+    toast('授权失败: '+e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+function closeColabOauthModal() {
+  $('colabOauthMask').style.display = 'none';
+  $('colabOauthModal').style.display = 'none';
+}
+
+async function copyColabOauthUrl(btn) {
+  const value = $('colabOauthUrl').value;
+  if (!value) return;
+  await navigator.clipboard.writeText(value);
+  const old = btn.textContent;
+  btn.textContent = '已复制';
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+
+async function completeColabOauth(btn) {
+  const code = $('colabOauthCode').value.trim();
+  if (!code) return toast('请先粘贴授权码');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '验证中…';
+  try {
+    const cr = await fetch('/api/colab/oauth/complete',{
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code})
+    });
+    const cd = await cr.json();
+    if (!cr.ok || cd.error) throw new Error(cd.error||'HTTP '+cr.status);
+    toast('✅ Google OAuth2 授权成功'+(cd.email?' · '+cd.email:''));
+    closeColabOauthModal();
+    await loadColabProfiles();
+    await refreshEngines();
+  } catch(e) {
+    toast('授权失败: '+e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
 }
 
 async function setActiveColabProfile(id) {
   try {
     const r = await fetch('/api/colab/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:id})});
     const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error||'HTTP '+r.status);
-    toast('✅ 已切换 Google 账号'); await refreshSystemSettings();
+    toast('✅ 已切换 Google 账号');
+    // 仅刷新 Colab 和引擎区域，保留系统设置当前 Tab、滚动位置及其它表单状态。
+    await loadColabProfiles();
+    await refreshEngines();
   } catch(e) { toast('切换失败: '+e.message); }
 }
 
 async function controlColabSession(action, btn) {
   if (!_colabSessionState) return toast('正在检查会话状态，请稍候');
   if (action === 'start' && _colabSessionState.running) return toast('当前会话已在运行');
-  if (action === 'stop' && !_colabSessionState.running) return toast('当前没有运行中的会话');
-  const verb = action === 'start' ? '创建' : '停止';
-  if (!confirm(`${verb}当前 Google 账号的 Colab 会话？${action==='start'?'会消耗该账号的计算单元。':''}`)) return;
+  const verb = action === 'start' ? '创建' : (_colabSessionState.running ? '停止' : '释放');
+  const prompt = action === 'start'
+    ? '创建当前 Google 账号的 Colab 会话？会消耗该账号的计算单元。'
+    : (_colabSessionState.running
+      ? '停止当前 Google 账号的 Colab 会话？'
+      : '释放当前 Google 账号在 Colab 端可能残留的旧会话占用？');
+  if (!confirm(prompt)) return;
   btn.disabled = true; const old = btn.textContent; btn.textContent = '处理中…';
   try {
     const r = await fetch('/api/colab/session/'+action,{method:'POST'});
-    const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error||'HTTP '+r.status);
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      if (d.code === 'colab_assignment_conflict') {
+        toast('旧的 Colab GPU 会话尚未释放，请先点“停止”，稍后再启动');
+        await loadColabSessionStatus();
+        return;
+      }
+      throw new Error(d.error||'HTTP '+r.status);
+    }
     toast(action==='start'?'✅ Colab 会话已启动':'✅ Colab 会话已停止');
-    await refreshSystemSettings();
+    await loadColabProfiles();
+    await refreshEngines();
   } catch(e) { toast(verb+'失败: '+e.message); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
@@ -1305,12 +1881,12 @@ function engineCardHTML(e) {
     verHtml = '<div class="ev">' + Object.entries(e.version_info)
       .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
   }
-  let estHtml = '';
-  if (e.est_min) {
-    const dur = e.installed ? `实际安装耗时约 ${e.est_min} 分钟` : `预计安装约 ${e.est_min} 分钟`;
-    const size = e.est_size_gb ? ` · ~${e.est_size_gb}GB` : '';
-    estHtml = `<div class="ev" style="color:#888;font-size:11px">⏱ ${dur}${size}</div>`;
-  }
+  const estHtml = (!e.installed && e.install_hint)
+    ? `<div class="ev" style="color:#888;font-size:11px">⏱ ${esc(e.install_hint)}</div>`
+    : '';
+  const noteHtml = e.note
+    ? `<div class="ev" style="color:#d18b2c;font-size:11px;margin-top:3px">⚠️ ${esc(e.note)}</div>`
+    : '';
   const btn = e.builtin
     ? (e.installed
       ? '<button class="btn ghost" style="font-size:12px" disabled>✅ 随 CosyVoice 自带</button>'
@@ -1328,6 +1904,7 @@ function engineCardHTML(e) {
       <div class="en">${e.name} ${badge} ${remoteBadge} ${e.builtin?'(CosyVoice 内置)':(e.has_script?'':'(缺安装脚本)')}</div>
       ${verHtml}
       ${estHtml}
+      ${noteHtml}
     </div>
     <div style="flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
       ${btn}
@@ -1349,45 +1926,59 @@ function updateEngineCard(e) {
   const html = engineCardHTML(e);
   const tmp = document.createElement('div'); tmp.innerHTML = html;
   const newEl = tmp.firstElementChild;
+  // Only the status card is replaced. logtools/logbox are sibling elements
+  // and must remain untouched so live/history text is never cleared.
   old.replaceWith(newEl);
-  // restore log state
-  if (_openLogs[e.key]) {
-    const lb = document.getElementById('log-' + e.key);
-    // 保存旧日志内容
-    const oldLog = document.getElementById('log-' + e.key + '-backup');
-    if (lb) { lb.classList.add('show'); lb.textContent = oldLog?.textContent || ''; }
-  }
-  // 为新 logbox 建一个隐藏备份元素存日志
-  const newBox = document.getElementById('log-' + e.key);
-  const oldBackup = document.getElementById('log-' + e.key + '-backup');
-  if (oldBackup && newBox && oldBackup.textContent) {
-    newBox.textContent = oldBackup.textContent;
-    newBox.classList.add('show');
-    newBox.scrollTop = newBox.scrollHeight;
-    oldBackup.remove();
-  }
 }
 
-async function refreshEngines() {
+async function fetchEngineStatus(force=false){
+  if(!force&&_engineState&&Date.now()-_engineStateAt<15000)
+    return {engines:_engineState};
+  if(_engineStatusRequest)return _engineStatusRequest;
+  _engineStatusRequest=(async()=>{
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),35000);
+  try{
+    const response=await fetch('/api/engines',{cache:'no-store',signal:controller.signal});
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    const data=await response.json();
+    _engineState=data.engines||[];
+    _engineStateAt=Date.now();
+    return data;
+  }finally{clearTimeout(timeoutId);_engineStatusRequest=null}
+  })();
+  return _engineStatusRequest;
+}
+
+async function refreshEngines(force=false) {
   try {
-    const d = await (await fetch('/api/engines')).json();
+    const d = await fetchEngineStatus(force);
     _engineState = d.engines || [];
+    applyLipsyncEngineSelect(d);
     renderSettingsHealth();
+    // Snapshot visible logs BEFORE replacing engineList. EventSource callbacks
+    // hold references to the old DOM nodes, so stop and reconnect them too.
+    const savedLogs={};
+    Object.keys(_openLogs).forEach(key=>{
+      const box=document.getElementById('log-'+key);
+      savedLogs[key]=box?.textContent||'';
+      if(_installPolls[key]){
+        try{_installPolls[key].close()}catch(_){}
+        delete _installPolls[key];
+      }
+    });
     let html = '';
     d.engines.forEach(e => { html += engineCardHTML(e); });
     $('engineList').innerHTML = html;
-    // 恢复之前打开的日志（备份+恢复内容）
+    // Restore text/open state, then reconnect live streams.
     Object.keys(_openLogs).forEach(k => {
-      const oldBox = document.getElementById('log-' + k);
-      if (oldBox && oldBox.textContent) {
-        // 把旧日志存到隐藏备份元素
-        let bu = document.getElementById('log-' + k + '-backup');
-        if (!bu) { bu = document.createElement('div'); bu.id = 'log-' + k + '-backup'; bu.style.display = 'none'; document.body.appendChild(bu); }
-        bu.textContent = oldBox.textContent;
-      }
       const box = document.getElementById('log-' + k);
       const tools = document.getElementById('logtools-' + k);
-      if (box) { box.classList.add('show'); tools?.classList.add('show'); box.textContent = oldBox?.textContent || ''; pollLog(k); }
+      if (box) {
+        box.classList.add('show');tools?.classList.add('show');
+        box.textContent=savedLogs[k]||'(正在读取远程日志…)';
+        pollLog(k);
+      }
     });
     // 安装中的引擎自动展开日志并轮询
     d.engines.forEach(e => { if (e.installing && !_openLogs[e.key]) { toggleLog(e.key, true); } });
@@ -1397,15 +1988,16 @@ async function refreshEngines() {
     }
   } catch (e) {
     _engineState = [];
-    $('engineList').innerHTML = '<div class="empty">加载引擎状态失败</div>';
+    $('engineList').innerHTML = `<div class="empty">${e?.name==='AbortError'?'Colab 响应超时，请检查会话后刷新':'加载引擎状态失败：'+esc(e?.message||e)}</div>`;
     renderSettingsHealth();
   }
 }
 
 async function refreshCards() {
   try {
-    const d = await (await fetch('/api/engines')).json();
+    const d = await fetchEngineStatus(true);
     _engineState = d.engines || [];
+    applyLipsyncEngineSelect(d);
     renderSettingsHealth();
     d.engines.forEach(e => updateEngineCard(e));
     // 继续安排下一轮
@@ -1450,6 +2042,21 @@ function clearEngineLog(key) {
   if (box) box.textContent = '(已清空显示，新的日志仍会继续出现)';
 }
 
+function mergeEngineLog(current,incoming){
+  current=String(current||'');incoming=String(incoming||'');
+  if(!incoming)return current;
+  if(!current||current.startsWith('('))return incoming;
+  if(incoming.includes(current))return incoming;
+  if(current.includes(incoming))return current;
+  const anchor=incoming.slice(0,Math.min(200,incoming.length));
+  const at=current.lastIndexOf(anchor);
+  if(at>=0){
+    const overlap=current.slice(at);
+    if(incoming.startsWith(overlap))return current+incoming.slice(overlap.length);
+  }
+  return current.replace(/\s*$/,'')+'\n'+incoming.replace(/^\s*/,'');
+}
+
 async function pollLog(key) {
   const box = document.getElementById('log-' + key);
   if (!box) return;
@@ -1458,7 +2065,8 @@ async function pollLog(key) {
   // 先拉历史
   try {
     const d = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
-    box.textContent = d.lines.join('\n').replace(/\r/g, '\n') || '(暂无日志)';
+    const history=d.lines.join('\n').replace(/\r/g, '\n');
+    box.textContent = mergeEngineLog(box.textContent,history) || '(暂无日志)';
     followEngineLog(key);
     // 已装完且不在安装中 → 不需要 SSE，直接结束
     if (!d.installing && box.textContent !== '(暂无日志)') return;
@@ -1476,13 +2084,36 @@ async function pollLog(key) {
           if (state) { state.textContent = '● 重连中'; state.style.color = 'var(--amber)'; }
         }
         if (d.done) {
+          // Colab 的 pgrep 偶尔会在进程切换瞬间返回 NO。结束前重新读取
+          // 服务端状态；仍在安装时继续连接，避免日志停在旧进度。
+          try {
+            const latest = await (await fetch('/api/engines/' + key + '/log?tail=200')).json();
+            const latestText = latest.lines.join('\n').replace(/\r/g, '\n');
+            if (latestText) box.textContent = latestText;
+            followEngineLog(key);
+            if (latest.installing) {
+              es.close(); delete _installPolls[key];
+              const state = document.getElementById('logstate-' + key);
+              if (state) { state.textContent = '● Colab 实时'; state.style.color = '#71d6b2'; }
+              setTimeout(() => pollLog(key), 1000);
+              return;
+            }
+          } catch (_) {
+            es.close(); delete _installPolls[key];
+            setTimeout(() => pollLog(key), 3000);
+            return;
+          }
           const state = document.getElementById('logstate-' + key);
           if (state) { state.textContent = '● 已结束'; state.style.color = '#9aa8b1'; }
           es.close(); delete _installPolls[key];
           try {
             const all = await (await fetch('/api/engines')).json();
+            _engineState=all.engines||[];
+            _engineStateAt=Date.now();
+            applyLipsyncEngineSelect(all);
             const eng = all.engines.find(e => e.key === key);
             if (eng) updateEngineCard(eng);
+            refreshStatus(true);
           } catch (_) {}
           // updateEngineCard 重建了 logbox → 重新填充历史日志
           const newBox = document.getElementById('log-' + key);
@@ -1496,7 +2127,7 @@ async function pollLog(key) {
           }
           return;
         }
-        if (d.replace !== undefined) box.textContent = d.replace || '(等待远程日志…)';
+        if (d.replace !== undefined) box.textContent = mergeEngineLog(box.textContent,d.replace) || '(等待远程日志…)';
         else if (d.text) box.textContent += d.text;
         if (d.replace !== undefined || d.text) {
           const state = document.getElementById('logstate-' + key);
@@ -1512,19 +2143,51 @@ async function pollLog(key) {
 
 async function installEngine(key) {
   if (!confirm('确定要安装/重装 '+key+' 吗？这会覆盖之前的安装。')) return;
+  if(!_openLogs[key])toggleLog(key,true);
   try {
     const d = await (await fetch('/api/engines/' + key + '/install', { method: 'POST' })).json();
     if (d.error) { toast(d.error); return; }
     toast((d.already_running ? '已在安装中' : '已启动安装') + ': ' + key);
     await refreshEngines();
-    setTimeout(() => toggleLog(key, true), 500);
+    setTimeout(() => { if(!_installPolls[key])pollLog(key); }, 500);
   } catch (e) { toast('安装失败: ' + e); }
+}
+
+async function installCoreEngines(btn) {
+  if (!confirm('同时安装 MuseTalk 和 CosyVoice？两个任务会在 Colab 中并发执行，并分别显示实时日志。')) return;
+  const old=btn.textContent;btn.disabled=true;btn.textContent='⏳ 正在启动两个安装任务…';
+  const keys=['mt','cosy'];
+  keys.forEach(key=>{if(!_openLogs[key])toggleLog(key,true)});
+  try {
+    const results=await Promise.all(keys.map(async key=>{
+      const r=await fetch('/api/engines/'+key+'/install',{method:'POST'});
+      const d=await r.json();
+      if(!r.ok||d.error)throw new Error(`${key}: ${d.error||'HTTP '+r.status}`);
+      return {key,d};
+    }));
+    toast('MuseTalk 与 CosyVoice 已并发开始安装');
+    await refreshEngines();
+    setTimeout(()=>keys.forEach(key=>pollLog(key)),500);
+  } catch(e) {
+    toast('并发安装启动失败：'+(e?.message||e));
+    await refreshEngines();
+  } finally {
+    btn.disabled=false;btn.textContent=old;
+  }
 }
 
 /* ---------- 启动 ---------- */
 (async function init(){
   persistInit();bindUploads();
-  refreshStatus();setInterval(refreshStatus,20000);
+  updateRewriteSettingsLabel();
+  try{
+    const savedTitleData=JSON.parse(localStorage.getItem(PK+'titleData')||'null');
+    if(savedTitleData)renderTitleResult(savedTitleData);
+  }catch(e){}
+  refreshStatus();setInterval(()=>{
+    refreshStatus();
+    if($('iModal').style.display==='flex')refreshEngines();
+  },20000);
   await loadSelects();
   // 恢复上次的配音 / 成片(刷新不丢)
   if(voiceId){
