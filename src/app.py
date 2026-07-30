@@ -600,7 +600,19 @@ def _cicy_gpu_tts():
             headers=gpu_headers, method="POST",
         )
         with gpu_opener.open(create_req, timeout=120) as response:
-            remote_job = json.loads(response.read().decode("utf-8"))["id"]
+            create_status = response.status
+            create_raw = response.read().decode("utf-8")
+        created = json.loads(create_raw)
+        remote_job = str(created.get("id") or created.get("job_id") or "")
+        if not remote_job:
+            plog(
+                f"[CiCy GPU 配音] 创建响应异常 · HTTP {create_status} · "
+                f"keys={sorted(created.keys()) if isinstance(created, dict) else type(created).__name__}"
+            )
+            return jsonify({
+                "error": "GPU 创建任务响应缺少任务 ID",
+                "code": "gpu_create_response_invalid",
+            }), 502
         plog(f"[CiCy GPU 配音] 远程任务已创建 · job={remote_job}")
         try:
             oss_opener.open(
@@ -689,6 +701,15 @@ def _cicy_gpu_tts():
         return jsonify({
             "error": f"CiCy GPU 连接失败：{exc.reason}",
             "code": "cicy_gpu_connection_failed",
+        }), 502
+    except Exception as exc:
+        plog(
+            f"[CiCy GPU 配音] 本地同步异常 · "
+            f"{type(exc).__name__}: {str(exc)[:500]}"
+        )
+        return jsonify({
+            "error": f"CiCy GPU 本地结果同步失败：{type(exc).__name__}: {exc}",
+            "code": "cicy_gpu_local_sync_failed",
         }), 502
 
 

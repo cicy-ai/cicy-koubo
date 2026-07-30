@@ -1160,6 +1160,16 @@ let cicyGpuRequestId=localStorage.getItem(PK+'cicyGpuRequestId')||'';
 let cicyGpuReadyPromise=null;
 let cicyGpuBilling={startedAt:0,endedAt:0,rate:0,actual:null,status:''};
 let cicyGpuBusy=false;
+function resetCicyGpuUi(){
+  cicyGpuControlJob='';cicyGpuRequestId='';cicyGpuReadyPromise=null;cicyGpuBusy=false;
+  cicyGpuBilling={startedAt:0,endedAt:0,rate:0,actual:null,status:''};
+  localStorage.removeItem(PK+'cicyGpuControlJob');
+  localStorage.removeItem(PK+'cicyGpuRequestId');
+  const billing=$('gpuBilling'),destroy=$('gpuDestroyBtn'),start=$('gpuStartBtn');
+  if(billing)billing.style.display='none';
+  if(destroy){destroy.style.display='none';destroy.disabled=false;destroy.textContent='销毁 GPU'}
+  if(start){start.style.display='inline-flex';start.disabled=false;start.textContent='启动 GPU'}
+}
 function parseCloudUtc(value){
   const text=String(value||'').trim();
   if(!text)return NaN;
@@ -1203,7 +1213,10 @@ function updateCicyGpuBilling(job){
   dot.className='dot '+(terminal?'ok':'bad');
 }
 async function restoreCicyGpuState(){
-  if(!cicyGpuControlJob)return;
+  if(!cicyGpuControlJob){
+    if(cicyGpuBilling.startedAt)resetCicyGpuUi();
+    return;
+  }
   const box=$('gpuBilling'),label=$('t-gpu-billing');
   if(box)box.style.display='flex';
   if(label&&!cicyGpuBilling.startedAt)label.textContent='正在恢复 GPU 状态…';
@@ -1216,9 +1229,9 @@ async function restoreCicyGpuState(){
     if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);
     const job=data.job||{};
     if(['failed','cancelled','released','settled'].includes(job.status)){
-      cicyGpuControlJob='';cicyGpuRequestId='';
-      localStorage.removeItem(PK+'cicyGpuControlJob');
-      localStorage.removeItem(PK+'cicyGpuRequestId');
+      updateCicyGpuBilling(job);
+      resetCicyGpuUi();
+      return;
     }
     updateCicyGpuBilling(job);
   }catch(error){
@@ -1328,11 +1341,7 @@ async function destroyCicyGpu(){
       await new Promise(resolve=>setTimeout(resolve,2000));
     }
     if(!terminalStatus)throw new Error('云端释放确认超时，请刷新状态后重试');
-    cicyGpuControlJob='';cicyGpuRequestId='';
-    localStorage.removeItem(PK+'cicyGpuControlJob');
-    localStorage.removeItem(PK+'cicyGpuRequestId');
-    button.style.display='none';
-    $('gpuStartBtn').style.display='inline-flex';
+    resetCicyGpuUi();
     toast('GPU 已销毁，计费已停止');
   }catch(error){
     toast('销毁失败：'+(error?.message||error));
