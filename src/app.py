@@ -15,6 +15,7 @@ import pathlib
 import re
 import secrets
 import shlex
+import ssl
 import subprocess
 import sys
 import threading
@@ -390,19 +391,36 @@ def _cicy_gateway_request(method, path, payload=None, idempotency_key=""):
         headers["Content-Type"] = "application/json"
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    req = urllib.request.Request(
-        base_url + path, data=data, headers=headers, method=method,
+    openers = (
+        ("system", urllib.request.build_opener()),
+        ("direct", urllib.request.build_opener(urllib.request.ProxyHandler({}))),
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
+    last_error = None
+    for attempt in range(3):
+        route_name, opener = openers[min(attempt, len(openers) - 1)]
+        req = urllib.request.Request(
+            base_url + path, data=data, headers=headers, method=method,
+        )
         try:
-            result = json.loads(raw)
-        except Exception:
-            result = {"success": False, "error": raw or f"HTTP {exc.code}"}
-        return exc.code, result
+            with opener.open(req, timeout=30) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                result = json.loads(raw)
+            except Exception:
+                result = {"success": False, "error": raw or f"HTTP {exc.code}"}
+            return exc.code, result
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ConnectionError) as exc:
+            last_error = exc
+            plog(
+                f"[CiCy Cloud] 请求连接失败，正在重试 · "
+                f"path={path} route={route_name} attempt={attempt + 1}/3 "
+                f"error={type(exc).__name__}"
+            )
+            if attempt < 2:
+                time.sleep(attempt + 1)
+    raise last_error or RuntimeError("CiCy Cloud 请求失败")
 
 
 def _cicy_gpu_proxy(path, complete_on_success=False):
