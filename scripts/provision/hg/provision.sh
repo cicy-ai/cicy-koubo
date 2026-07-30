@@ -39,12 +39,10 @@ log "下载加速: 共享缓存 + 断点续传 + 5 次重试 + 4 路并发"
 [ "$GPU_MB" -ge 15000 ] || echo "WARN: 显存 <15GB,HeyGem 可能 OOM"
 
 log "1/5 micromamba + python 3.8"
-MM=/content/mt/bin/micromamba
-[ -x "$MM" ] || MM=/content/cosy/bin/micromamba
+MM=$WORK/bin/micromamba
 if [ ! -x "$MM" ]; then
   mkdir -p $WORK/bin
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
-  MM=$WORK/bin/micromamba
 fi
 [ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.8 pip || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python

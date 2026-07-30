@@ -481,6 +481,7 @@ def _job_runtime_payload(job: Job) -> dict:
     )
     log_path = job.directory / log_name
     lines: list[str] = []
+    raw_lines: list[str] = []
     if log_path.is_file():
         raw_lines = log_path.read_text(
             encoding="utf-8", errors="replace",
@@ -501,14 +502,42 @@ def _job_runtime_payload(job: Job) -> dict:
     if job.status == "running" and job.kind == "video" and job.stage == "lipsync":
         progress_rows = re.findall(
             r"(\d{1,3})%\|[^|]*\|\s*(\d+)/(\d+)",
-            "\n".join(lines),
+            "\n".join(raw_lines),
         )
         if progress_rows:
+            phase = 1
+            previous_completed = -1
+            previous_total = -1
+            for _, completed_text, total_text in progress_rows:
+                completed_value = int(completed_text)
+                total_value = int(total_text)
+                if previous_completed >= 0 and (
+                    completed_value < previous_completed or total_value != previous_total
+                ):
+                    phase += 1
+                previous_completed = completed_value
+                previous_total = total_value
             percent, completed, total = progress_rows[-1]
-            payload["progress"] = min(99, int(percent))
-            payload["stage"] = f"lipsync_frame_{completed}_of_{total}"
+            phase = min(4, phase)
+            overall = round(((phase - 1) + int(percent) / 100) / 4 * 95)
+            payload["progress"] = min(95, max(1, overall))
+            payload["stage"] = (
+                f"lipsync_phase_{phase}_of_4_frame_{completed}_of_{total}"
+            )
+            payload["phase"] = phase
+            payload["phases_total"] = 4
+            payload["phase_progress"] = int(percent)
             payload["frames_completed"] = int(completed)
             payload["frames_total"] = int(total)
+            joined = "\n".join(raw_lines)
+            last_progress = max(joined.rfind("%|"), joined.rfind("% |"))
+            last_mux = max(
+                joined.rfind("Video generation command:"),
+                joined.rfind("Audio combination command:"),
+            )
+            if last_mux > last_progress:
+                payload["stage"] = "finalizing_video"
+                payload["progress"] = 96
     if job.status == "running" and job.kind == "tts":
         joined = "\n".join(lines)
         total_match = re.findall(r"分句结果:\s*(\d+)\s*段", joined)

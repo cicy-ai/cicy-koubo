@@ -30,6 +30,9 @@ from flask import Flask, request, jsonify, send_file, Response
 
 _edit_lock = threading.Lock()
 _tts_lock = threading.Lock()
+_TTS_ACTIVE = {}
+_video_lock = threading.Lock()
+_VIDEO_ACTIVE = {}
 
 SRC_DIR = pathlib.Path(__file__).resolve().parent      # src/
 ROOT = SRC_DIR.parent / "app"                            # 项目根下的 app/
@@ -162,6 +165,8 @@ _CICY_GPU_PREPARED_REFERENCES = {}
 _CICY_GPU_RESULT_ASSETS = {}
 _CICY_GPU_VIDEO_LOG_LINES = {}
 _CICY_GPU_VIDEO_LAST_STATE = {}
+_CICY_GPU_VIDEO_LOG_LOCK = threading.Lock()
+_CICY_GPU_VIDEO_PHASES = {}
 
 def _local_gpu_conf():
     """Read the token written by the Windows installer without exposing it."""
@@ -579,34 +584,68 @@ def _cicy_gpu_video_status(job_id):
     try:
         with _public_direct_opener().open(upstream, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        seen = _CICY_GPU_VIDEO_LOG_LINES.setdefault(job_id, set())
-        for raw_line in payload.get("log") or []:
-            line = str(raw_line).strip()
-            if line and line not in seen:
-                seen.add(line)
-                plog(f"[CiCy GPU 出片][模型] {line[:1000]}")
+        remote_lines = [str(line).strip() for line in payload.get("log") or []]
         if payload.get("status") == "running":
             progress_rows = re.findall(
                 r"(\d{1,3})%\|[^|]*\|\s*(\d+)/(\d+)",
-                "\n".join(str(line) for line in payload.get("log") or []),
+                "\n".join(remote_lines),
             )
-            if progress_rows:
+            if progress_rows and not payload.get("phase"):
                 percent, completed, total = progress_rows[-1]
-                payload["progress"] = min(99, int(percent))
-                payload["stage"] = f"lipsync_frame_{completed}_of_{total}"
-                payload["frames_completed"] = int(completed)
-                payload["frames_total"] = int(total)
-        state = (
-            str(payload.get("status") or ""),
-            str(payload.get("stage") or ""),
-            int(payload.get("progress") or 0),
-        )
-        if _CICY_GPU_VIDEO_LAST_STATE.get(job_id) != state:
-            _CICY_GPU_VIDEO_LAST_STATE[job_id] = state
-            plog(
-                f"[CiCy GPU 出片] 远程进度 · status={state[0]} "
-                f"stage={state[1]} progress={state[2]}%"
+                completed_value, total_value = int(completed), int(total)
+                tracker = _CICY_GPU_VIDEO_PHASES.setdefault(
+                    job_id, {"phase": 1, "completed": -1, "total": -1},
+                )
+                inferred = {77: 3, 616: 4}.get(total_value)
+                if inferred:
+                    tracker["phase"] = max(tracker["phase"], inferred)
+                elif tracker["completed"] >= 0 and (
+                    completed_value < tracker["completed"]
+                    or total_value != tracker["total"]
+                ):
+                    tracker["phase"] = min(4, tracker["phase"] + 1)
+                tracker["completed"], tracker["total"] = completed_value, total_value
+                phase = tracker["phase"]
+                overall = round(((phase - 1) + int(percent) / 100) / 4 * 95)
+                payload["progress"] = min(95, max(1, overall))
+                payload["stage"] = (
+                    f"lipsync_phase_{phase}_of_4_frame_{completed}_of_{total}"
+                )
+                payload["phase"] = phase
+                payload["phases_total"] = 4
+                payload["phase_progress"] = int(percent)
+                payload["frames_completed"] = completed_value
+                payload["frames_total"] = total_value
+            joined = "\n".join(remote_lines)
+            last_inference = joined.rfind("Starting inference")
+            last_progress = max(joined.rfind("%|"), joined.rfind("% |"))
+            last_mux = max(
+                joined.rfind("Video generation command:"),
+                joined.rfind("Audio combination command:"),
             )
+            if last_mux > last_progress:
+                payload["stage"] = "finalizing_video"
+                payload["progress"] = 96
+            elif last_inference > last_progress:
+                payload["stage"] = "preparing_inference"
+                payload["progress"] = 0
+        with _CICY_GPU_VIDEO_LOG_LOCK:
+            seen = _CICY_GPU_VIDEO_LOG_LINES.setdefault(job_id, set())
+            for line in remote_lines:
+                if line and line not in seen:
+                    seen.add(line)
+                    plog(f"[CiCy GPU 出片][模型] {line[:1000]}")
+            state = (
+                str(payload.get("status") or ""),
+                str(payload.get("stage") or ""),
+                int(payload.get("progress") or 0),
+            )
+            if _CICY_GPU_VIDEO_LAST_STATE.get(job_id) != state:
+                _CICY_GPU_VIDEO_LAST_STATE[job_id] = state
+                plog(
+                    f"[CiCy GPU 出片] 远程进度 · status={state[0]} "
+                    f"stage={state[1]} progress={state[2]}%"
+                )
         return jsonify(payload)
     except urllib.error.HTTPError as exc:
         return Response(
@@ -1046,7 +1085,11 @@ def _colab_resolve_session(profile, requested=None, force=False):
                 for name in re.findall(r"^\s*\[[^\]]*\]\s+([^|\r\n]+?)\s*\|", output, re.M)
                 if name.strip()
             ]
-        resolved = configured if configured in names else (names[0] if names else configured)
+        # The JSON may contain a runtime assignment id such as gpu-t4-..., but
+        # colab exec/upload only accept the configured CLI alias. Never fall
+        # back to an arbitrary state-file key; doing so creates a false
+        # "active" session that every CLI operation rejects as not found.
+        resolved = configured
         _COLAB_SESSION_CACHE[cache_key] = (time.time(), resolved)
         if resolved != configured:
             plog(
@@ -1123,12 +1166,35 @@ def _colab_upload(local_path, remote_path, session=None, profile=None):
     resolved_session = _colab_resolve_session(profile, session)
     r = None
     for attempt in range(1, 4):
-        r = subprocess.run(
+        upload_started = time.monotonic()
+        local_size = pathlib.Path(local_path).stat().st_size
+        process = subprocess.Popen(
             _colab_base_args(profile) + ["upload", "-s", resolved_session,
                          str(local_path), remote_path],
-            env=_colab_env(profile), capture_output=True, text=True, timeout=300,
+            env=_colab_env(profile), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
         )
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+                break
+            except subprocess.TimeoutExpired:
+                waited = time.monotonic() - upload_started
+                plog(
+                    f"[Colab 上传中] remote={remote_path} total_bytes={local_size} "
+                    f"已等待={waited:.1f}s attempt={attempt}/3 "
+                    "(Colab CLI 不提供已上传字节数)"
+                )
+                if waited >= 300:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(process.args, 300)
+        r = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
         if r.returncode == 0:
+            plog(
+                f"[Colab 上传] 完成 remote={remote_path} bytes={local_size} "
+                f"elapsed={time.monotonic()-upload_started:.1f}s"
+            )
             if attempt > 1:
                 plog(f"[Colab 上传恢复] remote={remote_path}, attempt={attempt}/3")
             return True
@@ -1463,7 +1529,7 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
     try:
         colab_profile = None
         colab_session = None
-        if GPU_MODE == "colab_cli":
+        if GPU_MODE == "colab_cli" and opts.get("mode") != "simple":
             colab_profile = _active_colab_profile()
             colab_session = _colab_resolve_session(colab_profile, force=True)
             log(f"绑定 Colab 会话: {colab_session}")
@@ -1480,7 +1546,12 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                 ss = round(random.uniform(0, dur / 2), 2)
                 cmd += ["-ss", str(ss)]
                 log(f"动作随机: 底板从 {ss}s 开始")
-        cmd += ["-i", str(video_path), "-r", "25",
+        cmd += ["-i", str(video_path)]
+        # Lip-sync cannot use frames beyond the accompanying audio. Trimming
+        # here avoids transcoding and uploading an entire long seed video.
+        if opts.get("mode") != "simple" and audio_path is not None:
+            cmd += ["-t", f"{_ffdur(audio_path) + 0.25:.3f}"]
+        cmd += ["-r", "25",
                 "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-an", str(norm)]
         r = run(cmd)
         if r.returncode != 0:
@@ -1673,14 +1744,27 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
         plog(f"[出片 {job_id}] ❌ 失败: {e}")
         j["error"] = str(e)
         log("ERROR " + str(e))
+    finally:
+        _VIDEO_ACTIVE.clear()
+        _video_lock.release()
 
 
 @app.post("/api/generate-video")
 def generate_video():
-    if GPU_MODE == "cicy_gpu":
+    requested_mode = request.form.get("mode") or "lipsync"
+    # Base preview is always a local ffmpeg operation. It must never create a
+    # cloud/Colab GPU job or depend on a remote runtime.
+    if requested_mode != "simple" and GPU_MODE == "cicy_gpu":
         return _cicy_gpu_video()
-    if GPU_MODE == "local" and not LOCAL_GPU:
+    if requested_mode != "simple" and GPU_MODE == "local" and not LOCAL_GPU:
         return _local_gpu_video()
+    if requested_mode != "simple" and GPU_MODE == "colab_cli":
+        session_active, session_hint = _colab_session_active()
+        if not session_active:
+            return jsonify({
+                "error": f"{session_hint}。请先在系统管理中启动 Colab 会话",
+                "code": "colab_session_inactive",
+            }), 503
     has_audio = "audio" in request.files and request.files["audio"].filename
     audio_media = None
     if not has_audio:
@@ -1690,7 +1774,7 @@ def generate_video():
             if e and (MEDIA_DIR / e.get("file", "")).exists():
                 audio_media = MEDIA_DIR / e["file"]
                 has_audio = True
-    mode = request.form.get("mode") or "lipsync"
+    mode = requested_mode
     if not has_audio:
         mode = "simple"  # 无配音只能仅底板合成(对口型必须有音频)
     use_default = "video" not in request.files or not request.files["video"].filename
@@ -1750,8 +1834,28 @@ def generate_video():
     opts = {"sharp": request.form.get("sharp") == "1",       # 牙齿高清=成片锐化
             "randstart": request.form.get("randstart") == "1",  # 动作随机=底板随机起点
             "mode": mode, "engine": engine}
+    if not _video_lock.acquire(blocking=False):
+        active_job = _VIDEO_ACTIVE.get("job_id", "")
+        plog(f"[出片] 忽略重复请求：已有出片任务正在运行 job={active_job}")
+        return jsonify({
+            "error": "已有出片任务正在进行，请等待完成，不要重复点击",
+            "code": "video_already_running",
+            "job_id": active_job,
+        }), 409
+    _VIDEO_ACTIVE.update({
+        "active": True,
+        "job_id": job_id,
+        "started_at": time.time(),
+    })
     JOBS[job_id] = {"stage": "排队", "log": [], "result": None, "error": None}
-    threading.Thread(target=do_generate, args=(job_id, vp, ap, bbox, opts), daemon=True).start()
+    try:
+        threading.Thread(
+            target=do_generate, args=(job_id, vp, ap, bbox, opts), daemon=True,
+        ).start()
+    except Exception:
+        _VIDEO_ACTIVE.clear()
+        _video_lock.release()
+        raise
     return jsonify({"job_id": job_id})
 
 
@@ -1775,6 +1879,14 @@ def job_status(job_id):
         return _cicy_gpu_video_status(job_id)
     j = JOBS.get(job_id)
     if not j:
+        if (WORK / job_id).is_dir():
+            return jsonify({
+                "stage": "失败",
+                "log": ["本地 API 已重启，原任务已中断，请重新生成"],
+                "result": None,
+                "error": "本地 API 重启导致任务中断",
+                "code": "job_interrupted_by_restart",
+            })
         return jsonify({"error": "unknown job"}), 404
     return jsonify({"stage": j["stage"], "log": j["log"][-6:],
                     "result": j["result"], "error": j["error"]})
@@ -1955,13 +2067,23 @@ def tts():
             "error": "已有配音任务正在进行，请等待完成，不要重复点击",
             "code": "tts_already_running",
         }), 409
+    jid = uuid.uuid4().hex[:10]
+    _TTS_ACTIVE.update({"active": True, "job_id": jid, "started_at": time.time()})
     try:
-        return _tts_impl()
+        return _tts_impl(jid)
     finally:
+        _TTS_ACTIVE.clear()
         _tts_lock.release()
 
 
-def _tts_impl():
+@app.get("/api/tts/status")
+def tts_status():
+    payload = dict(_TTS_ACTIVE)
+    payload.setdefault("active", False)
+    return jsonify(payload)
+
+
+def _tts_impl(jid=None):
     """文案 + 参考音色 → CosyVoice zero-shot 克隆配音(本机 GPU 直接跑)。"""
     if GPU_MODE == "cicy_gpu":
         return _cicy_gpu_tts()
@@ -1979,7 +2101,7 @@ def _tts_impl():
     except ValueError:
         speed = 1.15
 
-    jid = uuid.uuid4().hex[:10]
+    jid = jid or uuid.uuid4().hex[:10]
     started = time.monotonic()
     whole = request.form.get("mode") == "whole"
     plog(f"[配音 {jid}] 开始: {len(text)}字 语速{speed} 模式{'整段' if whole else '分段'}")
@@ -2085,6 +2207,13 @@ def _tts_impl():
         launch_rc, launch_out = _colab_exec(cmd, timeout=10)
         if launch_rc != 0:
             plog(f"[配音 {jid}] 5/6 启动失败: {launch_out[-300:]}")
+            lowered_launch = launch_out.lower()
+            if "appears to be lost" in lowered_launch or "session" in lowered_launch \
+                    and ("not found" in lowered_launch or "404/401" in lowered_launch):
+                return jsonify({
+                    "error": "Colab 会话已断开，请重新启动会话后再生成配音",
+                    "code": "colab_session_inactive",
+                }), 503
             return jsonify({"error": "CosyVoice 推理进程启动失败"}), 500
         # 轮询完成
         inference_started = time.monotonic()
@@ -2205,16 +2334,54 @@ def edit():
 
 def _edit_impl():
     """执行单个剪辑任务；由 edit() 保证进程内不并发烧录。"""
-    job_id = request.form.get("job_id")
+    job_id = (request.form.get("job_id") or "").strip()
     src = None
     # 只从「原始未加工成片」剪辑,绝不拿剪辑产物再剪(否则字幕/BGM 会叠加)
     if job_id and (WORK / job_id / "result.mp4").exists():
         src = WORK / job_id / "result.mp4"          # 出片任务的干净原片(烧录不改动它)
+    elif job_id and GPU_MODE == "cicy_gpu":
+        if not re.fullmatch(r"gpu_[0-9a-f]{32}", job_id):
+            return jsonify({"error": "无效的 CiCy GPU 成片任务 ID"}), 400
+        session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+        endpoint = str(session.get("endpoint") or "").rstrip("/")
+        authorization = str(session.get("authorization_token") or "")
+        if not endpoint or not authorization:
+            return jsonify({"error": "CiCy GPU 授权已失效，无法获取指定原片"}), 503
+        job_dir = WORK / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        target = job_dir / "result.mp4"
+        temporary = job_dir / ".result.download"
+        plog(f"[剪辑] 下载指定 CiCy GPU 原片 · job={job_id}")
+        try:
+            upstream = urllib.request.Request(
+                endpoint + f"/api/result/{urllib.parse.quote(job_id, safe='')}",
+                headers={"Authorization": f"Bearer {authorization}"},
+            )
+            with _public_direct_opener().open(upstream, timeout=600) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if "video/" not in content_type:
+                    raise RuntimeError(f"unexpected content type: {content_type}")
+                with temporary.open("wb") as output:
+                    _sht.copyfileobj(response, output, length=1024 * 1024)
+            if not temporary.is_file() or temporary.stat().st_size < 1024:
+                raise RuntimeError("downloaded result is empty")
+            temporary.replace(target)
+            plog(
+                f"[剪辑] 指定原片下载完成 · job={job_id} "
+                f"bytes={target.stat().st_size}"
+            )
+            src = target
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            plog(f"[剪辑] 指定原片下载失败 · job={job_id} · {exc}")
+            return jsonify({
+                "error": f"无法获取当前成片，已停止剪辑（不会使用历史视频）：{exc}",
+            }), 502
     if src is None and "video" in request.files and request.files["video"].filename:
         tmp = WORK / (uuid.uuid4().hex[:8] + ".mp4")
         request.files["video"].save(tmp)
         src = tmp
-    if src is None:
+    if src is None and not job_id:
         # 兜底:历史里最新的「原始成片」(note 不是"剪辑成片"的那种),对应 jobs/<id>/result.mp4
         for e in _media_list():
             if e.get("type") == "video" and "剪辑" not in (e.get("note") or ""):
@@ -2232,7 +2399,7 @@ def _edit_impl():
         "color": request.form.get("color") or "#FFFFFF",
         "outline": request.form.get("outline") or "#000000",
         "mb": int(request.form.get("mb") or 300),
-        "font_id": request.form.get("font") or "heavy",
+        "font_id": request.form.get("font") or "smiley",
     }
     bgm_path = None
     bgm_id = (request.form.get("bgm_id") or "").strip()
@@ -2336,20 +2503,21 @@ def _parse_srt(text):
 
 
 FONTS = {
-    "soft": ("/System/Library/Fonts/PingFang.ttc", "柔和无衬线（多语种推荐）"),
-    "heavy": (str(ROOT / "assets/fonts/SourceHanSansCN-Heavy.otf"), "抖音口播·特粗（推荐）"),
-    "bold": (str(ROOT / "assets/fonts/SourceHanSansCN-Bold.otf"), "抖音口播·粗体"),
-    "heiti": ("/System/Library/Fonts/STHeiti Medium.ttc", "系统黑体"),
-    "pingfang": ("/System/Library/Fonts/PingFang.ttc", "苹方"),
-    "songti": ("/System/Library/Fonts/Supplemental/Songti.ttc", "宋体"),
+    "variety": (str(ROOT / "assets/fonts/ResourceHanRoundedCN-Heavy.ttf"), "综艺粗圆体·参考图风格（推荐）"),
+    "tiejili": (str(ROOT / "assets/fonts/TiejiliSC-Regular.ttf"), "铁蒺藜体·醒目口播（推荐）"),
+    "marker": (str(ROOT / "assets/fonts/LXGWMarkerGothic-Regular.ttf"), "霞鹜标楷黑·马克笔"),
+    "wenkai": (str(ROOT / "assets/fonts/LXGWWenKai-Medium.ttf"), "霞鹜文楷·中等"),
+    "smiley": (str(ROOT / "assets/fonts/SmileySans-Oblique.otf"), "得意黑·潮流斜体"),
+    "heavy": (str(ROOT / "assets/fonts/SourceHanSansCN-Heavy.otf"), "思源黑体·特粗"),
+    "bold": (str(ROOT / "assets/fonts/SourceHanSansCN-Bold.otf"), "思源黑体·粗体"),
 }
 
 
 def _font_path(fid):
-    p = FONTS.get(fid or "heavy", FONTS["heavy"])[0]
+    p = FONTS.get(fid or "variety", FONTS["variety"])[0]
     if os.path.exists(p):
         return p
-    for c in (FONTS["heiti"][0],                                   # macOS
+    for c in ("/System/Library/Fonts/STHeiti Medium.ttc",           # macOS fallback only
               "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",   # Linux/Colab Noto CJK
               "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
               "/content/SourceHanSansCN-Heavy.otf",                    # 用户上传字体(Colab /content)
@@ -2405,9 +2573,9 @@ def _load_font(fid, size, text=""):
     if any("\uac00" <= ch <= "\ud7af" for ch in text):
         script_candidates += ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"]
     candidates = script_candidates + [
-        FONTS.get(fid or "soft", FONTS["soft"])[0],                  # 用户选择
+        FONTS.get(fid or "variety", FONTS["variety"])[0],           # 用户选择
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        FONTS["heiti"][0],                                           # macOS
+        "/System/Library/Fonts/STHeiti Medium.ttc",                  # macOS fallback only
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",       # Linux/Colab Noto CJK
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/content/SourceHanSansCN-Heavy.otf",                        # 用户上传(Colab /content)
@@ -2430,20 +2598,43 @@ def _load_font(fid, size, text=""):
     return ImageFont.truetype(p, size)
 
 
-def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="#000000", mb=60, font_id="heavy"):
+@app.get("/api/fonts/<font_id>/preview.png")
+def font_preview(font_id):
+    """返回轻量字体预览，避免浏览器下载多个 10–25MB 的完整中文字体。"""
+    if font_id not in FONTS:
+        return jsonify({"error": "font_not_found"}), 404
+    import io
     from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    text = "让每一句字幕都舒服好看"
+    image = Image.new("RGBA", (620, 76), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(image)
+    font = _load_font(font_id, 30, text)
+    draw.text((4, 34), text, font=font, fill=(32, 42, 49, 255), anchor="lm")
+    output = io.BytesIO()
+    image.save(output, "PNG", optimize=True)
+    output.seek(0)
+    response = send_file(output, mimetype="image/png", max_age=86400)
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
+
+def _render_caption(text, w, h, png_path, fontsize=0, color="#FFD91A", outline="#111111", mb=60, font_id="variety"):
+    from PIL import Image, ImageDraw
+    # 2x supersampling 后 Lanczos 缩小，消除粗描边在 1080p/YUV 视频中的锯齿。
+    render_scale = 2 if w <= 1920 and h <= 3840 else 1
+    rw, rh = w * render_scale, h * render_scale
+    img = Image.new("RGBA", (rw, rh), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     # UI 字号按手机端约 160px 的视觉基准等比换算到成片。
     # 默认 14 在 1080p 竖屏中约为 95px，接近大字抖音口播字幕。
     ui_fs = max(8, fontsize or 14)
-    fs = max(8, min(180, round(ui_fs * w / 160)))
+    fs = max(8, min(180, round(ui_fs * w / 160))) * render_scale
     fg = _hex_rgba(color, (255, 255, 255, 255))
     og = _hex_rgba(outline, (0, 0, 0, 255))
     font = _load_font(font_id, fs, text)
-    # 大字口播字幕每行约 10 个中文字；同时保留 12% 的左右安全区。
-    maxw = w * 0.88
-    max_chars = 10
+    # 参考短视频综艺字幕：每行 12 个中文字，粗圆字形但保留左右呼吸空间。
+    maxw = rw * 0.88
+    max_chars = 12
     lines, cur = [], ""
     for ch in text:
         if (d.textlength(cur + ch, font=font) > maxw or len(cur) >= max_chars) and cur:
@@ -2452,17 +2643,21 @@ def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="
             cur += ch
     if cur:
         lines.append(cur)
-    lh = round(fs * 1.10)
-    y = h - lh * len(lines) - max(10, mb)
+    lh = round(fs * 1.06)
+    y = rh - lh * len(lines) - max(10, mb) * render_scale
     for ln in lines:
         tw = d.textlength(ln, font=font)
-        x = (w - tw) / 2
-        stroke = max(2, round(fs * 0.06))
-        for dx in (-stroke, stroke):
-            for dy in (-stroke, stroke):
-                d.text((x + dx, y + dy), ln, font=font, fill=og)
-        d.text((x, y), ln, font=font, fill=fg)
+        x = (rw - tw) / 2
+        stroke = max(2, round(fs * 0.065))
+        shadow = max(2, round(fs * 0.025))
+        # Pillow 原生连续描边，避免旧实现四角复制形成锯齿和脏边。
+        d.text((x + shadow, y + shadow), ln, font=font, fill=(25, 20, 16, 210),
+               stroke_width=stroke, stroke_fill=(25, 20, 16, 210))
+        d.text((x, y), ln, font=font, fill=fg,
+               stroke_width=stroke, stroke_fill=og)
         y += lh
+    if render_scale > 1:
+        img = img.resize((w, h), Image.Resampling.LANCZOS)
     img.save(png_path)
 
 
@@ -3982,7 +4177,206 @@ _COLAB_OAUTH_PROCESSES = {}
 _COLAB_INSTALL_LOG_BRIDGES = set()
 _COLAB_ENGINE_STARTING = {}
 _COLAB_ENGINE_INSTALL_INFLIGHT = set()
+_COLAB_ENGINE_ACTIVE = set()
 _COLAB_ENGINE_INSTALL_LOCK = threading.Lock()
+_COLAB_SESSION_BOOTSTRAPS = set()
+_COLAB_ENGINE_METRICS = {}
+
+
+def _colab_engine_marker(engine):
+    return ROOT / f".colab-{engine}.installing"
+
+
+def _colab_engine_ready_marker(engine):
+    return ROOT / f".colab-{engine}.ready"
+
+
+def _colab_engine_mark_ready(engine):
+    try:
+        _colab_engine_ready_marker(engine).write_text(
+            json.dumps({"ready_at": time.time(), "engine": engine})
+        )
+    except Exception:
+        pass
+
+
+def _colab_engine_clear_ready():
+    for engine in ENGINES:
+        try:
+            _colab_engine_ready_marker(engine).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _colab_engine_mark_active(engine):
+    try:
+        _colab_engine_marker(engine).write_text(
+            json.dumps({"started_at": time.time(), "engine": engine})
+        )
+    except Exception:
+        pass
+
+
+def _colab_engine_mark_done(engine):
+    try:
+        _colab_engine_marker(engine).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _colab_engine_marked_active(engine):
+    marker = _colab_engine_marker(engine)
+    if not marker.is_file():
+        return False
+    try:
+        if time.time() - marker.stat().st_mtime > 7200:
+            marker.unlink(missing_ok=True)
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _colab_upload_all_engine_scripts(profile):
+    """Seed every bundled engine script immediately after a new VM starts."""
+    seed_rc, seed_out = _colab_exec(
+        "test -f /content/.koubo_engine_scripts_ready && echo SEEDED",
+        timeout=20,
+        profile=profile,
+    )
+    if seed_rc == 0 and "SEEDED" in seed_out:
+        plog("[Colab 会话初始化] 安装脚本已预上传，跳过重复上传")
+        return [key for key, cfg in ENGINES.items() if not cfg.get("builtin")]
+    uploaded = []
+    for engine, cfg in ENGINES.items():
+        if cfg.get("builtin"):
+            continue
+        source_dir = SRC_DIR.parent / "scripts/provision" / engine
+        if not source_dir.is_dir():
+            continue
+        remote_dir = cfg["dir"]
+        rc, output = 1, ""
+        for attempt in range(1, 6):
+            rc, output = _colab_exec(
+                f"mkdir -p {shlex.quote(remote_dir)}",
+                timeout=60,
+                profile=profile,
+            )
+            if rc == 0:
+                break
+            plog(
+                f"[Colab 会话初始化] {cfg['name']} 远程目录暂不可用，"
+                f"重试 {attempt}/5"
+            )
+            time.sleep(min(attempt * 3, 10))
+        if rc != 0:
+            raise RuntimeError(f"{cfg['name']} 远程目录创建失败：{output[-200:]}")
+        files = sorted(path for path in source_dir.iterdir() if path.is_file())
+        for path in files:
+            plog(f"[Colab 会话初始化] 上传 {cfg['name']}/{path.name}")
+            if not _colab_upload(
+                path, f"{remote_dir}/{path.name}", profile=profile
+            ):
+                raise RuntimeError(f"{cfg['name']}/{path.name} 上传失败")
+        uploaded.append(engine)
+    rc, output = _colab_exec(
+        "touch /content/.koubo_engine_scripts_ready",
+        timeout=30,
+        profile=profile,
+    )
+    if rc != 0:
+        raise RuntimeError(f"安装脚本标记写入失败：{output[-200:]}")
+    return uploaded
+
+
+def _start_colab_session_bootstrap(profile):
+    """Upload scripts and start core installs with retry, without blocking UI."""
+    bootstrap_key = (profile["id"], profile["session"])
+    if bootstrap_key in _COLAB_SESSION_BOOTSTRAPS:
+        return False
+    _COLAB_SESSION_BOOTSTRAPS.add(bootstrap_key)
+    # The UI must enter an initializing state as soon as bootstrap begins,
+    # not several minutes later after every script has uploaded.
+    for engine in ("cosy", "mt", "hg"):
+        _COLAB_ENGINE_STARTING[engine] = time.time()
+        _colab_engine_mark_active(engine)
+
+    def run():
+        try:
+            last_error = None
+            for attempt in range(1, 6):
+                try:
+                    plog(
+                        f"[Colab 会话初始化] {attempt}/5 上传 MuseTalk、"
+                        "CosyVoice、HeyGem 脚本"
+                    )
+                    uploaded = _colab_upload_all_engine_scripts(profile)
+                    started = _colab_start_missing_core_installs(profile)
+                    plog(
+                        f"[Colab 会话初始化完成] scripts={','.join(uploaded)} "
+                        f"started={','.join(started)}"
+                    )
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    plog(
+                        f"[Colab 会话初始化重试] attempt={attempt}/5 "
+                        f"error={type(exc).__name__}: {exc}"
+                    )
+                    time.sleep(min(attempt * 5, 20))
+            plog(f"[Colab 会话初始化失败] 已重试 5 次：{last_error}")
+        finally:
+            # If bootstrap ended before an installer process took ownership,
+            # do not leave a permanent local "installing" marker.
+            for engine in ("cosy", "mt", "hg"):
+                if engine not in _COLAB_ENGINE_ACTIVE:
+                    _COLAB_ENGINE_STARTING.pop(engine, None)
+                    _colab_engine_mark_done(engine)
+            _COLAB_SESSION_BOOTSTRAPS.discard(bootstrap_key)
+
+    threading.Thread(
+        target=run,
+        name=f"colab-bootstrap-{profile['id']}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _colab_start_missing_core_installs(profile):
+    """Start all bundled GPU engines together after their scripts are seeded."""
+    started = []
+    for engine in ("cosy", "mt", "hg"):
+        cfg = ENGINES[engine]
+        ready = shlex.quote(cfg["ready"])
+        script = shlex.quote(f"{cfg['dir']}/provision.sh")
+        log_path = shlex.quote(f"{cfg['dir']}/provision.log")
+        process_pattern = shlex.quote(f"{cfg['dir']}/[p]rovision.sh")
+        command = (
+            f"if ! test -f {ready} && "
+            f"! pgrep -f {process_pattern} >/dev/null; "
+            f"then chmod +x {script} && "
+            f"nohup bash {script} >> {log_path} 2>&1 </dev/null & pid=$!; "
+            f"sleep 3; "
+            f"if kill -0 $pid 2>/dev/null; then echo STARTED_{engine}:$pid; "
+            f"else echo FAILED_{engine}; tail -n 20 {log_path}; exit 1; fi; "
+            f"elif test -f {ready}; then echo READY_{engine}; "
+            f"else echo RUNNING_{engine}; fi"
+        )
+        rc, output = _colab_exec(command, timeout=60, profile=profile)
+        if rc != 0:
+            raise RuntimeError(
+                f"{cfg['name']} 启动检查失败：{output[-300:]}"
+            )
+        if f"STARTED_{engine}" in output or f"RUNNING_{engine}" in output:
+            with _COLAB_ENGINE_INSTALL_LOCK:
+                _COLAB_ENGINE_ACTIVE.add(engine)
+            _COLAB_ENGINE_STARTING[engine] = time.time()
+            _colab_engine_mark_active(engine)
+            _start_colab_install_log_bridge(engine, profile)
+            started.append(engine)
+        elif f"READY_{engine}" in output:
+            _colab_engine_mark_ready(engine)
+    return started
 
 
 def _start_colab_install_log_bridge(engine, profile):
@@ -3999,7 +4393,7 @@ def _start_colab_install_log_bridge(engine, profile):
         offset = 0
         stopped_checks = 0
         try:
-            while stopped_checks < 3:
+            while stopped_checks < 10:
                 command = (
                     f"size=$(wc -c < {remote_log} 2>/dev/null || echo 0); "
                     f"if [ \"$size\" -lt {offset} ]; then start=1; "
@@ -4018,14 +4412,21 @@ def _start_colab_install_log_bridge(engine, profile):
                         new_offset = offset
                     if new_offset < offset:
                         offset = 0
-                    if new_offset > offset:
+                    log_grew = new_offset > offset
+                    if log_grew:
                         for line in body.replace("\r", "\n").splitlines():
                             if line.strip():
                                 plog(f"[Colab 安装][{cfg['name']}] {line}")
+                            if "DONE" in line and "READY written" in line:
+                                _colab_engine_mark_ready(engine)
                         offset = new_offset
-                    stopped_checks = 0 if running_text.strip().endswith("YES") else stopped_checks + 1
-                    if running_text.strip().endswith("YES"):
-                        _COLAB_ENGINE_STARTING.pop(engine, None)
+                    # A growing provision.log is stronger evidence than a
+                    # transient pgrep miss through Colab CLI.
+                    stopped_checks = (
+                        0
+                        if log_grew or running_text.strip().endswith("YES")
+                        else stopped_checks + 1
+                    )
                 else:
                     plog(f"[Colab 安装日志暂不可用][{cfg['name']}] 正在自动重试")
                     stopped_checks = 0
@@ -4033,6 +4434,9 @@ def _start_colab_install_log_bridge(engine, profile):
             plog(f"[Colab 安装][{cfg['name']}] 安装进程已结束")
         finally:
             _COLAB_ENGINE_STARTING.pop(engine, None)
+            with _COLAB_ENGINE_INSTALL_LOCK:
+                _COLAB_ENGINE_ACTIVE.discard(engine)
+            _colab_engine_mark_done(engine)
             _COLAB_INSTALL_LOG_BRIDGES.discard(bridge_key)
 
     threading.Thread(
@@ -4067,10 +4471,16 @@ def api_colab_oauth_start():
     profile = _active_colab_profile()
     if profile["auth"] != "oauth2":
         return jsonify({"error": "当前账号不是 OAuth2 模式"}), 400
+    token_path = _colab_oauth_token_path(profile)
+    if token_path.is_file() and token_path.stat().st_size > 0:
+        return jsonify({
+            "ok": True,
+            "already_authorized": True,
+            "email": profile.get("email") or "",
+        })
     old = _COLAB_OAUTH_PROCESSES.pop(profile["id"], None)
     if old and old.poll() is None:
         old.terminate()
-    token_path = _colab_oauth_token_path(profile)
     # Never delete a working token merely because the user opened the OAuth
     # dialog. A failed/cancelled authorization must leave existing access intact.
     try:
@@ -4086,7 +4496,7 @@ def api_colab_oauth_start():
         selector.register(proc.stdout, selectors.EVENT_READ)
         selector.register(proc.stderr, selectors.EVENT_READ)
         chunks = []
-        deadline = time.time() + 15
+        deadline = time.time() + 60
         auth_url = ""
         while time.time() < deadline and proc.poll() is None:
             for key, _ in selector.select(timeout=0.5):
@@ -4212,6 +4622,14 @@ def api_colab_session_start():
                 f"gpu={profile['gpu']}, error={raw_error[-1200:]}"
             )
             lowered = raw_error.lower()
+            # The CLI traceback can contain nested/stale 412 text even when
+            # the final Google response is 503. Service availability is the
+            # terminal error and must take precedence over assignment hints.
+            if "service unavailable" in lowered or "503" in lowered:
+                return jsonify({
+                    "error": "Google Colab 暂时无法分配 GPU，请稍后重试",
+                    "code": "colab_service_unavailable",
+                }), 503
             if "toomanyassignmentserror" in lowered or \
                     ("precondition failed" in lowered and "412" in lowered):
                 return jsonify({
@@ -4221,11 +4639,6 @@ def api_colab_session_start():
                     ),
                     "code": "colab_assignment_conflict",
                 }), 409
-            if "service unavailable" in lowered or "503" in lowered:
-                return jsonify({
-                    "error": "Google Colab 暂时无法分配 GPU，请稍后重试",
-                    "code": "colab_service_unavailable",
-                }), 503
             if "unauthorized" in lowered or "authentication" in lowered or "401" in lowered:
                 return jsonify({
                     "error": "Google 授权已失效，请重新授权后再启动会话",
@@ -4240,8 +4653,12 @@ def api_colab_session_start():
         if current is not None:
             current["started_at"] = time.time()
             save_global_cfg(cfg)
+        _colab_engine_clear_ready()
+        plog("[Colab 会话] 4/4 后台上传脚本并并发安装 MuseTalk、CosyVoice、HeyGem")
+        bootstrap_started = _start_colab_session_bootstrap(profile)
         plog(f"[Colab 会话] 3/3 启动成功 session={profile['session']} gpu={profile['gpu']}")
         return jsonify({"ok": True, "session": profile["session"], "gpu": profile["gpu"],
+                        "initializing": bootstrap_started,
                         "output": (r.stdout or "").strip()[-500:]})
     except subprocess.TimeoutExpired:
         return jsonify({
@@ -4278,6 +4695,15 @@ def api_colab_session_stop():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.post("/api/colab/session/bootstrap")
+def api_colab_session_bootstrap():
+    active, hint = _colab_session_active()
+    if not active:
+        return jsonify({"error": hint, "code": "colab_session_inactive"}), 409
+    started = _start_colab_session_bootstrap(_active_colab_profile())
+    return jsonify({"ok": True, "initializing": started})
+
+
 @app.get("/api/colab/session")
 def api_colab_session_status():
     """返回当前配置档的会话状态与运行时长，不暴露会话 token。"""
@@ -4293,22 +4719,13 @@ def api_colab_session_status():
         session = sessions.get(profile["session"])
     except Exception:
         session = None
+    # Status reads must fail closed and return immediately. Running the CLI
+    # `sessions` command here can block 20-30 seconds when Google is
+    # unreachable and used to stall the whole system-settings modal.
     resolved_session = profile["session"]
-    if credentials_ready and not session:
-        resolved_session = _colab_resolve_session(profile, force=True)
-        if resolved_session != profile["session"]:
-            session = {"accelerator": profile["gpu"], "variant": "GPU"}
-    account_email = ""
-    if credentials_ready:
-        try:
-            who = subprocess.run(_colab_base_args(profile) + ["whoami"], capture_output=True,
-                                 text=True, timeout=10, env=_colab_env(profile))
-            for line in (who.stdout or who.stderr).splitlines():
-                if line.startswith("Email:"):
-                    account_email = line.split(":", 1)[1].strip()
-                    break
-        except Exception:
-            pass
+    # Keep this gate endpoint fast: OAuth `whoami` and remote `nvidia-smi`
+    # belong to optional metrics, not to the button-unlock decision.
+    account_email = profile.get("email") or ""
     common = {
         "profile_id": profile["id"],
         "session": resolved_session,
@@ -4354,23 +4771,6 @@ def api_colab_session_status():
         current = next((p for p in colab["profiles"] if p.get("id") == colab["active"]), {})
         started_at = current.get("started_at")
     now = time.time()
-    gpu_usage = {}
-    try:
-        rc, raw_usage = _colab_exec(
-            "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw "
-            "--format=csv,noheader,nounits | head -1",
-            timeout=20,
-        )
-        parts = [part.strip() for part in raw_usage.splitlines()[-1].split(",")]
-        if rc == 0 and len(parts) >= 4:
-            gpu_usage = {
-                "utilization_percent": float(parts[0]),
-                "memory_used_mb": float(parts[1]),
-                "memory_total_mb": float(parts[2]),
-                "power_watts": float(parts[3]),
-            }
-    except Exception:
-        pass
     return jsonify({
         "running": True,
         **common,
@@ -4379,7 +4779,7 @@ def api_colab_session_status():
         "started_at": started_at,
         "runtime_seconds": max(0, int(now - started_at)) if started_at else None,
         "last_execution": (session.get("last_execution") or [None, None, None])[-1],
-        "gpu_usage": gpu_usage,
+        "gpu_usage": {},
     })
 
 # 启动时自动部署 provision 脚本到 /content/（Colab 重启后目录丢失）
@@ -4833,9 +5233,29 @@ def install_colab_cli():
 def api_engines():
     out = []
     is_remote = GPU_MODE == "colab_cli"
+    remote_session_present = False
+    if is_remote:
+        try:
+            profile = _active_colab_profile()
+            state_path = pathlib.Path(profile["session_config"])
+            sessions = json.loads(state_path.read_text()) if state_path.is_file() else {}
+            remote_session_present = bool(
+                isinstance(sessions, dict) and sessions.get(profile["session"])
+            )
+        except Exception:
+            remote_session_present = False
+        if not remote_session_present:
+            with _COLAB_ENGINE_INSTALL_LOCK:
+                _COLAB_ENGINE_ACTIVE.clear()
+            _COLAB_ENGINE_STARTING.clear()
+            for engine_key in ENGINES:
+                _colab_engine_mark_done(engine_key)
+            # Colab runtimes are ephemeral. READY files cached from a previous
+            # runtime must never make an offline/new session look installed.
+            _colab_engine_clear_ready()
     # 远程检测: colab cli 模式下通过 exec 检查 READY 文件
     remote_status = {}
-    if is_remote:
+    if is_remote and request.args.get("probe") == "1" and remote_session_present:
         checks = []
         for key, cfg in ENGINES.items():
             ready_remote = cfg["ready"]
@@ -4844,11 +5264,21 @@ def api_engines():
                 f"echo __KOUBO_ENGINE_{key}_BEGIN__; "
                 f"(test -f {shlex.quote(ready_remote)} && "
                 f"{{ echo __KOUBO_INSTALLED_YES__; cat {shlex.quote(ready_remote)}; }} || true); "
+                f"echo __KOUBO_DISK_BYTES__; "
+                f"(du -sb {shlex.quote(cfg['dir'])} 2>/dev/null | awk '{{print $1}}' || echo 0); "
+                f"echo __KOUBO_INSTALL_TIMES__; "
+                f"(grep -E '^=== \\[[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}\\]' "
+                f"{shlex.quote(cfg['dir'] + '/provision.log')} 2>/dev/null | head -1 || true); "
+                f"(grep 'DONE' {shlex.quote(cfg['dir'] + '/provision.log')} "
+                f"2>/dev/null | tail -1 || true); "
                 f"echo __KOUBO_INSTALLING__; "
                 f"(pgrep -f {shlex.quote(script)} >/dev/null && echo YES || echo NO); "
                 f"echo __KOUBO_ENGINE_{key}_END__"
             )
         # A single Colab round-trip avoids four sequential 30-second checks.
+        # Engine cards are advisory UI. Never let a slow Colab runtime block
+        # system settings; generation endpoints perform their own strict
+        # readiness checks before work starts.
         _, batch_out = _colab_exec("; ".join(checks), timeout=30)
         for key in ENGINES:
             begin = f"__KOUBO_ENGINE_{key}_BEGIN__"
@@ -4861,15 +5291,53 @@ def api_engines():
             installed = installed_marker in segment
             version_and_state = segment.split(installed_marker, 1)[1] if installed else segment
             before, _, after = version_and_state.rpartition("__KOUBO_INSTALLING__")
+            version_text, disk_marker, metrics_text = before.partition("__KOUBO_DISK_BYTES__")
+            disk_bytes = 0
+            install_seconds = None
+            if disk_marker:
+                disk_text, _, times_text = metrics_text.partition("__KOUBO_INSTALL_TIMES__")
+                try:
+                    disk_bytes = int(disk_text.strip().splitlines()[0])
+                except (ValueError, IndexError):
+                    disk_bytes = 0
+                clock_values = re.findall(r"=== \[(\d{2}):(\d{2}):(\d{2})\]", times_text)
+                if len(clock_values) >= 2:
+                    values = [
+                        int(h) * 3600 + int(m) * 60 + int(s)
+                        for h, m, s in (clock_values[0], clock_values[-1])
+                    ]
+                    install_seconds = values[1] - values[0]
+                    if install_seconds < 0:
+                        install_seconds += 24 * 3600
             remote_status[key] = {
                 "installed": installed,
-                "version_text": before.strip() if installed else "",
+                "version_text": version_text.strip() if installed else "",
                 "installing": after.strip().endswith("YES"),
+                "disk_bytes": disk_bytes,
+                "install_seconds": install_seconds,
             }
+            if installed:
+                _COLAB_ENGINE_METRICS[key] = {
+                    "disk_bytes": disk_bytes,
+                    "install_seconds": install_seconds,
+                }
+            if installed:
+                _colab_engine_mark_ready(key)
+                # READY is authoritative. Clear every local in-progress hint so
+                # a completed remote install cannot remain stuck in the UI.
+                with _COLAB_ENGINE_INSTALL_LOCK:
+                    _COLAB_ENGINE_ACTIVE.discard(key)
+                _COLAB_ENGINE_STARTING.pop(key, None)
+                _colab_engine_mark_done(key)
+                remote_status[key]["installing"] = False
+            elif remote_status[key]["installing"]:
+                with _COLAB_ENGINE_INSTALL_LOCK:
+                    _COLAB_ENGINE_ACTIVE.add(key)
+                _colab_engine_mark_active(key)
     for key, cfg in ENGINES.items():
         if is_remote:
             rs = remote_status.get(key, {})
-            installed = rs.get("installed", False)
+            installed = rs.get("installed", False) or _colab_engine_ready_marker(key).is_file()
             version_info = {}
             if installed and rs.get("version_text"):
                 for line in rs["version_text"].splitlines():
@@ -4889,12 +5357,20 @@ def api_engines():
                 except Exception:
                     pass
         starting_at = _COLAB_ENGINE_STARTING.get(key, 0)
-        starting = bool(starting_at and time.time() - starting_at < 300)
-        installing = (
+        starting = key in _COLAB_ENGINE_ACTIVE or _colab_engine_marked_active(key) or bool(
+            starting_at and time.time() - starting_at < 300
+        )
+        installing = False if installed else (
             remote_status.get(key, {}).get("installing", False) or starting
             if is_remote else _is_installing(key)
         )
-        if is_remote and installing and not cfg.get("builtin", False):
+        # Only attach the remote log bridge after a probe has confirmed that
+        # provision.sh is actually running. A local "starting" marker is also
+        # present while files are still uploading; bridging at that point can
+        # observe three process misses and incorrectly clear the install state
+        # before provision.sh has even launched.
+        if is_remote and remote_status.get(key, {}).get("installing", False) \
+                and not cfg.get("builtin", False):
             _start_colab_install_log_bridge(key, _active_colab_profile())
         # In Colab mode the source script lives in this app and is uploaded on
         # demand. Checking /content on the local Mac incorrectly reports every
@@ -4905,6 +5381,20 @@ def api_engines():
         out.append({"key": key, "name": cfg["name"],
                     "installed": installed, "installing": installing,
                     "version_info": version_info, "has_script": has_script,
+                    "disk_bytes": (
+                        0 if cfg.get("builtin") else
+                        remote_status.get(key, {}).get(
+                            "disk_bytes", _COLAB_ENGINE_METRICS.get(key, {}).get("disk_bytes", 0)
+                        )
+                    ),
+                    "install_seconds": (
+                        _COLAB_ENGINE_METRICS.get("cosy", {}).get("install_seconds")
+                        if cfg.get("builtin") else
+                        remote_status.get(key, {}).get(
+                            "install_seconds",
+                            _COLAB_ENGINE_METRICS.get(key, {}).get("install_seconds"),
+                        )
+                    ),
                     "remote": is_remote, "builtin": cfg.get("builtin", False),
                     "install_hint": cfg.get("install_hint", ""),
                     "note": cfg.get("note", "")})
@@ -5028,6 +5518,8 @@ def api_engine_install(engine):
             if task_key in _COLAB_ENGINE_INSTALL_INFLIGHT:
                 return jsonify({"ok": True, "already_running": True, "engine": engine}), 202
             _COLAB_ENGINE_INSTALL_INFLIGHT.add(task_key)
+            _COLAB_ENGINE_ACTIVE.add(engine)
+            _colab_engine_mark_active(engine)
             _COLAB_ENGINE_STARTING[engine] = time.time()
         remote_dir = cfg["dir"]
         remote_log = f"{remote_dir}/provision.log"
@@ -5039,67 +5531,40 @@ def api_engine_install(engine):
             profile=profile,
         )
         if "READY" in check_out:
+            _colab_engine_mark_ready(engine)
             _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_ACTIVE.discard(engine)
+            _colab_engine_mark_done(engine)
             _COLAB_ENGINE_STARTING.pop(engine, None)
             return jsonify({"ok": True, "already_installed": True, "engine": engine})
         if "RUNNING" in check_out:
             _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
-            _COLAB_ENGINE_STARTING.pop(engine, None)
             _start_colab_install_log_bridge(engine, profile)
             return jsonify({"ok": True, "already_running": True, "engine": engine}), 202
-        plog(f"[Colab 安装][{cfg['name']}] 1/3 创建远程目录")
-        mkdir_rc, mkdir_out = _colab_exec(
-            f"mkdir -p {shlex.quote(remote_dir)}",
-            timeout=30,
+        seed_rc, seed_out = _colab_exec(
+            f"test -f /content/.koubo_engine_scripts_ready && "
+            f"test -f {shlex.quote(f'{remote_dir}/provision.sh')} && echo SEEDED",
+            timeout=20,
+            profile=profile,
         )
-        if mkdir_rc != 0:
+        scripts_preseeded = seed_rc == 0 and "SEEDED" in seed_out
+        if not scripts_preseeded:
             _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_ACTIVE.discard(engine)
+            _colab_engine_mark_done(engine)
             _COLAB_ENGINE_STARTING.pop(engine, None)
             return jsonify({
-                "error": f"创建 Colab 安装目录失败：{mkdir_out[-300:] or remote_dir}"
-            }), 500
-        _colab_exec(
-            f"printf '\\n[%s] 开始准备 {shlex.quote(cfg['name'])} 安装环境\\n' "
-            f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
-            timeout=30,
-        )
-        # 上传整个目录
-        upload_files = [sf for sf in src_dir.iterdir() if sf.is_file()]
-        for index, sf in enumerate(upload_files, 1):
-            plog(
-                f"[Colab 安装][{cfg['name']}] 2/3 上传文件 "
-                f"{index}/{len(upload_files)}: {sf.name}"
-            )
-            _colab_exec(
-                f"printf '[%s] 上传文件 {index}/{len(upload_files)}: %s ... ' "
-                f"\"$(date '+%H:%M:%S')\" {shlex.quote(sf.name)} >> {shlex.quote(remote_log)}",
-                timeout=30,
-            )
-            if sf.is_file():
-                ok = _colab_upload(sf, f"{remote_dir}/{sf.name}")
-                if not ok:
-                    _colab_exec(
-                        f"printf '失败\\n' >> {shlex.quote(remote_log)}",
-                        timeout=30,
-                    )
-                    _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
-                    _COLAB_ENGINE_STARTING.pop(engine, None)
-                    return jsonify({"error": f"上传 {sf.name} 到 Colab 失败"}), 500
-                _colab_exec(
-                    f"printf '完成\\n' >> {shlex.quote(remote_log)}",
-                    timeout=30,
-                )
-        # 远程执行 provision.sh
+                "error": "当前 Colab 会话缺少预上传安装脚本，请重新初始化会话",
+                "code": "colab_scripts_not_seeded",
+            }), 409
+        plog(f"[Colab 安装][{cfg['name']}] 安装脚本已预上传，直接执行")
         script = f"{remote_dir}/provision.sh"
-        plog(f"[Colab 安装][{cfg['name']}] 3/3 启动远程安装")
-        _colab_exec(
-            f"printf '[%s] 文件上传完成，启动安装脚本\\n' "
-            f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
-            timeout=30,
+        detached_launch = shlex.quote(
+            f"nohup bash {shlex.quote(script)} >> "
+            f"{shlex.quote(remote_log)} 2>&1 </dev/null &"
         )
         rc, out = _colab_exec(
-            f"chmod +x {shlex.quote(script)} && "
-            f"nohup bash {shlex.quote(script)} >> {shlex.quote(remote_log)} 2>&1 &",
+            f"chmod +x {shlex.quote(script)} && sh -c {detached_launch}",
             timeout=30,
         )
         if rc != 0:
@@ -5109,6 +5574,8 @@ def api_engine_install(engine):
                 timeout=30,
             )
             _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_ACTIVE.discard(engine)
+            _colab_engine_mark_done(engine)
             _COLAB_ENGINE_STARTING.pop(engine, None)
             return jsonify({"error": f"启动 {cfg['name']} 安装失败：{out[-300:]}"}), 500
         _start_colab_install_log_bridge(engine, profile)

@@ -54,6 +54,14 @@ a.ref_text = base64.b64decode(a.ref_text_b64).decode("utf-8") if a.ref_text_b64 
 if not a.text:
     raise SystemExit("no --text/--text-b64")
 
+# Whisper commonly returns a prompt transcript without terminal punctuation.
+# CosyVoice then treats the prompt as unfinished and may continue its final
+# words at the beginning of every generated segment. Mark the prompt boundary
+# explicitly so reference speech is conditioning only, never synthesized text.
+a.ref_text = a.ref_text.strip()
+if a.ref_text and not re.search(r"[。！？.!?]$", a.ref_text):
+    a.ref_text += "。"
+
 log("==== TTS 开始 ====")
 log(f"参考音频: {a.ref}")
 log(f"参考转写(ref_text) [{len(a.ref_text)}字]: {a.ref_text!r}")
@@ -134,8 +142,11 @@ DIALECT_INSTRUCTIONS = {
     # CosyVoice2 instruct2 requires the explicit end-of-prompt token.  Without
     # it the instruction can leak into the synthesized speech, once per
     # segment, e.g. “请用闽南语表达” being spoken seven times.
-    "zh-yue": "You are a helpful assistant. 请用粤语表达。<|endofprompt|>",
-    "zh-minnan": "You are a helpful assistant. 请用闽南语表达。<|endofprompt|>",
+    # Keep these control phrases byte-for-byte aligned with CosyVoice's
+    # official instruct_list; synonyms such as “粤语/闽南语” do not reliably
+    # activate the trained dialect controls.
+    "zh-yue": "You are a helpful assistant. 请用广东话表达。<|endofprompt|>",
+    "zh-minnan": "You are a helpful assistant. 请用闽南话表达。<|endofprompt|>",
     "zh-sichuan": "You are a helpful assistant. 请用四川话表达。<|endofprompt|>",
     "zh-dongbei": "You are a helpful assistant. 请用东北话表达。<|endofprompt|>",
     "zh-shanghai": "You are a helpful assistant. 请用上海话表达。<|endofprompt|>",
@@ -153,9 +164,19 @@ for idx, seg in enumerate(segments):
             seg.strip(), DIALECT_INSTRUCTIONS[a.language], a.ref,
             stream=False, speed=a.speed,
         )
+    elif hasattr(m, "inference_cross_lingual"):
+        # Reference transcripts produced from user clips can end mid-word or
+        # disagree with the clipped waveform. zero_shot then continues that
+        # prompt at every segment boundary (for example repeating “好多的”).
+        # Cross-lingual inference conditions on the voice audio only, so the
+        # reference text can never leak into the requested speech.
+        iterator = m.inference_cross_lingual(
+            seg.strip(), a.ref, stream=False, speed=a.speed,
+        )
     else:
-        iterator = m.inference_zero_shot(
-            seg.strip(), a.ref_text, a.ref, stream=False, speed=a.speed,
+        raise RuntimeError(
+            "当前 CosyVoice 不支持隔离参考文本的 inference_cross_lingual，"
+            "为防止参考尾词泄漏，已拒绝回退到 zero_shot"
         )
     for j in iterator:
         chunks.append(_fade(j["tts_speech"], m.sample_rate))

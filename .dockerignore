@@ -1,0 +1,12 @@
+**
+!scripts/
+!scripts/provision/
+!scripts/provision/mt/
+!scripts/provision/mt/provision.sh
+!scripts/provision/cosy/
+!scripts/provision/cosy/provision.sh
+!scripts/provision/cosy/cosyvoice_tts.py
+!docker/
+!docker/gpu/
+!docker/gpu/Dockerfile
+!docker/gpu/entrypoint.sh

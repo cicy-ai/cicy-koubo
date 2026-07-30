@@ -4,8 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/cicy-ai/cicy-tools/main/musetalk-provision.sh \
 #     > /content/mt/provision.sh && nohup bash /content/mt/provision.sh > /content/mt/provision.log 2>&1 &
 # Idempotent — re-run any time to repair or pick up script updates.
-# Writes /content/mt/READY (gpu + versions + smoke-test timing) only after the
-# official-sample smoke test passes, so orchestrators can poll for readiness.
+# Writes /content/mt/READY after a fast CUDA/import/model-file readiness check.
+# Full sample-video inference belongs to E2E tests, not every new VM install.
 set -uo pipefail
 
 # Colab 容器的 NVIDIA 驱动库不在默认搜索路径;SSH 会话没有 notebook 的 env,必须显式补上
@@ -165,18 +165,30 @@ chmod +x $WORK/synthesize.sh
 $PY -c "import torch, mmpose, diffusers; print('torch', torch.__version__, 'cuda_ok', torch.cuda.is_available())" \
   || die "sanity import failed"
 
-log "7/7 smoke test (official sample)"
-SMOKE=deferred
-if [ "${CICY_DOCKER_BUILD:-0}" != "1" ]; then
-  START=$(date +%s)
-  bash $WORK/synthesize.sh > $WORK/smoke.log 2>&1 || { tail -20 $WORK/smoke.log; die "smoke test failed (see $WORK/smoke.log)"; }
-  SMOKE=$(( $(date +%s) - START ))
-fi
+log "7/7 fast readiness check (no test video)"
+for REQUIRED in \
+  "$M/musetalkV15/unet.pth" \
+  "$M/musetalkV15/musetalk.json" \
+  "$M/sd-vae/diffusion_pytorch_model.safetensors" \
+  "$M/whisper/pytorch_model.bin" \
+  "$M/dwpose/dw-ll_ucoco_384.pth"; do
+  [ -s "$REQUIRED" ] || die "required model missing: $REQUIRED"
+done
+$PY - <<'PY' || die "CUDA/core import readiness check failed"
+import torch
+import diffusers
+import mmpose
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA unavailable")
+torch.zeros(1, device="cuda")
+print("fast readiness check passed")
+PY
 
 {
   echo "gpu=$GPU"
   echo "provisioned_at=$(date -u +%FT%TZ)"
-  echo "smoke_wall_s=$SMOKE"
+  echo "readiness_check=fast"
   $PY -c "import torch; print('torch='+torch.__version__)"
 } > $WORK/READY
-log "DONE — READY written. smoke=${SMOKE}s"
+log "DONE — READY written (fast check; full video test skipped)"

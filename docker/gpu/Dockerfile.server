@@ -1,0 +1,32 @@
+ARG BASE_IMAGE=cicy-koubo-gpu:2026.07.28
+FROM ${BASE_IMAGE}
+
+ARG CICY_KOUBO_VERSION=0.1.7
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    KOUBO_LOCAL_GPU=1 \
+    KOUBO_GPU_MODE=local \
+    KOUBO_PORT=8770 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl python3 python3-flask python3-pil \
+    && mkdir -p /opt/cicy-koubo/package \
+    && curl -fsSL "https://registry.npmjs.org/cicy-koubo/-/cicy-koubo-${CICY_KOUBO_VERSION}.tgz" \
+       -o /tmp/cicy-koubo.tgz \
+    && tar -xzf /tmp/cicy-koubo.tgz -C /opt/cicy-koubo \
+    && tag="$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')" \
+    && test -f "/opt/cicy-koubo/package/app/app-${tag}.pyc" \
+    && rm -f /tmp/cicy-koubo.tgz \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+
+COPY docker/gpu/entrypoint.sh /opt/cicy-koubo/entrypoint.sh
+RUN chmod 0755 /opt/cicy-koubo/entrypoint.sh
+
+EXPOSE 8770
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=4 \
+  CMD curl -fsS "http://127.0.0.1:${KOUBO_PORT}/" >/dev/null || exit 1
+
+ENTRYPOINT ["/opt/cicy-koubo/entrypoint.sh"]
+CMD ["serve"]

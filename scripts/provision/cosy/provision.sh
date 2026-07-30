@@ -35,15 +35,18 @@ retry() {
 
 rm -f $WORK/COSY_READY
 mkdir -p $WORK "$PIP_CACHE_DIR" "$HF_HOME"
-nvidia-smi --query-gpu=name --format=csv,noheader || die "no GPU"
+if [ "${CICY_DOCKER_BUILD:-0}" = "1" ]; then
+  log "GPU validation deferred to runtime"
+else
+  nvidia-smi --query-gpu=name --format=csv,noheader || die "no GPU"
+fi
 log "下载加速: 共享缓存 + 并行分片 + 断点续传 + 5 次重试"
 
 log "1/6 micromamba + python 3.10 + pynini(conda-forge)"
-MM=/content/mt/bin/micromamba
+MM=$WORK/bin/micromamba
 if [ ! -x "$MM" ]; then
   mkdir -p $WORK/bin
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
-  MM=$WORK/bin/micromamba
 fi
 [ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.10 pip "pynini==2.1.5" || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python
@@ -62,7 +65,7 @@ grep -v -iE 'openai-whisper|deepspeed' $REPO/requirements.txt > /tmp/cosy-req.tx
 $PIP install -q -r /tmp/cosy-req.txt 2>&1 | tail -3 || log "requirements 部分失败,兜底补装"
 # zero-shot 推理关键依赖兜底
 $PIP install -q modelscope modelscope-hub onnxruntime librosa soundfile hyperpyyaml omegaconf \
-  conformer inflect gdown "diffusers==0.29.0" transformers || die "关键依赖补装失败"
+  conformer inflect gdown edge-tts "diffusers==0.29.0" transformers || die "关键依赖补装失败"
 # openai-whisper:CosyVoice2 加载模型时 import whisper;它在构建隔离下会崩,numpy 就绪后免隔离装
 $PY -c "import whisper" 2>/dev/null || \
   $PIP install -q --no-build-isolation openai-whisper || \
@@ -110,15 +113,18 @@ snapshot_download(
   }
 
 log "5/6 TTS 封装脚本"
-curl -fsSL $RAW/cosyvoice_tts.py -o $WORK/cosyvoice_tts.py || die "tts.py download"
+test -s "$WORK/cosyvoice_tts.py" || die "预上传的 cosyvoice_tts.py 缺失"
+chmod +x "$WORK/cosyvoice_tts.py"
 
 log "6/6 冒烟:加载模型"
-$PY -c "
+if [ "${CICY_DOCKER_BUILD:-0}" != "1" ]; then
+  $PY -c "
 import sys; sys.path.append('$REPO'); sys.path.append('$REPO/third_party/Matcha-TTS')
 from cosyvoice.cli.cosyvoice import CosyVoice2
 m=CosyVoice2('$REPO/pretrained_models/CosyVoice2-0.5B', load_jit=False, load_trt=False, fp16=False)
 print('model load ok, sr=', m.sample_rate)
 " || die "model load failed"
+fi
 
 echo "ready_at=$(date -u +%FT%TZ)" > $WORK/COSY_READY
 log "DONE — COSY_READY written"

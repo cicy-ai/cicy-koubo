@@ -4,6 +4,7 @@
  *   npx cicy-koubo --install-only  只安装/检查运行依赖,不启动服务
  *   npx cicy-koubo --cft      同时开 cloudflared 快速隧道,打印公网 URL
  *   npx cicy-koubo --port N   指定端口
+ *   npx cicy-koubo --open     启动后主动打开浏览器(默认不打开)
  */
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
@@ -17,11 +18,13 @@ if (argv.includes('--help') || argv.includes('-h')) {
   npx cicy-koubo            本地启动(默认端口 8770)
   npx cicy-koubo --install-only  安装并检查运行依赖,不启动服务
   npx cicy-koubo --cft      额外开 cloudflared 快速隧道,输出公网 https 地址
-  npx cicy-koubo --port N   指定端口`);
+  npx cicy-koubo --port N   指定端口
+  npx cicy-koubo --open     启动后主动打开浏览器(默认不打开)`);
   process.exit(0);
 }
 const useCft = argv.includes('--cft');
 const installOnly = argv.includes('--install-only');
+const openBrowser = argv.includes('--open');
 const port = (() => {
   const i = argv.indexOf('--port');
   return i >= 0 && argv[i + 1] ? parseInt(argv[i + 1], 10) : 8770;
@@ -180,7 +183,7 @@ waitUp().then(() => {
   console.log('──────────────────────────────────────────────');
   if (useCft) tunProc = startTunnel();
   else console.log('  提示: 加 --cft 可得到一个公网 https 地址\n');
-  if (process.platform === 'darwin' && !process.env.KOUBO_NO_OPEN)
+  if (openBrowser && process.platform === 'darwin')
     sh('open', ['http://127.0.0.1:' + port]);
 }).catch((e) => {
   console.error('\n启动失败: ' + e.message + '\n' + errBuf.slice(-800));

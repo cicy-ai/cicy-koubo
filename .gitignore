@@ -1,6 +1,8 @@
 src/vendor/
 __pycache__
-app/assets/
+app/assets/*
+!app/assets/fonts/
+!app/assets/fonts/**
 app/jobs/
 app/media/
 app/thumbs/

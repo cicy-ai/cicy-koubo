@@ -1,0 +1,15 @@
+[Unit]
+Description=CiCy Koubo GPU API container
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cicy-koubo-api-run
+ExecStop=/usr/bin/docker stop -t 30 cicy-koubo-api
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

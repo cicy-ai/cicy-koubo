@@ -85,12 +85,52 @@ video.prev.no-controls::-webkit-media-controls{opacity:0;pointer-events:none}
 .stage{font-size:12px;color:var(--teal-d);background:var(--teal-l);border-radius:8px;
   padding:7px 10px;margin-top:8px;display:none;line-height:1.5;white-space:pre-line}
 .stage.err{color:var(--red);background:#fdf0ee}
+#genStage{box-sizing:border-box;min-width:0;max-width:100%;overflow-x:hidden;
+  max-height:210px;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;
+  word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .switch{display:flex;align-items:center;gap:6px;font-size:12px;color:#4a555e;cursor:pointer;user-select:none}
 .switch input{accent-color:var(--teal);width:15px;height:15px;margin:0}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.subgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.subgrid .cell{font-size:11px;color:var(--mut)}
-.subgrid input,.subgrid select{width:100%;border:1px solid var(--line);border-radius:6px;padding:5px 6px;font-size:12px}
+.subgrid{display:grid;grid-template-columns:70px minmax(0,1fr) minmax(0,1fr);gap:7px}
+.subgrid .cell{font-size:11px;color:var(--mut);min-width:0;white-space:nowrap}
+.subgrid .font-field{grid-column:1/-1}
+.subgrid input:not([type=hidden]),.subgrid select{display:block;width:100%;height:31px;margin-top:3px;
+  border:1px solid var(--line);border-radius:7px;padding:5px 8px;font-size:12px}
+.subgrid .color-trigger,.subgrid .font-picker-trigger{margin-top:3px}
+.font-field{position:relative}
+.font-picker-trigger{width:100%;height:31px;border:1px solid var(--line);border-radius:7px;background:#fff;
+  padding:4px 7px;display:flex;align-items:center;justify-content:space-between;gap:5px;cursor:pointer;color:var(--ink)}
+.font-picker-trigger:hover,.font-picker-trigger.active{border-color:var(--teal);box-shadow:0 0 0 2px var(--teal-l)}
+.font-picker-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.font-picker-arrow{font-size:9px;color:var(--mut);flex:none}
+.font-picker-menu{position:fixed;z-index:94;width:360px;max-height:360px;overflow-y:auto;padding:7px;
+  background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 36px rgba(27,44,54,.22);display:none}
+.font-picker-menu.show{display:block}
+.font-option{width:100%;border:0;background:#fff;border-radius:8px;padding:9px 10px;cursor:pointer;text-align:left;
+  display:flex;flex-direction:column;gap:4px;color:var(--ink)}
+.font-option:hover{background:#f2f8f6}.font-option.selected{background:var(--teal-l);color:var(--teal-d)}
+.font-option-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font:11px -apple-system,"PingFang SC",sans-serif;color:var(--mut)}
+.font-option.selected .font-option-head{color:var(--teal-d)}
+.font-option-preview{display:block;width:100%;height:38px;object-fit:contain;object-position:left center}
+.font-option-check{font-size:12px;font-weight:700}
+.color-field{position:relative}
+.color-trigger{width:100%;height:31px;border:1px solid var(--line);border-radius:7px;background:#fff;
+  padding:4px 7px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--ink)}
+.color-trigger:hover,.color-trigger.active{border-color:var(--teal);box-shadow:0 0 0 2px var(--teal-l)}
+.color-swatch{width:20px;height:20px;border-radius:5px;border:1px solid rgba(0,0,0,.14);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.28);flex:none}
+.color-hex{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.2px}
+.color-popover{position:fixed;z-index:95;width:258px;padding:13px;background:#fff;border:1px solid var(--line);
+  border-radius:12px;box-shadow:0 12px 36px rgba(27,44,54,.22);display:none}
+.color-popover.show{display:block}
+#colorPickerMount{display:flex;justify-content:center}
+.color-popover-row{display:flex;align-items:center;gap:8px;margin-top:10px}
+.color-popover-row input{min-width:0;flex:1;height:32px;border:1px solid var(--line);border-radius:7px;
+  padding:6px 8px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase}
+.color-presets{display:grid;grid-template-columns:repeat(8,1fr);gap:5px;margin-top:10px}
+.color-preset{width:24px;height:24px;padding:0;border-radius:6px;border:1px solid rgba(0,0,0,.14);
+  cursor:pointer;box-shadow:inset 0 0 0 1px rgba(255,255,255,.22)}
+.color-preset:hover{transform:scale(1.12)}
 .drop{border:1.5px dashed #b9c6cd;border-radius:8px;padding:10px;text-align:center;
   font-size:12px;color:var(--mut);cursor:pointer;transition:.15s}
 .drop:hover,.drop.on{border-color:var(--teal);color:var(--teal-d);background:var(--teal-l)}
@@ -389,7 +429,8 @@ html.modal-open,body.modal-open{overflow:hidden}
     <div style="height:10px"></div>
     <div class="row">
       <button class="btn ghost" onclick="openSttSettings()" title="参考音频转写设置" aria-label="参考音频转写设置">⚙</button>
-      <button class="btn big" style="margin-top:0;flex:1" id="btn-tts" onclick="genAudio()">4. 🎙 生成配音</button>
+      <button class="btn big" style="margin-top:0;flex:1" id="btn-tts" onclick="genAudio()"
+        disabled title="正在检查 GPU 连接状态">4. 🎙 生成配音</button>
     </div>
     <div class="stage" id="ttsStage"></div>
     <div class="lbl" style="margin-top:12px">配音结果 <span class="kv" id="ttsInfo"></span></div>
@@ -418,7 +459,8 @@ html.modal-open,body.modal-open{overflow:hidden}
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
     </div>
-    <button class="btn big" id="btn-gen" onclick="genVideo()">5. 🎬 生成视频</button>
+    <button class="btn big" id="btn-gen" onclick="genVideo()"
+      disabled title="正在检查 GPU 连接状态">5. 🎬 生成视频</button>
     <div class="stage" id="genStage"></div>
     <div class="lbl" style="margin-top:12px">成片 <span class="kv" id="genInfo"></span></div>
     <video class="prev" id="resultPrev" controls playsinline></video>
@@ -433,10 +475,25 @@ html.modal-open,body.modal-open{overflow:hidden}
     </div>
     <textarea class="ta small" id="subText" placeholder="点「按配音生成」得到逐句时间轴字幕,或手写"></textarea>
     <div class="subgrid" style="margin-top:6px">
-      <div class="cell">字体<select id="subFont"></select></div>
+      <div class="cell font-field">字体
+        <input id="subFont" type="hidden" value="variety">
+        <button class="font-picker-trigger" id="fontPickerTrigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span class="font-picker-label">综艺粗圆体·参考图风格</span><span class="font-picker-arrow">▼</span>
+        </button>
+      </div>
       <div class="cell">字号(px)<input id="subSize" type="number" min="8" value="14"></div>
-      <div class="cell">字色<input id="subColor" type="color" value="#FFFFFF"></div>
-      <div class="cell">描边<input id="subOutline" type="color" value="#000000"></div>
+      <div class="cell color-field">字色
+        <input id="subColor" type="hidden" value="#FFD91A">
+        <button class="color-trigger" type="button" data-color-for="subColor" aria-label="选择字幕字色">
+          <span class="color-swatch"></span><span class="color-hex">#FFD91A</span>
+        </button>
+      </div>
+      <div class="cell color-field">描边
+        <input id="subOutline" type="hidden" value="#111111">
+        <button class="color-trigger" type="button" data-color-for="subOutline" aria-label="选择字幕描边颜色">
+          <span class="color-swatch"></span><span class="color-hex">#111111</span>
+        </button>
+      </div>
     </div>
     <div class="row"><span class="kv">字幕安全区</span><input type="range" id="subMb" min="20" max="500" step="10" value="300"
       oninput="$('mbV').textContent=this.value"><b class="kv" id="mbV">300</b></div>
@@ -606,7 +663,7 @@ html.modal-open,body.modal-open{overflow:hidden}
       <div class="settings-section-head"><div><div class="settings-section-title" id="engineSectionTitle">生成引擎</div><div class="settings-section-desc" id="engineSectionDesc">配音、数字人与字幕能力的安装状态</div></div></div>
       <div id="engineHint"></div>
       <div id="coreEngineInstallActions" style="display:none;margin:10px 0 12px">
-        <button class="btn" id="installCoreEnginesBtn" onclick="installCoreEngines(this)">⚡ 一键并发安装 MuseTalk + CosyVoice</button>
+        <button class="btn" id="installCoreEnginesBtn" onclick="installCoreEngines(this)">⚡ 并发安装 MuseTalk + CosyVoice + HeyGem</button>
       </div>
       <div id="engineList"></div>
     </section>
@@ -620,6 +677,18 @@ html.modal-open,body.modal-open{overflow:hidden}
   <div class="settings-footer">
     <button class="btn ghost" onclick="closeInstallModal()">关闭</button>
   </div>
+</div>
+
+<div class="color-popover" id="colorPopover" role="dialog" aria-label="字幕颜色选择器">
+  <div id="colorPickerMount"></div>
+  <div class="color-popover-row">
+    <input id="colorHexInput" maxlength="7" spellcheck="false" aria-label="HEX 颜色值">
+    <button class="btn ghost" type="button" style="padding:6px 9px" onclick="closeColorPicker()">完成</button>
+  </div>
+  <div class="color-presets" id="colorPresets" aria-label="常用字幕颜色"></div>
+</div>
+<div class="font-picker-menu" id="fontPickerMenu" role="listbox" aria-label="字幕字体">
+  <div style="padding:12px;color:var(--mut);font-size:12px">正在加载字体…</div>
 </div>
 
 <!-- Colab OAuth modal -->
@@ -639,8 +708,160 @@ html.modal-open,body.modal-open{overflow:hidden}
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@jaames/iro@5.5.2/dist/iro.min.js"
+  integrity="sha384-oZxUObEswsFY+jlvIkPj4iWF3WW1I6vMNyzoakb3v99l1DtAoF/VyBTrNKtSCVoa"
+  crossorigin="anonymous"></script>
 <script>
 const $=id=>document.getElementById(id);
+let subtitleFonts=[];
+function positionFontPicker(){
+  const trigger=$('fontPickerTrigger'),menu=$('fontPickerMenu'),r=trigger.getBoundingClientRect();
+  const width=Math.max(280,Math.min(r.width,420)),gap=8;
+  menu.style.width=width+'px';
+  menu.style.left=Math.max(10,Math.min(r.left,window.innerWidth-width-10))+'px';
+  const roomBelow=window.innerHeight-r.bottom-gap-12;
+  const roomAbove=r.top-gap-12;
+  const openAbove=roomBelow<230&&roomAbove>roomBelow;
+  const maxHeight=Math.max(170,Math.min(360,openAbove?roomAbove:roomBelow));
+  menu.style.maxHeight=maxHeight+'px';
+  menu.style.top=(openAbove?Math.max(10,r.top-maxHeight-gap):r.bottom+gap)+'px';
+}
+function closeFontPicker(){
+  $('fontPickerMenu').classList.remove('show');
+  $('fontPickerTrigger').classList.remove('active');
+  $('fontPickerTrigger').setAttribute('aria-expanded','false');
+}
+function selectSubtitleFont(id){
+  const font=subtitleFonts.find(x=>x.id===id)||subtitleFonts[0];if(!font)return;
+  $('subFont').value=font.id;persist($('subFont'));
+  $('subFont').dispatchEvent(new Event('change',{bubbles:true}));
+  const label=$('fontPickerTrigger').querySelector('.font-picker-label');
+  label.textContent=font.name;label.style.fontFamily='';
+  document.querySelectorAll('.font-option').forEach(x=>x.classList.toggle('selected',x.dataset.fontId===font.id));
+  closeFontPicker();
+}
+function renderFontPicker(fonts){
+  subtitleFonts=fonts||[];
+  const current=subtitleFonts.some(x=>x.id===$('subFont').value)?$('subFont').value:(subtitleFonts[0]?.id||'');
+  $('fontPickerMenu').innerHTML=subtitleFonts.map(font=>{
+    return `<button type="button" class="font-option" role="option" data-font-id="${font.id}">
+      <span class="font-option-head"><span>${font.name}</span><span class="font-option-check">✓</span></span>
+      <img class="font-option-preview" alt="${font.name}预览" data-src="/api/fonts/${encodeURIComponent(font.id)}/preview.png">
+    </button>`;
+  }).join('');
+  selectSubtitleFont(current);
+}
+function initSubtitleFontPicker(){
+  $('fontPickerTrigger').addEventListener('click',e=>{
+    e.stopPropagation();const open=$('fontPickerMenu').classList.toggle('show');
+    $('fontPickerTrigger').classList.toggle('active',open);
+    $('fontPickerTrigger').setAttribute('aria-expanded',String(open));
+    if(open){
+      positionFontPicker();
+      $('fontPickerMenu').querySelectorAll('img[data-src]').forEach(img=>{
+        img.src=img.dataset.src;delete img.dataset.src;
+      });
+    }
+  });
+  $('fontPickerMenu').addEventListener('click',e=>{
+    const option=e.target.closest('[data-font-id]');if(option)selectSubtitleFont(option.dataset.fontId);
+  });
+  document.addEventListener('click',e=>{
+    if(!e.target.closest('#fontPickerMenu')&&!e.target.closest('#fontPickerTrigger'))closeFontPicker();
+  });
+  window.addEventListener('resize',closeFontPicker);
+  document.addEventListener('scroll',e=>{
+    if(!$('fontPickerMenu').classList.contains('show'))return;
+    if(e.target===$('fontPickerMenu')||$('fontPickerMenu').contains(e.target))return;
+    positionFontPicker();
+  },true);
+}
+let subtitleColorPicker=null;
+let activeColorInput=null;
+const SUBTITLE_COLORS=['#FFFFFF','#FFF4D6','#FFE066','#FF8A65','#FF5C8A','#B388FF','#65D6FF','#71E6B1',
+  '#111827','#3B2F2F','#FFFFFF','#F5F5F4','#FDE68A','#FB7185','#A78BFA','#22D3EE'];
+function normalizeHexColor(value){
+  const raw=String(value||'').trim();
+  const full=/^#?[0-9a-f]{6}$/i.test(raw)?raw.replace(/^#/,''):'';
+  const short=/^#?[0-9a-f]{3}$/i.test(raw)?raw.replace(/^#/,'').split('').map(x=>x+x).join(''):'';
+  return (full||short)?'#'+(full||short).toUpperCase():null;
+}
+function syncColorTrigger(input){
+  const trigger=document.querySelector(`[data-color-for="${input.id}"]`);
+  if(!trigger)return;
+  trigger.querySelector('.color-swatch').style.background=input.value;
+  trigger.querySelector('.color-hex').textContent=input.value.toUpperCase();
+}
+function setActiveColor(value,fromPicker=false){
+  const color=normalizeHexColor(value);
+  if(!color||!activeColorInput)return false;
+  activeColorInput.value=color;
+  syncColorTrigger(activeColorInput);
+  $('colorHexInput').value=color;
+  persist(activeColorInput);
+  activeColorInput.dispatchEvent(new Event('change',{bubbles:true}));
+  if(!fromPicker&&subtitleColorPicker)subtitleColorPicker.color.hexString=color;
+  return true;
+}
+function positionColorPopover(trigger){
+  const pop=$('colorPopover');
+  pop.classList.add('show');
+  const r=trigger.getBoundingClientRect();
+  const pw=258,ph=365,gap=8;
+  let left=Math.min(r.left,window.innerWidth-pw-10);
+  let top=r.bottom+gap;
+  if(top+ph>window.innerHeight-10)top=Math.max(10,r.top-ph-gap);
+  pop.style.left=Math.max(10,left)+'px';pop.style.top=top+'px';
+}
+function openColorPicker(inputId,trigger){
+  activeColorInput=$(inputId);
+  document.querySelectorAll('.color-trigger').forEach(x=>x.classList.toggle('active',x===trigger));
+  if(!window.iro){
+    const value=prompt('输入 HEX 颜色，例如 #FFFFFF',activeColorInput.value);
+    if(value&&!setActiveColor(value))toast('颜色格式应为 #RRGGBB');
+    return;
+  }
+  if(!subtitleColorPicker){
+    subtitleColorPicker=new iro.ColorPicker('#colorPickerMount',{
+      width:220,color:activeColorInput.value,layout:[
+        {component:iro.ui.Wheel},
+        {component:iro.ui.Slider,options:{sliderType:'value'}}
+      ]
+    });
+    subtitleColorPicker.on('color:change',color=>setActiveColor(color.hexString,true));
+  }else subtitleColorPicker.color.hexString=activeColorInput.value;
+  $('colorHexInput').value=activeColorInput.value;
+  positionColorPopover(trigger);
+}
+function closeColorPicker(){
+  $('colorPopover').classList.remove('show');
+  document.querySelectorAll('.color-trigger').forEach(x=>x.classList.remove('active'));
+  activeColorInput=null;
+}
+function initSubtitleColorPicker(){
+  document.querySelectorAll('.color-trigger').forEach(trigger=>{
+    const input=$(trigger.dataset.colorFor);syncColorTrigger(input);
+    trigger.addEventListener('click',e=>{e.stopPropagation();openColorPicker(input.id,trigger)});
+  });
+  $('colorPresets').innerHTML=SUBTITLE_COLORS.map(c=>
+    `<button type="button" class="color-preset" style="background:${c}" data-color="${c}" aria-label="${c}"></button>`).join('');
+  $('colorPresets').addEventListener('click',e=>{
+    const button=e.target.closest('[data-color]');if(button)setActiveColor(button.dataset.color);
+  });
+  $('colorHexInput').addEventListener('change',e=>{
+    if(!setActiveColor(e.target.value)){e.target.value=activeColorInput?.value||'#FFFFFF';toast('颜色格式应为 #RRGGBB')}
+  });
+  document.addEventListener('click',e=>{
+    if($('colorPopover').classList.contains('show')&&!$('colorPopover').contains(e.target)&&!e.target.closest('.color-trigger'))closeColorPicker();
+  });
+  window.addEventListener('resize',closeColorPicker);
+  document.addEventListener('scroll',e=>{
+    if(!$('colorPopover').classList.contains('show'))return;
+    if(e.target===$('colorPopover')||$('colorPopover').contains(e.target))return;
+    const trigger=activeColorInput&&document.querySelector(`[data-color-for="${activeColorInput.id}"]`);
+    if(trigger)positionColorPopover(trigger);
+  },true);
+}
 function syncBodyModalLock(){
   const open=[...document.querySelectorAll('.modal,#vmodal')]
     .some(el=>getComputedStyle(el).display!=='none');
@@ -681,9 +902,21 @@ function persistInit(){document.querySelectorAll('input[id],textarea[id],select[
     localStorage.setItem(PK+'subSize','14');
     localStorage.setItem(PK+'subtitleFont14V1','1');
   }
-  if(localStorage.getItem(PK+'subtitleTypefaceHeavyV1')!=='1'){
-    localStorage.setItem(PK+'subFont','heavy');
-    localStorage.setItem(PK+'subtitleTypefaceHeavyV1','1');
+  if(localStorage.getItem(PK+'subtitleVarietyStyleV1')!=='1'){
+    $('subFont').value='variety';
+    $('subColor').value='#FFE33B';
+    $('subOutline').value='#3B3023';
+    localStorage.setItem(PK+'subFont','variety');
+    localStorage.setItem(PK+'subColor','#FFE33B');
+    localStorage.setItem(PK+'subOutline','#3B3023');
+    localStorage.setItem(PK+'subtitleVarietyStyleV1','1');
+  }
+  if(localStorage.getItem(PK+'subtitleCleanYellowStyleV2')!=='1'){
+    $('subColor').value='#FFD91A';
+    $('subOutline').value='#111111';
+    localStorage.setItem(PK+'subColor','#FFD91A');
+    localStorage.setItem(PK+'subOutline','#111111');
+    localStorage.setItem(PK+'subtitleCleanYellowStyleV2','1');
   }
   $('spdV').textContent=(+$('speed').value).toFixed(2);
   $('bgmV').textContent=Math.round($('bgmVol').value*100)+'%';
@@ -1069,18 +1302,24 @@ function saveSttSettings(){
 }
 async function genAudio(){
   if(ttsRunning)return toast('已有配音任务正在运行，请等待完成');
+  if($('topGpuMode')?.value==='colab'&&!(await refreshColabActionAvailability())){
+    openInstallModal();
+    return toast('请先启动 Colab 会话');
+  }
   const s2=$('script2').value.trim(),s1=$('script1').value.trim();
   const text=s2||s1;if(!text)return toast('先填/改写文案');
   const which=s2?'改写后文案':'原始文案';
   const languageCode=$('ttsLanguage').value||'zh-CN';
   const languageName=$('ttsLanguage').selectedOptions[0]?.textContent||languageCode;
-  if(!confirm(`将用【${which}】配音,共 ${text.length} 字\n语言：${languageName} (${languageCode})\n开头:${text.slice(0,40)}…\n\n语速 ${$('speed').value}x · ${$('ttsMode').value==='whole'?'整段':'分段'}生成`))return;
-  const b=$('btn-tts');ttsRunning=true;b.disabled=true;b.textContent='配音中(长文案约1-2分钟)…';
+  toast(`开始生成 ${languageName} 配音 · ${text.length}字 · ${$('speed').value}x`);
+  const b=$('btn-tts');ttsRunning=true;b.disabled=true;b.textContent='配音中…';
   stage('ttsStage',`准备生成 ${languageName} (${languageCode}) · 参考音色：${$('refSel').selectedOptions[0]?.textContent||'默认'}`);
   logUiError(`[配音] 语言确认 · ${languageName} (${languageCode}) · ${text.length}字`,'info');
   const stopTtsLogMonitor=await startTaskLogMonitor(
     'ttsStage',
-    line=>line.includes('[CiCy GPU 配音]')||line.includes('[参考音频转写]')
+    line=>line.includes('[CiCy GPU 配音]')
+      ||line.includes('[参考音频转写]')
+      ||/\[配音 [0-9a-f]+\]/.test(line)
   );
   try{
     let preparedReferenceId='';
@@ -1160,19 +1399,89 @@ let cicyGpuReadyPromise=null;
 let cicyGpuBilling={startedAt:0,endedAt:0,rate:0,actual:null,status:''};
 let cicyGpuBusy=false;
 let cicyGpuApiReady=false;
+let colabSessionConnected=false;
+let colabTtsEngineReady=false;
+let colabVideoEngineReady=false;
+let localGpuConnected=false;
 let ttsRunning=false,videoRunning=false;
+let ttsServerRecovered=false;
+async function syncTtsServerState(){
+  try{
+    const response=await fetch('/api/tts/status',{cache:'no-store'});
+    if(!response.ok)return;
+    const state=await response.json();
+    if(state.active&&!ttsRunning){
+      ttsServerRecovered=true;
+      ttsRunning=true;
+      const button=$('btn-tts');
+      if(button)button.textContent='配音中…';
+      syncGpuActionAvailability();
+    }else if(!state.active&&ttsServerRecovered){
+      ttsServerRecovered=false;
+      ttsRunning=false;
+      const button=$('btn-tts');
+      if(button)button.textContent='4. 🎙 生成配音';
+      syncGpuActionAvailability();
+      loadMediaTab();
+    }
+  }catch(_){}
+}
 function syncGpuActionAvailability(){
   const cloudMode=$('topGpuMode')?.value==='cicy_gpu';
-  const blocked=cloudMode&&!cicyGpuApiReady;
-  for(const [id,label,running] of [
-    ['btn-tts','请先启动 GPU，等待顶部显示“已就绪”',ttsRunning],
-    ['btn-gen','请先启动 GPU，等待顶部显示“已就绪”',videoRunning],
+  const colabMode=$('topGpuMode')?.value==='colab';
+  const localMode=$('topGpuMode')?.value==='local';
+  const runtimeBlocked=(cloudMode&&!cicyGpuApiReady)
+    ||(colabMode&&!colabSessionConnected)
+    ||(localMode&&!localGpuConnected);
+  const blockedLabel=colabMode
+    ?'请先在系统管理中授权并启动 Colab 会话'
+    :(localMode?'请先启动本地 GPU 服务':'请先启动 GPU，等待顶部显示“已就绪”');
+  for(const [id,running,engineReady,engineLabel] of [
+    ['btn-tts',ttsRunning,colabTtsEngineReady,'CosyVoice 正在安装或尚未安装'],
+    ['btn-gen',videoRunning,colabVideoEngineReady,'MuseTalk 正在安装或尚未安装'],
   ]){
     const button=$(id);
     if(!button)continue;
-    button.disabled=blocked||running;
-    button.title=blocked?label:'';
+    const engineBlocked=colabMode&&!engineReady;
+    button.disabled=runtimeBlocked||engineBlocked||running;
+    button.title=runtimeBlocked?blockedLabel:(engineBlocked?engineLabel:'');
   }
+}
+async function refreshColabActionAvailability(){
+  if($('topGpuMode')?.value!=='colab'){
+    colabSessionConnected=false;
+    syncGpuActionAvailability();
+    return false;
+  }
+  // Fail closed while the current status request is in flight. Never keep a
+  // previous session's ready state during "正在检查".
+  colabSessionConnected=false;
+  syncGpuActionAvailability();
+  try{
+    const response=await fetch('/api/colab/session',{cache:'no-store'});
+    const state=await response.json();
+    colabSessionConnected=response.ok&&state.running===true&&state.credentials_ready===true;
+  }catch(_){
+    colabSessionConnected=false;
+  }
+  syncGpuActionAvailability();
+  return colabSessionConnected;
+}
+async function refreshLocalGpuActionAvailability(){
+  if($('topGpuMode')?.value!=='local'){
+    localGpuConnected=false;
+    syncGpuActionAvailability();
+    return false;
+  }
+  try{
+    const response=await fetch('/api/local-gpu/status',{cache:'no-store'});
+    const state=await response.json();
+    localGpuConnected=response.ok&&state.running===true;
+  }catch(_){
+    localGpuConnected=false;
+  }
+  syncGpuActionAvailability();
+  return localGpuConnected;
 }
 function resetCicyGpuUi(){
   cicyGpuControlJob='';cicyGpuRequestId='';cicyGpuReadyPromise=null;cicyGpuBusy=false;
@@ -1305,6 +1614,28 @@ async function refreshGpuModeHeader(){
     const mode=cfg.provider||'cicy_gpu';
     $('topGpuMode').value=mode;
     if(mode!=='cicy_gpu')cicyGpuApiReady=false;
+    if(mode==='colab'){
+      await refreshColabActionAvailability();
+      try{
+        const engineData=await fetchEngineStatus(false);
+        _engineState=engineData.engines||[];
+        colabTtsEngineReady=!!_engineState.find(
+          engine=>engine.key==='cosy'&&engine.installed&&!engine.installing
+        );
+        colabVideoEngineReady=!!_engineState.find(
+          engine=>engine.key==='mt'&&engine.installed&&!engine.installing
+        );
+      }catch(_){
+        colabTtsEngineReady=false;
+        colabVideoEngineReady=false;
+      }
+    }else{
+      colabSessionConnected=false;
+      colabTtsEngineReady=false;
+      colabVideoEngineReady=false;
+    }
+    if(mode==='local')await refreshLocalGpuActionAvailability();
+    else localGpuConnected=false;
     syncGpuActionAvailability();
     $('gpuAccount').classList.toggle('on',mode==='cicy_gpu');
     $('gpuRuntimeName').textContent=mode==='cicy_gpu'?'CiCy GPU':(mode==='colab'?'Colab GPU':'本地 GPU');
@@ -1337,6 +1668,9 @@ async function changeTopGpuMode(provider){
   const data=await aj(response);
   if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);
   await refreshGpuModeHeader();
+  await syncTtsServerState();
+  setInterval(syncTtsServerState,3000);
+  if(provider==='colab')await refreshColabActionAvailability();
   await refreshStatus(true);
   toast(provider==='cicy_gpu'?'已切换到 CiCy GPU':'GPU 模式已立即切换');
 }
@@ -1631,8 +1965,12 @@ function syncEditAvailability(){
 }
 function previewBase(){
   const v=$('baseSel').value;if(!v)return;
+  const player=$('basePrev');
+  if(player.dataset.assetId===v&&player.getAttribute('src'))return;
   videoBlob=null;
-  $('basePrev').src='/api/basevideos/'+v;$('basePrev').style.display='block';
+  player.dataset.assetId=v;
+  player.src='/api/basevideos/'+encodeURIComponent(v);
+  player.style.display='block';
 }
 function bindDrop(dropId,fileId,onFile){
   const dp=$(dropId),fi=$(fileId);
@@ -1643,21 +1981,26 @@ function bindDrop(dropId,fileId,onFile){
     if(e.dataTransfer.files[0])onFile(e.dataTransfer.files[0])};
 }
 async function genVideo(){
+  if($('topGpuMode')?.value==='colab'&&!(await refreshColabActionAvailability())){
+    openInstallModal();
+    return toast('请先启动 Colab 会话');
+  }
   if(videoRunning)return toast('已有视频任务正在运行，请等待完成');
   const hasAudio=!!(audioBlob||voiceId);
   let mode=$('genMode').value;
   if(!hasAudio&&mode==='lipsync'){
-    if(!confirm('没有配音/音频,只能「底板测试」出无声片。继续?'))return;
+    toast('没有配音，将生成无声底板测试');
     mode='simple';
   }
   const b=$('btn-gen');videoRunning=true;b.disabled=true;b.textContent='生成中…';
-  stage('genStage','⬆️ 提交任务…');
+  stage('genStage',mode==='simple'?'🖥 本机正在准备底板预览…':'⬆️ 正在提交对口型任务…');
   const stopVideoLogMonitor=await startTaskLogMonitor(
     'genStage',
     line=>line.includes('[CiCy GPU 出片]')
+      ||/\[出片 [0-9a-f]+\]/.test(line)
   );
   try{
-    await ensureCicyGpu('genStage');
+    if(mode!=='simple')await ensureCicyGpu('genStage');
     const fd=new FormData();
     if(videoBlob)fd.append('video',videoBlob);
     else if($('baseSel').value)fd.append('base_id',$('baseSel').value);
@@ -1694,11 +2037,20 @@ async function pollJob(jid,btn,mode){
     }else if(d.error){stage('genStage','❌ '+d.error,true);
       videoRunning=false;btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return;
     }else{
-      const details=(d.log||[]).slice(-5).join('\n');
-      stage('genStage',`⏳ ${d.stage}${Number.isFinite(Number(d.progress))?' · '+Number(d.progress)+'%':''}${details?'\n'+details:''}`);
+      const phaseMatch=String(d.stage||'').match(/^lipsync_phase_(\d+)_of_(\d+)_frame_(\d+)_of_(\d+)$/);
+      const stageLabel=phaseMatch
+        ? `对口型 · 阶段 ${phaseMatch[1]}/${phaseMatch[2]} · 帧 ${phaseMatch[3]}/${phaseMatch[4]}`
+        : (d.stage==='finalizing_video'?'正在封装视频和音频':String(d.stage||'处理中'));
+      const details=(d.log||[])
+        .map(line=>String(line||'').replace(/\x1b\[[0-9;]*m/g,'').trim())
+        .filter(line=>line&&!/^\*{8,}/.test(line))
+        .slice(-5)
+        .map(line=>line.length>180?line.slice(0,177)+'…':line)
+        .join('\n');
+      stage('genStage',`⏳ ${stageLabel}${Number.isFinite(Number(d.progress))?' · 总进度 '+Number(d.progress)+'%':''}${details?'\n'+details:''}`);
     }
-    setTimeout(()=>pollJob(jid,btn),mode==='simple'?1000:4000);
-  }catch(e){setTimeout(()=>pollJob(jid,btn),mode==='simple'?2000:6000)}
+    setTimeout(()=>pollJob(jid,btn,mode),mode==='simple'?1000:4000);
+  }catch(e){setTimeout(()=>pollJob(jid,btn,mode),mode==='simple'?2000:6000)}
 }
 function dlResult(){if(curJob)location.href='/api/result/'+curJob}
 
@@ -1736,7 +2088,7 @@ async function editVideo(){
     const fd=new FormData();
     fd.append('job_id',curJob);
     fd.append('text',$('subText').value);
-    fd.append('font',$('subFont').value||'heavy');
+    fd.append('font',$('subFont').value||'variety');
     fd.append('fontsize',$('subSize').value);fd.append('color',$('subColor').value);
     fd.append('outline',$('subOutline').value);fd.append('mb',$('subMb').value);
     if(bgm){fd.append('bgm_id',bgm);fd.append('bgm_vol',vol)}
@@ -1784,25 +2136,43 @@ function dlCover(){if(!coverUrl)return;const a=document.createElement('a');
   a.href=coverUrl;a.download='cover.jpg';a.click()}
 
 /* ---------- 下拉数据 ---------- */
-async function loadSelects(preferVoiceId=''){
-  const stamp=Date.now();
-  const [vs,bs,gs,fs,es]=await Promise.all([
-    fetch('/api/voices?_='+stamp,{cache:'no-store'}).then(r=>r.json()),
-    fetch('/api/basevideos?_='+stamp,{cache:'no-store'}).then(r=>r.json()),
-    fetch('/api/bgms').then(r=>r.json()),fetch('/api/fonts').then(r=>r.json()),
-    fetch('/api/engines').then(r=>r.json())]);
+async function fetchJsonOr(url,fallback){
+  try{
+    const response=await fetch(url,{cache:'no-store'});
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  }catch(error){
+    logUiError(`[初始化] ${url} 加载失败，已使用空数据继续 · ${error?.message||error}`);
+    return fallback;
+  }
+}
+async function loadEngineState(){
+  const es=await fetchJsonOr('/api/engines',{engines:[]});
   _engineState=es.engines||[];
   _engineStateAt=Date.now();
+  applyLipsyncEngineSelect(es);
+  toggleGenMode();
+  return es;
+}
+async function loadSelects(preferVoiceId=''){
+  const stamp=Date.now();
+  // 素材和组件优先渲染；耗时数秒的引擎健康检查放到后台，不能阻塞整页。
+  const [vs,bs,gs,fs]=await Promise.all([
+    fetchJsonOr('/api/voices?_='+stamp,[]),
+    fetchJsonOr('/api/basevideos?_='+stamp,[]),
+    fetchJsonOr('/api/bgms',[]),
+    fetchJsonOr('/api/fonts',[])]);
   fillSel('refSel',[['','-- 请选择参考音色 --'],...vs.map(v=>[v.id,`${v.name}(${v.duration}s)`])],
     preferVoiceId||localStorage.getItem(PK+'refSel'));
   fillSel('baseSel',bs.map(v=>[v.id,`${v.name}(${v.duration}s)`]),localStorage.getItem(PK+'baseSel'));
   // 选中值存在但后台初始化会丢: fillSel 确认后主动触发 onchange 同步预览
   if ($('baseSel').value) previewBase();
   fillSel('bgmSel',[['','不用 BGM'],...gs.map(v=>[v.id,`${v.name}(${Math.round(v.duration)}s)`])],localStorage.getItem(PK+'bgmSel'));
-  fillSel('subFont',fs.map(f=>[f.id,f.name]),localStorage.getItem(PK+'subFont'));
+  renderFontPicker(fs);
   $('cnt-voice').textContent=vs.length;$('cnt-base').textContent=bs.length;$('cnt-bgm').textContent=gs.length;
-  applyLipsyncEngineSelect(es);
+  applyLipsyncEngineSelect({engines:_engineState||[]});
   toggleGenMode();
+  loadEngineState();
   return {vs,bs,gs};
 }
 function applyLipsyncEngineSelect(es){
@@ -2153,6 +2523,7 @@ let _engineStatusRequest = null;
 let _colabRuntimeTimer = null;
 let _colabMetricsTimer = null;
 let _colabControlPending = false;
+let _colabAssignmentConflict = false;
 let _localGpuState = null;
 let _operationLogTimer = null;
 function fmtGB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
@@ -2164,12 +2535,12 @@ async function openInstallModal() {
   closeTitlePrompt();
   closeSttSettings();
   $('imask').style.display = 'block'; $('iModal').style.display = 'flex';
-  switchSettingsTab(localStorage.getItem(PK+'settingsTab') || 'runtime');
+  switchSettingsTab('runtime');
   // The header poll owns the global health snapshot. Opening settings reads
   // that snapshot immediately; detailed hardware/account data refreshes in
   // the background and never blocks the modal.
   if (_globalHealth) renderSettingsHealth();
-  else await refreshStatus();
+  else renderSettingsHealth();
   if (_engineState?.length) {
     $('engineList').innerHTML=_engineState.map(engineCardHTML).join('');
     applyLipsyncEngineSelect({engines:_engineState});
@@ -2185,17 +2556,23 @@ async function refreshOperationLogs(force=false){
   try{
     const text=await (await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'})).text();
     if(force||box.textContent!==text){
-      const follow=box.scrollHeight-box.scrollTop-box.clientHeight<80;
       box.textContent=text||'(暂无日志)';
-      if(follow||force)box.scrollTop=box.scrollHeight;
+      requestAnimationFrame(()=>{box.scrollTop=box.scrollHeight});
     }
-  }catch(e){box.textContent='日志读取失败：'+(e?.message||e)}
+  }catch(e){
+    box.textContent='日志读取失败：'+(e?.message||e);
+    requestAnimationFrame(()=>{box.scrollTop=box.scrollHeight});
+  }
 }
 
 function switchSettingsTab(tab) {
   if (!document.querySelector(`[data-settings-panel="${tab}"]`)) tab = 'runtime';
   document.querySelectorAll('[data-settings-tab]').forEach(el => el.classList.toggle('on', el.dataset.settingsTab === tab));
   document.querySelectorAll('[data-settings-panel]').forEach(el => el.classList.toggle('on', el.dataset.settingsPanel === tab));
+  if(tab==='logs'){
+    const box=$('operationLog');
+    requestAnimationFrame(()=>{if(box)box.scrollTop=box.scrollHeight});
+  }
   document.querySelector('.settings-body')?.classList.toggle('logs-active',tab==='logs');
   localStorage.setItem(PK+'settingsTab', tab);
 }
@@ -2278,7 +2655,7 @@ async function refreshSystemSettings(force=false) {
       engineHint = '<div style="margin:8px 0 4px;font-size:12px;color:var(--mut)">💡 GPU 容器内直接运行生成引擎。</div>';
     } else if (s.gpu_mode === 'colab_cli') {
       engineHint = '<div style="margin:8px 0 4px;font-size:12px;color:var(--mut)">💡 Colab CLI 模式: 引擎在远程 Colab 运行，本地无需安装 GPU 引擎。但需要:</div>'
-        + '<div style="margin:0 0 4px 12px;font-size:11px;color:var(--mut)">• Colab CLI 已安装 · Colab 账号已登录 · GPU session 可用</div>';
+        + '<div style="margin:0 0 4px 12px;font-size:11px;color:var(--mut)">• Colab CLI 已安装 · Colab 账号已登录 · GPU 会话必须处于运行中</div>';
     }
     const gpuSummary=s.gpu_mode==='cicy_gpu'?'云端临时 GPU · 按需启动'
       :(s.gpu_name||'无')+' · '+fmtGB(s.gpu_memory_mb)+(s.cuda_version?' · CUDA '+s.cuda_version:'');
@@ -2326,6 +2703,8 @@ async function loadLocalGpuSettings(){
   try{
     const response=await fetch('/api/local-gpu/status',{cache:'no-store'});
     const s=await response.json();_localGpuState=s;
+    localGpuConnected=response.ok&&s.running===true;
+    syncGpuActionAvailability();
     const health=s.health||{};
     const state=s.running?'运行中':(s.installed?(s.status==='running'?'启动中':'已停止'):'未安装');
     box.innerHTML=`<div class="engine-card">
@@ -2343,7 +2722,11 @@ async function loadLocalGpuSettings(){
       </div>
       ${s.logs?`<pre class="logbox show" style="margin-top:10px">${esc(s.logs)}</pre>`:''}
     </div>`;
-  }catch(e){box.innerHTML=`<div class="empty">本地 GPU 状态读取失败：${esc(e?.message||e)}</div>`}
+  }catch(e){
+    localGpuConnected=false;
+    syncGpuActionAvailability();
+    box.innerHTML=`<div class="empty">本地 GPU 状态读取失败：${esc(e?.message||e)}</div>`;
+  }
 }
 
 async function controlLocalGpu(action,btn){
@@ -2449,14 +2832,18 @@ function renderColabSessionStatus() {
   if (startBtn) {
     startBtn.style.display=d.running?'none':'';
     startBtn.disabled = _colabControlPending || d.running || !authorized;
-    if(_colabControlPending&&!d.running)startBtn.textContent='处理中…';
+    startBtn.textContent=_colabControlPending&&!d.running
+      ?'处理中…'
+      :`▶ 启动 ${activeProfile?.gpu||'GPU'} 会话`;
     startBtn.title = !authorized ? '请先授权 Google 账号' : (d.running ? '当前会话已在运行，请先停止后再重新创建' : '');
   }
   if (stopBtn) {
-    stopBtn.style.display=d.running?'':'none';
-    stopBtn.disabled = _colabControlPending || !d.running;
+    stopBtn.style.display=(d.running||_colabAssignmentConflict)?'':'none';
+    stopBtn.disabled = _colabControlPending || (!d.running&&!_colabAssignmentConflict);
+    stopBtn.textContent=_colabAssignmentConflict&&!d.running?'■ 释放旧会话':'■ 停止会话';
     if(_colabControlPending&&d.running)stopBtn.textContent='处理中…';
-    stopBtn.title = d.running ? '停止当前会话' : '';
+    stopBtn.title = d.running ? '停止当前会话'
+      : (_colabAssignmentConflict?'释放当前 Google 账号残留的 Colab GPU 会话':'');
   }
   if (!d.running) {
     el.innerHTML = d.account_mismatch
@@ -2480,6 +2867,8 @@ async function loadColabSessionStatus() {
   clearInterval(_colabRuntimeTimer);
   clearInterval(_colabMetricsTimer);
   const requestedProfile = _colabState?.active;
+  colabSessionConnected=false;
+  syncGpuActionAvailability();
   try {
     const r = await fetch('/api/colab/session');
     if (!r.ok) throw new Error('HTTP '+r.status);
@@ -2488,19 +2877,35 @@ async function loadColabSessionStatus() {
     // response belonging to a profile that is no longer selected.
     if (requestedProfile !== _colabState?.active || nextState.profile_id !== _colabState?.active) return;
     _colabSessionState = nextState;
+    colabSessionConnected=nextState.running===true&&nextState.credentials_ready===true;
+    syncGpuActionAvailability();
     renderColabSessionStatus();
     if (_colabSessionState.running) _colabRuntimeTimer = setInterval(renderColabSessionStatus, 1000);
     if (_colabSessionState.running) _colabMetricsTimer = setInterval(loadColabSessionStatus, 30000);
   } catch (_) {
+    colabSessionConnected=false;
+    syncGpuActionAvailability();
     const el = $('colabSessionStatus');
     if (el && requestedProfile === _colabState?.active) el.textContent = '会话状态读取失败';
   }
 }
 
-function addColabProfileForm() {
+async function addColabProfileForm() {
   const id = 'google-' + Date.now();
-  _colabState.profiles.push({id,name:'新 Google 账号',auth:'oauth2',credentials_path:'',session:'koubo-'+id,gpu:'T4',credentials_ready:false});
-  renderColabProfiles();
+  const profile={id,name:'新 Google 账号',auth:'oauth2',credentials_path:'',
+    session:'koubo-'+id,gpu:'T4',email:''};
+  try{
+    const response=await fetch('/api/colab/profiles',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({profile})
+    });
+    const data=await response.json();
+    if(!response.ok||data.error)throw new Error(data.error||'HTTP '+response.status);
+    await loadColabProfiles();
+    toast('新 Google 账号已创建，请点击“授权”');
+  }catch(error){
+    toast('新增 Google 账号失败：'+(error?.message||error));
+  }
 }
 
 async function saveColabProfile(id, btn) {
@@ -2538,6 +2943,12 @@ async function authorizeColabProfile(id, btn) {
     const sr = await fetch('/api/colab/oauth/start',{method:'POST'});
     const sd = await sr.json();
     if (!sr.ok || sd.error) throw new Error(sd.error||'HTTP '+sr.status);
+    if(sd.already_authorized){
+      closeColabOauthModal();
+      toast(`Google 账号已授权${sd.email?'：'+sd.email:''}`);
+      await loadColabProfiles();
+      return;
+    }
     $('colabOauthUrl').value = sd.auth_url;
     $('colabOauthCopy').disabled = false;
     $('colabOauthSubmit').disabled = false;
@@ -2601,20 +3012,17 @@ async function setActiveColabProfile(id) {
     // 仅刷新 Colab 和引擎区域，保留系统设置当前 Tab、滚动位置及其它表单状态。
     await loadColabProfiles();
     await refreshEngines();
-  } catch(e) { toast('切换失败: '+e.message); }
+  } catch(e) {
+    toast('切换失败: '+e.message);
+    throw e;
+  }
 }
 
 async function controlColabSession(action, btn) {
   if(_colabControlPending)return toast('会话操作正在处理中，请勿重复点击');
   if (!_colabSessionState) return toast('正在检查会话状态，请稍候');
   if (action === 'start' && _colabSessionState.running) return toast('当前会话已在运行');
-  const verb = action === 'start' ? '创建' : (_colabSessionState.running ? '停止' : '释放');
-  const prompt = action === 'start'
-    ? '创建当前 Google 账号的 Colab 会话？会消耗该账号的计算单元。'
-    : (_colabSessionState.running
-      ? '停止当前 Google 账号的 Colab 会话？'
-      : '释放当前 Google 账号在 Colab 端可能残留的旧会话占用？');
-  if (!confirm(prompt)) return;
+  const actionLabel=action==='start'?'启动':'停止';
   _colabControlPending=true;
   btn.disabled = true; const old = btn.textContent; btn.textContent = '处理中…';
   try {
@@ -2623,16 +3031,23 @@ async function controlColabSession(action, btn) {
     const d = await r.json();
     if (!r.ok || d.error) {
       if (d.code === 'colab_assignment_conflict') {
-        toast('旧的 Colab GPU 会话尚未释放，请先点“停止”，稍后再启动');
+        _colabAssignmentConflict=true;
         await loadColabSessionStatus();
+        toast('检测到旧的 Colab GPU 会话，请点击“释放旧会话”后重试');
         return;
       }
-      throw new Error(d.error||'HTTP '+r.status);
+      if (d.code === 'colab_service_unavailable' || r.status === 503) {
+        toast('Google Colab 暂时无法分配 GPU，请稍后重试');
+        return;
+      }
+      toast(`${actionLabel}失败：${d.error||'HTTP '+r.status}`);
+      return;
     }
+    _colabAssignmentConflict=false;
     toast(action==='start'?'✅ Colab 会话已启动':'✅ Colab 会话已停止');
     await loadColabProfiles();
     await refreshEngines();
-  } catch(e) { toast(verb+'失败: '+e.message); }
+  } catch(e) { toast(`${actionLabel}失败：${e.message}`); }
   finally {
     _colabControlPending=false;
     btn.disabled = false; btn.textContent = old;
@@ -2685,6 +3100,14 @@ function engineCardHTML(e) {
     verHtml = '<div class="ev">' + Object.entries(e.version_info)
       .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
   }
+  const metricHtml=e.installed
+    ? `<div class="ev" style="margin-top:4px;color:#52616b">
+        ⏱ 安装耗时：${e.install_seconds==null?'未知':formatRuntime(Math.round(e.install_seconds))}
+        · 💾 磁盘：${e.builtin
+          ?'随 CosyVoice（不额外占用）'
+          :fmtGB(Number(e.disk_bytes||0)/1024/1024)}
+      </div>`
+    : '';
   const estHtml = (!e.installed && e.install_hint)
     ? `<div class="ev" style="color:#66737c;font-size:11px">💡 ${esc(e.install_hint)}</div>`
     : '';
@@ -2707,6 +3130,7 @@ function engineCardHTML(e) {
     <div class="eb">
       <div class="en">${e.name} ${badge} ${remoteBadge} ${e.builtin?'(CosyVoice 内置)':(e.has_script?'':'(缺安装脚本)')}</div>
       ${verHtml}
+      ${metricHtml}
       ${estHtml}
       ${noteHtml}
     </div>
@@ -2735,7 +3159,7 @@ async function fetchEngineStatus(force=false){
   const controller=new AbortController();
   const timeoutId=setTimeout(()=>controller.abort(),35000);
   try{
-    const response=await fetch('/api/engines',{cache:'no-store',signal:controller.signal});
+    const response=await fetch('/api/engines'+(force?'?probe=1':''),{cache:'no-store',signal:controller.signal});
     if(!response.ok)throw new Error('HTTP '+response.status);
     const data=await response.json();
     _engineState=data.engines||[];
@@ -2747,9 +3171,17 @@ async function fetchEngineStatus(force=false){
 }
 
 async function refreshEngines(force=false) {
+  if($('topGpuMode')?.value==='colab'){
+    colabTtsEngineReady=false;
+    colabVideoEngineReady=false;
+    syncGpuActionAvailability();
+  }
   try {
     const d = await fetchEngineStatus(force);
     _engineState = d.engines || [];
+    colabTtsEngineReady=!!_engineState.find(e=>e.key==='cosy'&&e.installed&&!e.installing);
+    colabVideoEngineReady=!!_engineState.find(e=>e.key==='mt'&&e.installed&&!e.installing);
+    syncGpuActionAvailability();
     applyLipsyncEngineSelect(d);
     renderSettingsHealth();
     // Snapshot visible logs BEFORE replacing engineList. EventSource callbacks
@@ -2791,6 +3223,9 @@ async function refreshEngines(force=false) {
     }
   } catch (e) {
     _engineState = [];
+    colabTtsEngineReady=false;
+    colabVideoEngineReady=false;
+    syncGpuActionAvailability();
     $('coreEngineInstallActions').style.display='none';
     $('engineList').innerHTML = `<div class="empty">${e?.name==='AbortError'?'Colab 响应超时，请检查会话后刷新':'加载引擎状态失败：'+esc(e?.message||e)}</div>`;
     renderSettingsHealth();
@@ -2801,6 +3236,9 @@ async function refreshCards() {
   try {
     const d = await fetchEngineStatus(true);
     _engineState = d.engines || [];
+    colabTtsEngineReady=!!_engineState.find(e=>e.key==='cosy'&&e.installed&&!e.installing);
+    colabVideoEngineReady=!!_engineState.find(e=>e.key==='mt'&&e.installed&&!e.installing);
+    syncGpuActionAvailability();
     applyLipsyncEngineSelect(d);
     renderSettingsHealth();
     d.engines.forEach(e => updateEngineCard(e));
@@ -2808,7 +3246,11 @@ async function refreshCards() {
     if (d.engines.some(e => e.installing)) {
       _engineTimer = _engineTimer || setTimeout(() => { _engineTimer = null; refreshCards(); }, 5000);
     }
-  } catch (e) {}
+  } catch (e) {
+    colabTtsEngineReady=false;
+    colabVideoEngineReady=false;
+    syncGpuActionAvailability();
+  }
 }
 
 function toggleLog(key, auto) {
@@ -2946,7 +3388,6 @@ async function pollLog(key) {
 }
 
 async function installEngine(key,btn) {
-  if (!confirm('确定要安装/重装 '+key+' 吗？这会覆盖之前的安装。')) return;
   const oldText=btn?.textContent;
   if(btn){btn.disabled=true;btn.textContent='⏳ 正在连接 Colab…'}
   const card=document.querySelector(`[data-engine="${key}"]`);
@@ -2967,25 +3408,23 @@ async function installEngine(key,btn) {
 }
 
 async function installCoreEngines(btn) {
-  const core=(_engineState||[]).filter(e=>e.key==='mt'||e.key==='cosy');
-  if(core.length!==2)return toast('引擎状态尚未确认，请先刷新');
-  if(core.every(e=>e.installed))return toast('MuseTalk 和 CosyVoice 均已安装，无需重复安装');
-  if (!confirm('同时安装 MuseTalk 和 CosyVoice？两个任务会在 Colab 中并发执行，并分别显示实时日志。')) return;
-  const old=btn.textContent;btn.disabled=true;btn.textContent='⏳ 正在启动两个安装任务…';
-  const keys=['mt','cosy'];
+  const core=(_engineState||[]).filter(e=>['mt','cosy','hg'].includes(e.key));
+  if(core.length!==3)return toast('引擎状态尚未确认，请先刷新');
+  if(core.every(e=>e.installed))return toast('MuseTalk、CosyVoice、HeyGem 均已安装，无需重复安装');
+  const old=btn.textContent;btn.disabled=true;btn.textContent='⏳ 正在并发启动…';
+  const keys=['cosy','mt','hg'].filter(key=>!core.find(engine=>engine.key===key)?.installed);
   keys.forEach(key=>{if(!_openLogs[key])toggleLog(key,true)});
   try {
-    const results=await Promise.all(keys.map(async key=>{
+    await Promise.all(keys.map(async key=>{
       const r=await fetch('/api/engines/'+key+'/install',{method:'POST'});
       const d=await r.json();
       if(!r.ok||d.error)throw new Error(`${key}: ${d.error||'HTTP '+r.status}`);
-      return {key,d};
+      return d;
     }));
-    toast('MuseTalk 与 CosyVoice 已并发开始安装');
-    await refreshEngines();
-    setTimeout(()=>keys.forEach(key=>pollLog(key)),500);
+    toast('MuseTalk、CosyVoice、HeyGem 已并发启动');
+    await refreshEngines(true);
   } catch(e) {
-    toast('并发安装启动失败：'+(e?.message||e));
+    toast('安装失败：'+(e?.message||e));
     await refreshEngines();
   } finally {
     btn.disabled=false;btn.textContent=old;
@@ -2994,7 +3433,7 @@ async function installCoreEngines(btn) {
 
 /* ---------- 启动 ---------- */
 (async function init(){
-  persistInit();bindUploads();
+  persistInit();initSubtitleFontPicker();initSubtitleColorPicker();bindUploads();
   syncEditAvailability();
   $('ttsLanguage').value=localStorage.getItem(PK+'ttsLanguage')||'zh-CN';
   $('ttsLanguage').addEventListener('change',()=>{
@@ -3024,10 +3463,16 @@ async function installCoreEngines(btn) {
     }catch(e){}
   }
   if(curJob){
-    const r=await fetch('/api/result/'+curJob,{method:'HEAD'}).catch(()=>null);
-    if(r&&r.ok){$('resultPrev').src='/api/result/'+curJob;$('resultPrev').style.display='block';
+    const r=await fetch('/api/job/'+curJob,{cache:'no-store'}).catch(()=>null);
+    const job=r&&r.ok?await r.json().catch(()=>null):null;
+    if(job?.result||job?.status==='succeeded'){
+      $('resultPrev').src='/api/result/'+curJob;$('resultPrev').style.display='block';
       $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+curJob;
       hasGeneratedVideo=true;
+    }else if(job?.status==='running'||job?.status==='queued'){
+      videoRunning=true;
+      const btn=$('btn-gen');btn.disabled=true;btn.textContent='生成中…';
+      pollJob(curJob,btn);
     }else{
       curJob='';localStorage.removeItem(PK+'curJob');
     }

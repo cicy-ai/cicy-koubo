@@ -1,6 +1,6 @@
 {
   "name": "cicy-koubo",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "爆款口播视频制作 — 一条命令启动本地数字人口播工作台(文案提取/AI仿写/CosyVoice配音/MuseTalk对口型/字幕BGM封面),--cft 直接给出 cloudflared 公网地址",
   "bin": {
     "cicy-koubo": "bin/cli.js"

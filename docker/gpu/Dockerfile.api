@@ -1,0 +1,26 @@
+ARG BASE_IMAGE=cicy-koubo-gpu:2026.07.28
+FROM ${BASE_IMAGE}
+
+ARG GPU_API_VERSION=0.1.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    KOUBO_API_HOST=0.0.0.0 \
+    KOUBO_API_PORT=8770 \
+    KOUBO_API_STATE_DIR=/var/lib/cicy-koubo-api \
+    PYTHONPATH=/opt/cicy-koubo-api/current
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl openssl python3 python3-flask python3-gunicorn \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY gpu_api /opt/cicy-koubo-api/releases/${GPU_API_VERSION}/gpu_api
+RUN ln -s "/opt/cicy-koubo-api/releases/${GPU_API_VERSION}" \
+      /opt/cicy-koubo-api/current \
+    && mkdir -p /var/lib/cicy-koubo-api
+
+EXPOSE 8770 8771
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=4 \
+  CMD curl -fsS "http://127.0.0.1:${KOUBO_API_PORT}/live" >/dev/null || exit 1
+
+ENTRYPOINT ["sh", "-c", "exec python3 -m gunicorn.app.wsgiapp --bind 0.0.0.0:${KOUBO_API_PORT} --workers 1 --threads 8 --timeout 0 --access-logfile - gpu_api.server:app"]

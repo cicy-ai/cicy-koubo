@@ -109,16 +109,22 @@ class GpuApiTest(unittest.TestCase):
         job.progress = 25
         (job.directory / "musetalk.log").write_text(
             "TensorFlow optional backend warning\n"
-            "60%|██████    | 138/231 [01:02<00:37, 2.49it/s]\n",
+            "100%|██████████| 231/231 [01:40<00:00, 2.31it/s]\n"
+            "Starting inference\n"
+            "60%|██████    | 46/77 [01:35<00:50, 1.64s/it]\n",
             encoding="utf-8",
         )
         payload = self.client.get(
             f"/v1/jobs/{job.id}", headers=self.auth()
         ).get_json()
-        self.assertEqual(payload["progress"], 60)
-        self.assertEqual(payload["stage"], "lipsync_frame_138_of_231")
-        self.assertEqual(payload["frames_completed"], 138)
-        self.assertEqual(payload["frames_total"], 231)
+        self.assertEqual(payload["progress"], 38)
+        self.assertEqual(
+            payload["stage"], "lipsync_phase_2_of_4_frame_46_of_77"
+        )
+        self.assertEqual(payload["phase"], 2)
+        self.assertEqual(payload["phase_progress"], 60)
+        self.assertEqual(payload["frames_completed"], 46)
+        self.assertEqual(payload["frames_total"], 77)
         self.assertIn("TensorFlow optional backend warning", payload["log"])
 
     def test_job_ids_are_validated(self):
