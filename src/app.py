@@ -13,17 +13,21 @@ import html
 import os
 import pathlib
 import re
+import secrets
 import shlex
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.error
+import urllib.request
 import uuid
 
 from flask import Flask, request, jsonify, send_file, Response
 
 _edit_lock = threading.Lock()
+_tts_lock = threading.Lock()
 
 SRC_DIR = pathlib.Path(__file__).resolve().parent      # src/
 ROOT = SRC_DIR.parent / "app"                            # 项目根下的 app/
@@ -110,6 +114,15 @@ def _get_gpu_memory_mb():
     except Exception:
         return 0
 
+
+def _is_wsl():
+    try:
+        return "microsoft" in pathlib.Path("/proc/version").read_text(
+            encoding="utf-8", errors="ignore",
+        ).lower()
+    except OSError:
+        return False
+
 def detect_gpu_mode():
     """自动检测 GPU 模式:
       macOS → colab_cli
@@ -119,6 +132,11 @@ def detect_gpu_mode():
     """
     if os.environ.get("KOUBO_GPU_MODE"):
         return os.environ["KOUBO_GPU_MODE"]
+    configured = (load_global_cfg().get("koubo", {}).get("gpu", {}).get("provider") or "").lower()
+    if configured in {"cicy_gpu", "local"}:
+        return configured
+    if configured in {"colab", "colab_cli"}:
+        return "colab_cli"
     # 强制本地模式(跑在 Colab 上)
     if LOCAL_GPU:
         return "local"
@@ -132,6 +150,619 @@ def detect_gpu_mode():
     return "colab_cli"
 
 GPU_MODE = detect_gpu_mode()
+
+# CiCy GPU control-plane sessions are deliberately process-local.  The
+# long-lived Gateway key stays in global.json; per-job GPU authorization never
+# gets written to disk or exposed to the browser UI.
+_CICY_GPU_SESSIONS = {}
+_CICY_GPU_ACTIVE_JOB_ID = ""
+_CICY_GPU_PREPARED_REFERENCES = {}
+_CICY_GPU_RESULT_ASSETS = {}
+
+def _local_gpu_conf():
+    """Read the token written by the Windows installer without exposing it."""
+    endpoint = os.environ.get("KOUBO_LOCAL_GPU_ENDPOINT", "http://cicy-koubo-gpu:8771").rstrip("/")
+    candidates = []
+    configured = os.environ.get("CICY_KOUBO_LOCAL_CONFIG", "")
+    if configured:
+        candidates.append(pathlib.Path(configured))
+    candidates.extend(pathlib.Path("/mnt").glob("*/CiCy/koubo-local/config.json"))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            token = str(data.get("token") or "")
+            if token:
+                return endpoint, token
+        except (OSError, ValueError):
+            continue
+    return endpoint, ""
+
+def _local_gpu_install_root():
+    mounts = []
+    for candidate in pathlib.Path("/mnt").glob("*"):
+        try:
+            if candidate.is_dir():
+                mounts.append((_sht.disk_usage(candidate).free, candidate))
+        except OSError:
+            continue
+    base = max(mounts, default=(0, pathlib.Path.home()), key=lambda item: item[0])[1]
+    return base / "CiCy" / "koubo-local"
+
+
+def _local_gpu_docker_status():
+    endpoint, token = _local_gpu_conf()
+    root = _local_gpu_install_root()
+    for candidate in pathlib.Path("/mnt").glob("*/CiCy/koubo-local/config.json"):
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if data.get("token"):
+                root = candidate.parent
+                break
+        except (OSError, ValueError):
+            continue
+    docker_ok = _sht.which("docker") is not None
+    status_text = "not_installed"
+    logs = ""
+    if docker_ok:
+        probe = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", "cicy-koubo-gpu"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if probe.returncode == 0:
+            status_text = probe.stdout.strip() or "stopped"
+            if status_text != "running":
+                log_result = subprocess.run(
+                    ["docker", "logs", "--tail", "30", "cicy-koubo-gpu"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                logs = (log_result.stdout + log_result.stderr)[-4000:]
+        elif token:
+            status_text = "stopped"
+    health = {}
+    if status_text == "running" and token:
+        try:
+            health = _local_gpu_request("GET", "/v1/health", token, timeout=8)
+        except Exception as exc:
+            health = {"ok": False, "error": str(exc)}
+    return {
+        "installed": bool(token),
+        "docker_available": docker_ok,
+        "status": status_text,
+        "running": status_text == "running" and bool(health.get("ok")),
+        "endpoint": endpoint,
+        "root": str(root),
+        "health": health,
+        "logs": logs,
+    }
+
+
+def _local_gpu_request(method, route, token, payload=None, timeout=120):
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "cicy-koubo/0.1.8"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request_obj = urllib.request.Request(
+        _local_gpu_conf()[0] + route, data=data, headers=headers, method=method,
+    )
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+        request_obj, timeout=timeout,
+    ) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _local_gpu_multipart(route, token, fields, files, timeout=600):
+    """Stream local files with curl; credentials are supplied via stdin, not argv."""
+    endpoint = _local_gpu_conf()[0] + route
+    args = ["curl", "-fsS", "--max-time", str(timeout), "--config", "-"]
+    for name, value in fields.items():
+        args.extend(["-F", f"{name}={value}"])
+    for name, file_path in files.items():
+        args.extend(["-F", f"{name}=@{file_path}"])
+    config = f'header = "Authorization: Bearer {token}"\n'
+    result = subprocess.run(args + [endpoint], input=config, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError("本地 GPU 上传失败：" + (result.stderr or "")[-300:])
+    return json.loads(result.stdout)
+
+
+def _local_gpu_wait(job_id, token, timeout_seconds=1800):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        job = _local_gpu_request(
+            "GET", "/v1/jobs/" + urllib.parse.quote(job_id, safe=""), token, timeout=30,
+        )
+        if job.get("status") == "succeeded":
+            return job
+        if job.get("status") in {"failed", "cancelled"}:
+            raise RuntimeError(job.get("error") or f"本地 GPU {job.get('status')}")
+        time.sleep(2)
+    raise RuntimeError("本地 GPU 任务超时")
+
+
+def _local_gpu_download(job_id, token, destination):
+    request_obj = urllib.request.Request(
+        _local_gpu_conf()[0] + "/v1/jobs/" + urllib.parse.quote(job_id, safe="") + "/result",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "cicy-koubo/0.1.8"},
+    )
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+        request_obj, timeout=600,
+    ) as response, open(destination, "wb") as output:
+        _sht.copyfileobj(response, output)
+
+
+def _local_gpu_tts():
+    endpoint, token = _local_gpu_conf()
+    if not token:
+        return jsonify({"error": "本地 GPU 尚未安装或访问 Token 不可用"}), 503
+    text = (request.form.get("text") or ((request.get_json(silent=True) or {}).get("text")) or "").strip()
+    if not text:
+        return jsonify({"error": "没有要配音的文案"}), 400
+    ref_id = (request.form.get("ref_id") or "").strip()
+    if ref_id.startswith("voice-sample-") and (ROOT / "assets" / ref_id).is_file():
+        ref = ROOT / "assets" / ref_id
+    elif "ref" in request.files and request.files["ref"].filename:
+        ref = WORK / (uuid.uuid4().hex[:8] + "_ref" + pathlib.Path(request.files["ref"].filename).suffix)
+        request.files["ref"].save(ref)
+    else:
+        samples = sorted((ROOT / "assets").glob("voice-sample-*.wav"))
+        if not samples:
+            return jsonify({"error": "没有参考音色"}), 400
+        ref = samples[-1]
+    reference_text = _transcribe(str(ref), (request.form.get("stt_provider") or "auto").strip())
+    if not reference_text:
+        return jsonify({"error": "参考音频转写失败"}), 400
+    try:
+        created = _local_gpu_multipart("/v1/tts-jobs", token, {
+            "text": text, "reference_text": reference_text,
+        }, {"reference": ref})
+        _local_gpu_wait(created["id"], token)
+        jid = uuid.uuid4().hex[:10]
+        dst = MEDIA_DIR / f"voice_{jid}.wav"
+        _local_gpu_download(created["id"], token, dst)
+        _normalize_voice_output(dst)
+        duration = _ffdur(dst)
+        _media_add({"id": jid, "type": "voice", "file": dst.name, "text": text[:100],
+                    "chars": len(text), "duration": duration, "ts": time.strftime("%m-%d %H:%M")})
+        return jsonify({"id": jid, "url": f"/api/media/{jid}/file",
+                        "duration": duration, "chars": len(text)})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "code": "local_gpu_failed"}), 502
+
+
+def _local_gpu_video():
+    endpoint, token = _local_gpu_conf()
+    if not token:
+        return jsonify({"error": "本地 GPU 尚未安装或访问 Token 不可用"}), 503
+    audio_id = (request.form.get("audio_id") or "").strip()
+    audio_entry = next((x for x in _media_list() if x.get("id") == audio_id), None)
+    audio = MEDIA_DIR / audio_entry["file"] if audio_entry else None
+    base_id = (request.form.get("base_id") or "").strip()
+    video = ROOT / "assets" / base_id if base_id.startswith("base-video-") else None
+    if not audio or not audio.is_file() or not video or not video.is_file():
+        return jsonify({"error": "缺少本地底板或配音素材"}), 400
+    try:
+        created = _local_gpu_multipart("/v1/video-jobs", token, {
+            "engine": request.form.get("engine") or "musetalk",
+            "bbox": request.form.get("bbox") or "0",
+        }, {"video": video, "audio": audio})
+        job_id = created["id"]
+        JOBS[job_id] = {"stage": "本地 GPU 处理中", "log": [], "result": None, "error": None}
+        def finish_local():
+            try:
+                _local_gpu_wait(job_id, token)
+                dst_dir = WORK / job_id
+                dst_dir.mkdir(exist_ok=True)
+                _local_gpu_download(job_id, token, dst_dir / "result.mp4")
+                JOBS[job_id].update(stage="完成", result=job_id)
+            except Exception as exc:
+                JOBS[job_id].update(stage="失败", error=str(exc))
+        threading.Thread(target=finish_local, daemon=True).start()
+        return jsonify({"job_id": job_id})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "code": "local_gpu_failed"}), 502
+
+
+def _cicy_gateway_conf():
+    cfg = load_global_cfg()
+    for provider in cfg.get("providers", {}).get("items", []):
+        url = str(provider.get("url") or "").rstrip("/")
+        key = str(provider.get("apiKey") or "")
+        if "gateway.cicy-ai.com" in url and key.startswith("sk-cicy-"):
+            return url, key
+    return "", ""
+
+
+def _cicy_gateway_request(method, path, payload=None, idempotency_key=""):
+    base_url, api_key = _cicy_gateway_conf()
+    if not base_url or not api_key:
+        raise RuntimeError("global.json 中没有可用的 CiCy Gateway Key")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        # Cloudflare Browser Integrity rejects urllib's default
+        # "Python-urllib/*" signature with Error 1010.
+        "User-Agent": "cicy-koubo/0.1.8",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    req = urllib.request.Request(
+        base_url + path, data=data, headers=headers, method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            result = json.loads(raw)
+        except Exception:
+            result = {"success": False, "error": raw or f"HTTP {exc.code}"}
+        return exc.code, result
+
+
+def _cicy_gpu_proxy(path, complete_on_success=False):
+    session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+    endpoint = str(session.get("endpoint") or "").rstrip("/")
+    authorization = str(session.get("authorization_token") or "")
+    if not endpoint or not authorization:
+        return jsonify({
+            "error": "CiCy GPU 尚未就绪，请先申请 GPU 并等待临时 Endpoint",
+            "code": "cicy_gpu_not_ready",
+        }), 503
+    headers = {
+        "Authorization": f"Bearer {authorization}",
+        "Accept": request.headers.get("Accept", "application/json"),
+    }
+    if request.content_type:
+        headers["Content-Type"] = request.content_type
+    data = request.get_data(cache=True) if request.method not in {"GET", "HEAD"} else None
+    query = ("?" + request.query_string.decode()) if request.query_string else ""
+    upstream = urllib.request.Request(
+        endpoint + path + query, data=data, headers=headers, method=request.method,
+    )
+    try:
+        # The ephemeral GPU endpoint is a direct public IP. Do not send its
+        # authenticated upload/download traffic through the user's HTTP proxy.
+        response = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+        ).open(upstream, timeout=7200)
+        status = response.status
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        control_job_id = _CICY_GPU_ACTIVE_JOB_ID
+
+        def stream():
+            completed = False
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        completed = True
+                        break
+                    yield chunk
+            finally:
+                response.close()
+                if completed and complete_on_success and control_job_id:
+                    try:
+                        safe_id = urllib.parse.quote(control_job_id, safe="")
+                        _cicy_gateway_request(
+                            "POST", f"/api/koubo/jobs/{safe_id}/complete", {},
+                        )
+                        _CICY_GPU_SESSIONS.pop(control_job_id, None)
+                    except Exception as exc:
+                        plog(f"[CiCy GPU] 成品已下载，但释放通知失败: {exc}")
+
+        return Response(stream(), status=status, content_type=content_type)
+    except urllib.error.HTTPError as exc:
+        return Response(
+            exc.read(), status=exc.code,
+            content_type=exc.headers.get("Content-Type", "application/json"),
+        )
+    except urllib.error.URLError as exc:
+        return jsonify({
+            "error": f"CiCy GPU 连接失败：{exc.reason}",
+            "code": "cicy_gpu_connection_failed",
+        }), 502
+    except TimeoutError:
+        return jsonify({
+            "error": "CiCy GPU 请求超时，请重试；已有远程任务会自动清理",
+            "code": "cicy_gpu_timeout",
+        }), 504
+
+
+def _cicy_gpu_tts():
+    """Upload the local reference voice, run remote TTS, and keep the result local."""
+    session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+    endpoint = str(session.get("endpoint") or "").rstrip("/")
+    authorization = str(session.get("authorization_token") or "")
+    if not endpoint or not authorization:
+        return jsonify({
+            "error": "CiCy GPU 尚未就绪，请先申请 GPU 并等待临时 Endpoint",
+            "code": "cicy_gpu_not_ready",
+        }), 503
+
+    text = (request.form.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "没有要配音的文案"}), 400
+    try:
+        speed = max(0.5, min(1.5, float(request.form.get("speed", "1.15"))))
+    except ValueError:
+        speed = 1.15
+    language = (request.form.get("language") or "zh-CN").strip()
+    language_labels = {
+        "zh-CN": "普通话", "zh-yue": "粤语", "zh-minnan": "闽南语",
+        "zh-sichuan": "四川话", "zh-dongbei": "东北话",
+        "zh-shanghai": "上海话", "zh-tianjin": "天津话",
+        "zh-shandong": "山东话", "zh-shaanxi": "陕西话",
+        "zh-shanxi": "山西话", "en": "English", "fr": "Français",
+        "de": "Deutsch", "es": "Español", "it": "Italiano",
+        "vi": "Tiếng Việt", "id": "Bahasa Indonesia",
+        "ms": "Bahasa Melayu", "th": "ไทย", "ko": "한국어",
+        "ru": "Русский", "ar": "العربية", "km": "ខ្មែរ", "lo": "ລາວ",
+    }
+
+    gpu_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    oss_opener = urllib.request.build_opener()
+    gpu_headers = {
+        "Authorization": f"Bearer {authorization}",
+        "Content-Type": "application/json",
+        "User-Agent": "cicy-koubo/0.1.8",
+    }
+    try:
+        health_req = urllib.request.Request(
+            endpoint + "/v1/health", headers=gpu_headers,
+        )
+        with gpu_opener.open(health_req, timeout=15) as response:
+            health = json.loads(response.read().decode("utf-8"))
+        supported = set(health.get("tts_languages") or [])
+        capability = str(health.get("capabilities_version") or "")
+        if language not in supported or not capability.startswith("2026.07.30-multilingual-"):
+            return jsonify({
+                "error": (
+                    f"当前 GPU 镜像不支持 {language_labels.get(language, language)}，"
+                    "请销毁后重新启动新版 GPU"
+                ),
+                "code": "gpu_multilingual_capability_missing",
+                "language": language,
+                "capabilities_version": capability,
+            }), 409
+        plog(
+            f"[CiCy GPU 配音] 目标语言确认 · "
+            f"{language_labels.get(language, language)} ({language}) · capability={capability}"
+        )
+    except urllib.error.HTTPError as exc:
+        return jsonify({
+            "error": f"GPU 多语言能力校验失败：HTTP {exc.code}",
+            "code": "gpu_capability_check_failed",
+        }), 502
+    except Exception as exc:
+        return jsonify({
+            "error": f"GPU 多语言能力校验失败：{exc}",
+            "code": "gpu_capability_check_failed",
+        }), 502
+    prepared_id = (request.form.get("prepared_reference_id") or "").strip()
+    prepared = _CICY_GPU_PREPARED_REFERENCES.pop(prepared_id, None)
+    if prepared and prepared.get("expires_at", 0) > time.time():
+        signed = prepared["signed"]
+        reference_text = prepared["reference_text"]
+        plog("[CiCy GPU 配音] 5/6 参考音频已就绪，提交远程配音任务")
+    else:
+        ref_id = (request.form.get("ref_id") or "").strip()
+        if ref_id and ref_id.startswith("voice-sample-") and (ROOT / "assets" / ref_id).is_file():
+            ref = ROOT / "assets" / ref_id
+        elif "ref" in request.files and request.files["ref"].filename:
+            ref = WORK / (uuid.uuid4().hex[:8] + "_ref" + pathlib.Path(request.files["ref"].filename).suffix)
+            request.files["ref"].save(ref)
+        else:
+            samples = sorted((ROOT / "assets").glob("voice-sample-*.wav"))
+            if not samples:
+                return jsonify({"error": "没有参考音色,请先选择/上传一段人声样本"}), 400
+            ref = samples[-1]
+        stt_provider = (request.form.get("stt_provider") or "auto").strip()
+        try:
+            reference_text = _transcribe(str(ref), stt_provider)
+        except GroqTranscriptionError as exc:
+            return jsonify({"error": str(exc), "code": "groq_stt_failed"}), 502
+        if not reference_text:
+            return jsonify({"error": f"参考音频转写失败（{stt_provider}）"}), 400
+        sign_status, signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
+            "region_id": session.get("region_id") or "cn-hangzhou",
+            "purpose": "reference",
+            "content_type": "audio/wav",
+            "extension": "wav",
+        })
+        if sign_status >= 300:
+            return jsonify({"error": signed.get("error") or "OSS 上传签名失败"}), sign_status
+        upload_req = urllib.request.Request(
+            signed["upload_url"], data=ref.read_bytes(),
+            headers={"Content-Type": "audio/wav", "User-Agent": "cicy-koubo/0.1.8"},
+            method="PUT",
+        )
+        try:
+            with oss_opener.open(upload_req, timeout=120):
+                pass
+        except urllib.error.URLError as exc:
+            return jsonify({"error": f"OSS 上传失败：{exc.reason}"}), 502
+    try:
+        create_req = urllib.request.Request(
+            endpoint + "/v1/tts-jobs",
+            data=json.dumps({
+                "text": text,
+                "language": language,
+                "speed": speed,
+                "reference_text": reference_text,
+                "reference_url": signed["download_url"],
+            }, ensure_ascii=False).encode("utf-8"),
+            headers=gpu_headers, method="POST",
+        )
+        with gpu_opener.open(create_req, timeout=120) as response:
+            remote_job = json.loads(response.read().decode("utf-8"))["id"]
+        plog(f"[CiCy GPU 配音] 远程任务已创建 · job={remote_job}")
+        try:
+            oss_opener.open(
+                urllib.request.Request(signed["delete_url"], method="DELETE"), timeout=30,
+            ).close()
+        except Exception:
+            pass
+        last_remote_state = ("", "", -1)
+        seen_remote_logs: set[str] = set()
+        last_wait_log_at = 0.0
+        for _ in range(300):
+            status_req = urllib.request.Request(
+                endpoint + "/v1/jobs/" + urllib.parse.quote(remote_job, safe=""),
+                headers=gpu_headers,
+            )
+            try:
+                with gpu_opener.open(status_req, timeout=30) as response:
+                    remote = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError):
+                time.sleep(2)
+                continue
+            remote_stage = str(remote.get("stage") or remote.get("status") or "")
+            remote_state = (
+                str(remote.get("status") or ""),
+                remote_stage,
+                int(remote.get("progress") or 0),
+            )
+            if remote_stage and remote_state != last_remote_state:
+                last_remote_state = remote_state
+                plog(
+                    f"[CiCy GPU 配音] 远程进度 · status={remote.get('status')} "
+                    f"stage={remote_stage} progress={remote.get('progress', 0)}%"
+                )
+            for raw_line in remote.get("log") or []:
+                line = str(raw_line).strip()
+                if not line or line in seen_remote_logs:
+                    continue
+                seen_remote_logs.add(line)
+                plog(f"[CiCy GPU 配音][模型] {line[:1000]}")
+            now = time.monotonic()
+            if (
+                remote.get("status") == "running"
+                and now - last_wait_log_at >= 15
+            ):
+                last_wait_log_at = now
+                plog(
+                    f"[CiCy GPU 配音] 模型仍在运行 · stage={remote_stage} "
+                    f"progress={remote.get('progress', 0)}%"
+                )
+            if remote.get("status") == "succeeded":
+                break
+            if remote.get("status") in {"failed", "cancelled"}:
+                return jsonify({"error": remote.get("error") or "远程配音失败"}), 500
+            time.sleep(2)
+        else:
+            return jsonify({"error": "远程配音超时"}), 504
+
+        result_req = urllib.request.Request(
+            endpoint + "/v1/jobs/" + urllib.parse.quote(remote_job, safe="") + "/result",
+            headers=gpu_headers,
+        )
+        jid = uuid.uuid4().hex[:10]
+        dst = MEDIA_DIR / f"voice_{jid}.wav"
+        with gpu_opener.open(result_req, timeout=120) as response, open(dst, "wb") as output:
+            _sht.copyfileobj(response, output)
+        plog(f"[CiCy GPU 配音] 6/6 结果下载完成 · file={dst.name} bytes={dst.stat().st_size}")
+        _normalize_voice_output(dst)
+        duration = _ffdur(dst)
+        _media_add({
+            "id": jid, "type": "voice", "file": dst.name,
+            "text": text[:100], "chars": len(text), "speed": speed,
+            "duration": duration, "ts": time.strftime("%m-%d %H:%M"),
+        })
+        return jsonify({
+            "id": jid, "url": f"/api/media/{jid}/file",
+            "duration": duration, "chars": len(text),
+        })
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(raw).get("error") or raw
+        except Exception:
+            detail = raw
+        return jsonify({"error": f"远程配音失败：{detail or exc.code}"}), exc.code
+    except urllib.error.URLError as exc:
+        return jsonify({
+            "error": f"CiCy GPU 连接失败：{exc.reason}",
+            "code": "cicy_gpu_connection_failed",
+        }), 502
+
+
+def _cicy_gpu_video():
+    session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+    endpoint = str(session.get("endpoint") or "").rstrip("/")
+    authorization = str(session.get("authorization_token") or "")
+    if not endpoint or not authorization:
+        return jsonify({"error": "CiCy GPU 尚未就绪"}), 503
+    audio_id = (request.form.get("audio_id") or "").strip()
+    audio_entry = next((x for x in _media_list() if x.get("id") == audio_id), None)
+    audio = MEDIA_DIR / audio_entry["file"] if audio_entry else None
+    base_id = (request.form.get("base_id") or "").strip()
+    video = ROOT / "assets" / base_id if base_id.startswith("base-video-") else None
+    if not audio or not audio.is_file() or not video or not video.is_file():
+        return jsonify({"error": "缺少本地底板或配音素材"}), 400
+    region = session.get("region_id") or "cn-hangzhou"
+    signed_assets = []
+    for purpose, path, content_type, extension in (
+        ("video", video, "video/mp4", "mp4"),
+        ("audio", audio, "audio/wav", "wav"),
+    ):
+        status, signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
+            "region_id": region, "purpose": purpose,
+            "content_type": content_type, "extension": extension,
+        })
+        if status >= 300:
+            return jsonify({"error": signed.get("error") or "OSS 上传签名失败"}), status
+        upload = urllib.request.Request(
+            signed["upload_url"], data=path.read_bytes(),
+            headers={"Content-Type": content_type, "User-Agent": "cicy-koubo/0.1.8"},
+            method="PUT",
+        )
+        with urllib.request.build_opener().open(upload, timeout=600):
+            pass
+        signed_assets.append(signed)
+    status, result_signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
+        "region_id": region, "purpose": "result",
+        "content_type": "video/mp4", "extension": "mp4",
+    })
+    if status >= 300:
+        return jsonify({"error": result_signed.get("error") or "OSS 成片签名失败"}), status
+    gpu_headers = {
+        "Authorization": f"Bearer {authorization}",
+        "Content-Type": "application/json",
+        "User-Agent": "cicy-koubo/0.1.8",
+    }
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    payload = {
+        "video_url": signed_assets[0]["download_url"],
+        "audio_url": signed_assets[1]["download_url"],
+        "engine": "musetalk",
+        "bbox": "0",
+        "result_upload_url": result_signed["upload_url"],
+        "result_download_url": result_signed["download_url"],
+    }
+    try:
+        req = urllib.request.Request(
+            endpoint + "/v1/video-jobs",
+            data=json.dumps(payload).encode(), headers=gpu_headers, method="POST",
+        )
+        with opener.open(req, timeout=600) as response:
+            remote = json.loads(response.read().decode())
+        _CICY_GPU_RESULT_ASSETS[str(remote["id"])] = result_signed
+        for signed in signed_assets:
+            try:
+                urllib.request.build_opener().open(
+                    urllib.request.Request(signed["delete_url"], method="DELETE"), timeout=30,
+                ).close()
+            except Exception:
+                pass
+        return jsonify({"job_id": remote["id"]}), 202
+    except urllib.error.HTTPError as exc:
+        return Response(exc.read(), status=exc.code, content_type="application/json")
 
 def _colab_profiles_cfg():
     """读取 Colab CLI 配置档；凭据文件由用户在本机单独准备。"""
@@ -160,6 +791,7 @@ def _active_colab_profile():
     return {
         "id": profile.get("id") or "default",
         "name": profile.get("name") or "Google 账号",
+        "email": (profile.get("email") or "").strip(),
         "auth": (profile.get("auth") or "oauth2").lower(),
         "credentials_path": os.path.expanduser(profile.get("credentials_path") or ""),
         "session_config": os.path.expanduser(profile.get("session_config") or
@@ -177,7 +809,7 @@ _COLAB_SESSION_CACHE = {}
 
 
 def _colab_resolve_session(profile, requested=None, force=False):
-    """Resolve stale configured aliases to the active CLI session for this account."""
+    """Resolve a session alias from this profile's local CLI state."""
     configured = requested or profile["session"]
     cache_key = (profile["id"], profile["session_config"], configured)
     cached = _COLAB_SESSION_CACHE.get(cache_key)
@@ -193,13 +825,26 @@ def _colab_resolve_session(profile, requested=None, force=False):
             if isinstance(state, dict) and configured in state:
                 _COLAB_SESSION_CACHE[cache_key] = (time.time(), configured)
                 return configured
-        result = subprocess.run(
-            _colab_base_args(profile) + ["sessions"],
-            env=_colab_env(profile), capture_output=True, text=True, timeout=20,
-        )
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-        names = re.findall(r"^\s*\[[^\]]*\]\s+([^|\r\n]+?)\s*\|", output, re.M)
-        names = [name.strip() for name in names if name.strip()]
+            if isinstance(state, dict):
+                names = [str(name).strip() for name in state if str(name).strip()]
+            else:
+                names = []
+        else:
+            names = []
+        # colab-cli 0.6 can keep a live assignment even when its JSON state was
+        # cleared. Only an authorized profile may perform this network lookup;
+        # unauthorised profiles used to hang here waiting for OAuth input.
+        if not names and _colab_oauth_token_path(profile).is_file():
+            result = subprocess.run(
+                _colab_base_args(profile) + ["sessions"],
+                env=_colab_env(profile), capture_output=True, text=True, timeout=10,
+            )
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            names = [
+                name.strip()
+                for name in re.findall(r"^\s*\[[^\]]*\]\s+([^|\r\n]+?)\s*\|", output, re.M)
+                if name.strip()
+            ]
         resolved = configured if configured in names else (names[0] if names else configured)
         _COLAB_SESSION_CACHE[cache_key] = (time.time(), resolved)
         if resolved != configured:
@@ -233,11 +878,11 @@ def _colab_oauth_token_path(profile):
     return pathlib.Path.home() / ".config/cicy-koubo/colab-oauth" / profile["id"] / ".config/colab-cli/token.json"
 
 
-def _colab_exec(cmd_str, session=None, timeout=300):
+def _colab_exec(cmd_str, session=None, timeout=300, profile=None):
     """通过 colab CLI 执行远程命令，返回 (returncode, stdout)"""
     import tempfile
     colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
-    profile = _active_colab_profile()
+    profile = profile or _active_colab_profile()
     # 写一个 Python 脚本来执行命令并打印输出
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(f"import subprocess,sys,json\n"
@@ -247,8 +892,15 @@ def _colab_exec(cmd_str, session=None, timeout=300):
         tmp = f.name
     resolved_session = _colab_resolve_session(profile, session)
     args = _colab_base_args(profile) + ["exec", "-s", resolved_session, "-f", tmp, "--timeout", str(timeout)]
-    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 30,
-                       env=_colab_env(profile))
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 30,
+                           env=_colab_env(profile))
+    except FileNotFoundError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return 127, "Colab CLI 未安装或命令路径已失效"
     try:
         os.unlink(tmp)
     except Exception:
@@ -264,9 +916,9 @@ def _colab_exec(cmd_str, session=None, timeout=300):
         output = output[:m.start()].rstrip()
     return rc, output
 
-def _colab_upload(local_path, remote_path, session=None):
+def _colab_upload(local_path, remote_path, session=None, profile=None):
     """上传文件到 Colab；自动纠正失效会话名并重试瞬时网络错误。"""
-    profile = _active_colab_profile()
+    profile = profile or _active_colab_profile()
     resolved_session = _colab_resolve_session(profile, session)
     r = None
     for attempt in range(1, 4):
@@ -324,9 +976,9 @@ def _colab_session_active():
     except Exception as exc:
         return False, f"检查 Colab 会话失败：{exc}"
 
-def _colab_download(remote_path, local_path, session=None):
+def _colab_download(remote_path, local_path, session=None, profile=None):
     """从 Colab 下载文件"""
-    profile = _active_colab_profile()
+    profile = profile or _active_colab_profile()
     resolved_session = _colab_resolve_session(profile, session)
     r = subprocess.run(_colab_base_args(profile) + ["download", "-s", resolved_session,
                         remote_path, str(local_path)], env=_colab_env(profile),
@@ -357,7 +1009,9 @@ def api_logs():
     except Exception:
         content = "(暂无日志)"
     if request.args.get("raw") == "1":
-        return Response(content, mimetype="text/plain; charset=utf-8")
+        response = Response(content, mimetype="text/plain; charset=utf-8")
+        response.headers["Cache-Control"] = "no-store"
+        return response
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='color-scheme' content='light'>"
@@ -366,9 +1020,21 @@ def api_logs():
         "body{box-sizing:border-box;padding:20px}"
         "pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;"
         "font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}</style>"
-        "</head><body><pre>" + html.escape(content) + "</pre></body></html>"
+        "</head><body><pre id='log'>" + html.escape(content) + "</pre>"
+        "<script>"
+        "const el=document.getElementById('log');let last=el.textContent;"
+        "async function refresh(){try{"
+        "const r=await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'});"
+        "const text=await r.text();"
+        "if(text!==last){const follow=innerHeight+scrollY>=document.body.scrollHeight-80;"
+        "el.textContent=text;last=text;if(follow)scrollTo(0,document.body.scrollHeight);}"
+        "}catch(_){}}"
+        "setInterval(refresh,1000);scrollTo(0,document.body.scrollHeight);"
+        "</script></body></html>"
     )
-    return Response(page, mimetype="text/html; charset=utf-8")
+    response = Response(page, mimetype="text/html; charset=utf-8")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/api/ui-log")
@@ -475,7 +1141,11 @@ def _ssh_check(remote_cmd, needle, tries=3):
 
 
 def tunnel_status():
-    if GPU_MODE == "colab_cli":
+    if GPU_MODE == "cicy_gpu":
+        # CiCy GPU is provisioned per job, so an absent tunnel is the normal
+        # idle state rather than a service failure.
+        return "ready", "CiCy GPU · 按需启动"
+    elif GPU_MODE == "colab_cli":
         # colab_cli 模式:检查是否有活跃 session
         colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
         try:
@@ -489,6 +1159,21 @@ def tunnel_status():
             return "offline", "Colab CLI · 无活跃 session，需 colab new --gpu T4"
         except Exception:
             return "offline", "Colab CLI · 连接失败"
+    elif GPU_MODE == "local" and not LOCAL_GPU:
+        endpoint, token = _local_gpu_conf()
+        try:
+            health = _local_gpu_request("GET", "/v1/health", token, timeout=10)
+            tstate = "ready" if health.get("ok") else "offline"
+            tnote = f"本地 GPU Docker · {health.get('gpu') or '未就绪'}"
+            audio = "ready" if health.get("engines", {}).get("cosyvoice") else "down"
+            video = "ready" if health.get("engines", {}).get("musetalk") else "down"
+        except Exception:
+            tstate, tnote, audio, video = "offline", "本地 GPU Docker 未启动", "down", "down"
+    elif GPU_MODE == "local":
+        gpu_mb = _get_gpu_memory_mb()
+        if gpu_mb < 8192:
+            return "offline", "本机未检测到可用的 NVIDIA GPU（至少需要 8GB 显存）"
+        return "ready", f"本机 NVIDIA GPU · {gpu_mb}MB 显存"
     # SSH 模式(原有逻辑)
     for _ in range(3):
         try:
@@ -511,10 +1196,21 @@ def status():
     force = request.args.get("refresh") == "1"
     if not force and cached and now - cached[0] < 20:
         return jsonify(cached[1])
-    if GPU_MODE == "colab_cli":
+    if GPU_MODE == "cicy_gpu":
+        active_session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+        if active_session.get("endpoint"):
+            tstate, tnote = "ready", "CiCy GPU · 实例在线"
+            audio = video = "ready"
+        elif _CICY_GPU_ACTIVE_JOB_ID:
+            tstate, tnote = "provisioning", "CiCy GPU · 实例启动中"
+            audio = video = "installing"
+        else:
+            tstate, tnote = "idle", "CiCy GPU · 未启动，处理任务时按需创建"
+            audio = video = "idle"
+    elif GPU_MODE == "colab_cli":
         active, tnote = _colab_session_active()
         tstate = "ready" if active else "offline"
-        mt_ready = cosy_ready = False
+        mt_ready = cosy_is_ready = False
         if active:
             _, ready_out = _colab_exec(
                 "test -f /content/mt/READY && echo __MT_READY__; "
@@ -522,16 +1218,26 @@ def status():
                 timeout=30,
             )
             mt_ready = "__MT_READY__" in ready_out
-            cosy_ready = "__COSY_READY__" in ready_out
-        audio = "ready" if cosy_ready else ("installing" if active else "down")
+            cosy_is_ready = "__COSY_READY__" in ready_out
+        audio = "ready" if cosy_is_ready else ("installing" if active else "down")
         video = "ready" if mt_ready else ("installing" if active else "down")
+    elif GPU_MODE == "local":
+        gpu_mb = _get_gpu_memory_mb()
+        tstate = "ready" if gpu_mb >= 8192 else "offline"
+        tnote = (
+            f"本机 NVIDIA GPU · {gpu_mb}MB 显存"
+            if tstate == "ready"
+            else "本机未检测到可用的 NVIDIA GPU（至少需要 8GB 显存）"
+        )
+        audio = "ready" if tstate == "ready" and cosy_ready() else "down"
+        video = "ready" if tstate == "ready" else "down"
     else:
         tstate, tnote = tunnel_status()
         audio = "ready" if (tstate == "ready" and _cosy_ready_remote()) else \
                 ("installing" if tstate == "ready" else "down")
         video = "ready" if tstate == "ready" else "down"
     overall = "ready" if tstate == "ready" and audio == "ready" and video == "ready" else \
-              ("partial" if tstate == "ready" else "down")
+              ("idle" if tstate == "idle" else ("partial" if tstate in {"ready", "provisioning"} else "down"))
     payload = {
         "tunnel": tstate, "tunnel_note": tnote,
         "gpu_mode": GPU_MODE,
@@ -554,6 +1260,12 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
         j["log"].append(m)
         plog(f"[出片 {job_id}] {m}")
     try:
+        colab_profile = None
+        colab_session = None
+        if GPU_MODE == "colab_cli":
+            colab_profile = _active_colab_profile()
+            colab_session = _colab_resolve_session(colab_profile, force=True)
+            log(f"绑定 Colab 会话: {colab_session}")
         jd = WORK / job_id
         jd.mkdir(exist_ok=True)
         j["stage"] = "归一底板 25fps"
@@ -596,10 +1308,20 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
             j["stage"] = "准备素材"
             if GPU_MODE == "colab_cli":
                 log("upload base + audio → Colab")
-                if not _colab_upload(norm, f"/content/{norm.name}"):
+                upload_started = time.monotonic()
+                if not _colab_upload(
+                    norm, f"/content/{norm.name}",
+                    session=colab_session, profile=colab_profile,
+                ):
                     raise RuntimeError("colab upload base failed")
-                if not _colab_upload(audio_path, f"/content/{pathlib.Path(audio_path).name}"):
+                log(f"底板上传完成 {time.monotonic()-upload_started:.1f}s")
+                audio_upload_started = time.monotonic()
+                if not _colab_upload(
+                    audio_path, f"/content/{pathlib.Path(audio_path).name}",
+                    session=colab_session, profile=colab_profile,
+                ):
                     raise RuntimeError("colab upload audio failed")
+                log(f"音频上传完成 {time.monotonic()-audio_upload_started:.1f}s")
             else:
                 log("copy base + audio → 本地 GPU")
                 r = run(SCP + [str(norm), str(audio_path), REMOTE + ":/content/"], timeout=180)
@@ -631,18 +1353,21 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                     f"nohup sh -c {shlex.quote(inner)} > {remote_log} 2>&1 </dev/null &"
                 )
                 log("colab background: " + cmd[:80])
-                launch_rc, launch_out = _colab_exec(launch, timeout=30)
+                launch_rc, launch_out = _colab_exec(
+                    launch, session=colab_session, timeout=30, profile=colab_profile,
+                )
                 if launch_rc != 0:
                     raise RuntimeError("MuseTalk launch failed via colab CLI: " + launch_out[-200:])
-                seen_lines = 0
+                remote_log_seen = ""
                 rc = 124
-                for _ in range(180):  # 最长 15 分钟
-                    time.sleep(5)
+                inference_started = time.monotonic()
+                for _ in range(450):  # 最长 15 分钟
+                    time.sleep(2)
                     poll_rc, poll_out = _colab_exec(
-                        f"tail -n 80 {remote_log} 2>/dev/null; "
+                        f"tail -c 30000 {remote_log} 2>/dev/null; "
                         f"echo __CICY_STATE__; "
                         f"if [ -f {remote_done} ]; then cat {remote_rc}; else echo RUNNING; fi",
-                        timeout=20,
+                        session=colab_session, timeout=20, profile=colab_profile,
                     )
                     if poll_rc != 0 and any(
                         marker in poll_out.lower()
@@ -650,16 +1375,23 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                     ):
                         raise RuntimeError("Colab 会话在对口型过程中断开或被 Google 回收，请重新启动会话后重试")
                     output, _, state = poll_out.rpartition("__CICY_STATE__")
-                    lines = [line for line in output.splitlines() if line.strip()]
-                    for line in lines[seen_lines:]:
-                        log(f"[MuseTalk] {line[:120]}")
-                    seen_lines = len(lines)
+                    output = output.lstrip("\r\n").replace("\r", "\n")
+                    if output != remote_log_seen:
+                        new_output = (
+                            output[len(remote_log_seen):]
+                            if output.startswith(remote_log_seen) else output
+                        )
+                        for line in new_output.splitlines():
+                            if line.strip():
+                                log(f"[{engine}] {line[:500]}")
+                        remote_log_seen = output
                     state = state.strip()
                     if state != "RUNNING":
                         try:
                             rc = int(state.splitlines()[-1])
                         except Exception:
                             rc = 1
+                        log(f"{engine} GPU 推理结束: rc={rc}, 耗时 {time.monotonic()-inference_started:.1f}s")
                         break
                 if rc != 0:
                     raise RuntimeError(f"MuseTalk failed via colab CLI (rc={rc})")
@@ -683,7 +1415,10 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
 
             # 验证输出
             if GPU_MODE == "colab_cli":
-                check_rc, check_out = _colab_exec(f"test -f {out_remote} && echo OK || echo MISSING", timeout=30)
+                check_rc, check_out = _colab_exec(
+                    f"test -f {out_remote} && echo OK || echo MISSING",
+                    session=colab_session, timeout=30, profile=colab_profile,
+                )
                 if "OK" not in check_out:
                     raise RuntimeError("MuseTalk did not produce output")
             else:
@@ -695,8 +1430,13 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
 
             j["stage"] = "取回成片"
             if GPU_MODE == "colab_cli":
-                if not _colab_download(out_remote, result):
+                download_started = time.monotonic()
+                log("下载 GPU 成片")
+                if not _colab_download(
+                    out_remote, result, session=colab_session, profile=colab_profile,
+                ):
                     raise RuntimeError("colab download failed")
+                log(f"成片下载完成 {time.monotonic()-download_started:.1f}s")
             else:
                 r = run(SCP + [REMOTE + ":" + out_remote, str(result)], timeout=180)
                 if r.returncode != 0 or not result.exists():
@@ -736,6 +1476,10 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
 
 @app.post("/api/generate-video")
 def generate_video():
+    if GPU_MODE == "cicy_gpu":
+        return _cicy_gpu_video()
+    if GPU_MODE == "local" and not LOCAL_GPU:
+        return _local_gpu_video()
     has_audio = "audio" in request.files and request.files["audio"].filename
     audio_media = None
     if not has_audio:
@@ -812,6 +1556,16 @@ def generate_video():
 
 @app.get("/api/job/<job_id>")
 def job_status(job_id):
+    recovered = WORK / job_id / "result.mp4"
+    if recovered.is_file():
+        return jsonify({
+            "stage": "完成",
+            "log": ["CiCy Cloud 已取回成片"],
+            "result": job_id,
+            "error": None,
+        })
+    if GPU_MODE == "cicy_gpu":
+        return _cicy_gpu_proxy(f"/api/job/{urllib.parse.quote(job_id, safe='')}")
     j = JOBS.get(job_id)
     if not j:
         return jsonify({"error": "unknown job"}), 404
@@ -821,6 +1575,44 @@ def job_status(job_id):
 
 @app.get("/api/result/<job_id>")
 def result(job_id):
+    recovered = WORK / job_id / "result.mp4"
+    if recovered.is_file():
+        return send_file(recovered, mimetype="video/mp4")
+    result_asset = _CICY_GPU_RESULT_ASSETS.get(job_id)
+    if result_asset:
+        upstream = urllib.request.Request(result_asset["download_url"], method="GET")
+        response = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+        ).open(upstream, timeout=300)
+
+        def stream_result():
+            completed = False
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        completed = True
+                        break
+                    yield chunk
+            finally:
+                response.close()
+                if completed:
+                    try:
+                        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                            urllib.request.Request(result_asset["delete_url"], method="DELETE"),
+                            timeout=30,
+                        ).close()
+                        _CICY_GPU_RESULT_ASSETS.pop(job_id, None)
+                        plog(f"[CiCy GPU] 成片已拉取本地，OSS 临时对象已删除: {job_id}")
+                    except Exception as exc:
+                        plog(f"[CiCy GPU] OSS 临时对象删除失败，等待生命周期清理: {job_id} · {exc}")
+
+        return Response(stream_result(), content_type="video/mp4")
+    if GPU_MODE == "cicy_gpu":
+        return _cicy_gpu_proxy(
+            f"/api/result/{urllib.parse.quote(job_id, safe='')}",
+            complete_on_success=False,
+        )
     f = WORK / job_id / "result.mp4"
     if not f.exists():
         return jsonify({"error": "no result"}), 404
@@ -829,6 +1621,8 @@ def result(job_id):
 
 @app.get("/api/cover/<job_id>")
 def cover(job_id):
+    if GPU_MODE == "cicy_gpu":
+        return _cicy_gpu_proxy(f"/api/cover/{urllib.parse.quote(job_id, safe='')}")
     f = WORK / job_id / "cover.jpg"
     return send_file(f, mimetype="image/jpeg") if f.exists() else ("", 404)
 
@@ -950,7 +1744,24 @@ def _pull_colab_log(jid):
 
 @app.post("/api/tts")
 def tts():
+    if not _tts_lock.acquire(blocking=False):
+        plog("[配音] 忽略重复请求：已有配音任务正在运行")
+        return jsonify({
+            "error": "已有配音任务正在进行，请等待完成，不要重复点击",
+            "code": "tts_already_running",
+        }), 409
+    try:
+        return _tts_impl()
+    finally:
+        _tts_lock.release()
+
+
+def _tts_impl():
     """文案 + 参考音色 → CosyVoice zero-shot 克隆配音(本机 GPU 直接跑)。"""
+    if GPU_MODE == "cicy_gpu":
+        return _cicy_gpu_tts()
+    if GPU_MODE == "local" and not LOCAL_GPU:
+        return _local_gpu_tts()
     text = ""
     if request.is_json:
         text = (request.json or {}).get("text", "").strip()
@@ -964,12 +1775,14 @@ def tts():
         speed = 1.15
 
     jid = uuid.uuid4().hex[:10]
+    started = time.monotonic()
     whole = request.form.get("mode") == "whole"
     plog(f"[配音 {jid}] 开始: {len(text)}字 语速{speed} 模式{'整段' if whole else '分段'}")
 
     # Groq/Whisper only transcribes the reference. CosyVoice still needs the
     # configured GPU runtime, so fail early with an actionable message.
     if GPU_MODE == "colab_cli":
+        plog(f"[配音 {jid}] 1/6 检查 Colab 会话")
         session_active, session_hint = _colab_session_active()
         if not session_active:
             plog(f"[配音 {jid}] COLAB_NOT_READY · {session_hint}")
@@ -995,6 +1808,7 @@ def tts():
         ref = samples[-1]
 
     # 裁到 ~10s 16kHz mono
+    plog(f"[配音 {jid}] 2/6 准备参考音色")
     ref_trim = WORK / f"ref_trim_{jid}.wav"
     tr = run(["ffmpeg", "-v", "error", "-y", "-i", str(ref), "-t", "6",
               "-ar", "16000", "-ac", "1", str(ref_trim)])
@@ -1020,11 +1834,17 @@ def tts():
                 "error": "当前 Colab 会话尚未安装 Whisper，请先完成环境安装"
             }), 400
     try:
+        transcribe_started = time.monotonic()
+        plog(f"[配音 {jid}] 3/6 转写参考音频 provider={stt_provider}")
         ref_text = _transcribe(str(ref), stt_provider)
     except GroqTranscriptionError as exc:
         return jsonify({"error": str(exc), "code": "groq_stt_failed"}), 502
     if not ref_text:
         return jsonify({"error": f"参考音频转写失败（{stt_provider}），请检查服务状态或更换清晰中文人声音频"}), 400
+    plog(
+        f"[配音 {jid}] 3/6 转写完成 {time.monotonic()-transcribe_started:.1f}s "
+        f"→ {len(ref_text)}字"
+    )
 
     # 本机直接跑 CosyVoice
     cosy_dir = pathlib.Path("/content/cosy")
@@ -1038,8 +1858,11 @@ def tts():
     if GPU_MODE == "colab_cli":
         # 上传 ref 音频到 Colab
         remote_ref = f"/content/_ref_{jid}.wav"
+        upload_started = time.monotonic()
+        plog(f"[配音 {jid}] 4/6 上传参考音频到 Colab")
         if not _colab_upload(ref, remote_ref):
             return jsonify({"error": "上传参考音频到 Colab 失败"}), 500
+        plog(f"[配音 {jid}] 4/6 上传完成 {time.monotonic()-upload_started:.1f}s")
         # 远程执行 CosyVoice TTS
         tts_inner = (
             f"env/bin/python cosyvoice_tts.py "
@@ -1053,15 +1876,41 @@ def tts():
             f"cd /content/cosy && nohup sh -c {shlex.quote(tts_inner)} "
             f"> /content/tts_{jid}.log 2>&1 </dev/null &"
         )
-        _colab_exec(cmd, timeout=10)
+        plog(f"[配音 {jid}] 5/6 启动 CosyVoice GPU 推理")
+        launch_rc, launch_out = _colab_exec(cmd, timeout=10)
+        if launch_rc != 0:
+            plog(f"[配音 {jid}] 5/6 启动失败: {launch_out[-300:]}")
+            return jsonify({"error": "CosyVoice 推理进程启动失败"}), 500
         # 轮询完成
-        for _ in range(120):
+        inference_started = time.monotonic()
+        remote_log_seen = ""
+        for poll_index in range(120):
             time.sleep(3)
-            check_rc, check_out = _colab_exec(f"cat /content/tts_{jid}.done 2>/dev/null && echo DONE", timeout=10)
-            if "DONE" in check_out:
+            check_rc, check_out = _colab_exec(
+                f"(test -f /content/tts_{jid}.done && echo DONE || true); "
+                f"echo __KOUBO_TTS_LOG__; tail -c 20000 /content/tts_{jid}.log 2>/dev/null || true",
+                timeout=10,
+            )
+            state_text, _, remote_log = check_out.partition("__KOUBO_TTS_LOG__")
+            remote_log = remote_log.lstrip("\r\n").replace("\r", "\n")
+            if remote_log != remote_log_seen:
+                if remote_log.startswith(remote_log_seen):
+                    new_log = remote_log[len(remote_log_seen):]
+                else:
+                    new_log = remote_log
+                for line in new_log.splitlines():
+                    if line.strip():
+                        plog(f"[配音 {jid}][CosyVoice] {line}")
+                remote_log_seen = remote_log
+            if "DONE" in state_text:
+                plog(f"[配音 {jid}] 5/6 GPU 推理完成 {time.monotonic()-inference_started:.1f}s")
                 break
+            if poll_index and poll_index % 10 == 0:
+                plog(f"[配音 {jid}] 5/6 GPU 推理中 {time.monotonic()-inference_started:.0f}s")
         # 下载结果
         result_wav = WORK / f"tts_{jid}.wav"
+        download_started = time.monotonic()
+        plog(f"[配音 {jid}] 6/6 下载并保存成品")
         if not _colab_download(f"/content/tts_{jid}.wav", result_wav):
             log_out = ""
             _, log_out = _colab_exec(f"tail -5 /content/tts_{jid}.log 2>/dev/null", timeout=10)
@@ -1075,6 +1924,10 @@ def tts():
         _media_add({"id": jid, "type": "voice", "file": dst.name,
                     "text": text[:100], "chars": len(text), "speed": speed,
                     "duration": dur, "ts": time.strftime("%m-%d %H:%M")})
+        plog(
+            f"[配音 {jid}] 6/6 保存完成 {time.monotonic()-download_started:.1f}s · "
+            f"总耗时 {time.monotonic()-started:.1f}s"
+        )
         plog(f"[配音 {jid}] ✅ 完成 {dur}s → media/voice_{jid}.wav")
         return jsonify({"id": jid, "url": f"/api/media/{jid}/file",
                         "duration": dur, "chars": len(text)})
@@ -1278,6 +2131,7 @@ def _parse_srt(text):
 
 
 FONTS = {
+    "soft": ("/System/Library/Fonts/PingFang.ttc", "柔和无衬线（多语种推荐）"),
     "heavy": (str(ROOT / "assets/fonts/SourceHanSansCN-Heavy.otf"), "抖音口播·特粗（推荐）"),
     "bold": (str(ROOT / "assets/fonts/SourceHanSansCN-Bold.otf"), "抖音口播·粗体"),
     "heiti": ("/System/Library/Fonts/STHeiti Medium.ttc", "系统黑体"),
@@ -1331,11 +2185,23 @@ def _hex_rgba(s, default):
         return default
 
 
-def _load_font(fid, size):
+def _load_font(fid, size, text=""):
     """加载字体。遍历回退链直到找到可用的字体（PIL path/bytes 双模式）。"""
     from PIL import ImageFont
-    candidates = [
-        FONTS[fid or "heavy"][0],                                   # ROOT 标准路径
+    script_candidates = []
+    if any("\u0600" <= ch <= "\u06ff" for ch in text):
+        script_candidates += ["/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf"]
+    if any("\u0e00" <= ch <= "\u0e7f" for ch in text):
+        script_candidates += ["/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"]
+    if any("\u1780" <= ch <= "\u17ff" for ch in text):
+        script_candidates += ["/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf"]
+    if any("\u0e80" <= ch <= "\u0eff" for ch in text):
+        script_candidates += ["/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf"]
+    if any("\uac00" <= ch <= "\ud7af" for ch in text):
+        script_candidates += ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"]
+    candidates = script_candidates + [
+        FONTS.get(fid or "soft", FONTS["soft"])[0],                  # 用户选择
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         FONTS["heiti"][0],                                           # macOS
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",       # Linux/Colab Noto CJK
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -1369,7 +2235,7 @@ def _render_caption(text, w, h, png_path, fontsize=0, color="#FFFFFF", outline="
     fs = max(8, min(180, round(ui_fs * w / 160)))
     fg = _hex_rgba(color, (255, 255, 255, 255))
     og = _hex_rgba(outline, (0, 0, 0, 255))
-    font = _load_font(font_id, fs)
+    font = _load_font(font_id, fs, text)
     # 大字口播字幕每行约 10 个中文字；同时保留 12% 的左右安全区。
     maxw = w * 0.88
     max_chars = 10
@@ -2889,26 +3755,86 @@ ENGINES = {
         "name": "MuseTalk",
         "ready": "/content/mt/READY",
         "dir": "/content/mt",
-        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
+        "install_hint": "制作数字人口型视频需要；只做配音时不用安装",
     },
     "cosy":     {
         "name": "CosyVoice",
         "ready": "/content/cosy/COSY_READY",
         "dir": "/content/cosy",
-        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
+        "install_hint": "配音和参考音频转写需要；安装后同时提供 Whisper",
     },
     "whisper":  {"name": "Whisper",   "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "builtin": True},
     "hg":       {
         "name": "HeyGem",
         "ready": "/content/hg/HG_READY",
         "dir": "/content/hg",
-        "install_hint": "首次安装需下载模型，耗时取决于 Colab 网络和缓存；请查看实时日志",
-        "note": "可以先安装；生成时可能需要更多 GPU 显存，建议 ≥16GB，T4 可能 OOM",
+        "install_hint": "仅选择 HeyGem 数字人时安装；其他流程不用安装",
     },
 }
 
 COLAB_GPUS = ("T4", "L4", "G4", "H100", "A100")
 _COLAB_OAUTH_PROCESSES = {}
+_COLAB_INSTALL_LOG_BRIDGES = set()
+_COLAB_ENGINE_STARTING = {}
+_COLAB_ENGINE_INSTALL_INFLIGHT = set()
+_COLAB_ENGINE_INSTALL_LOCK = threading.Lock()
+
+
+def _start_colab_install_log_bridge(engine, profile):
+    """Continuously copy a remote provision.log into the unified UI log."""
+    bridge_key = (profile["id"], engine)
+    if bridge_key in _COLAB_INSTALL_LOG_BRIDGES:
+        return
+    _COLAB_INSTALL_LOG_BRIDGES.add(bridge_key)
+    cfg = ENGINES[engine]
+    remote_log = shlex.quote(f"{cfg['dir']}/provision.log")
+    process_pattern = shlex.quote(f"{cfg['dir']}/[p]rovision.sh")
+
+    def run():
+        offset = 0
+        stopped_checks = 0
+        try:
+            while stopped_checks < 3:
+                command = (
+                    f"size=$(wc -c < {remote_log} 2>/dev/null || echo 0); "
+                    f"if [ \"$size\" -lt {offset} ]; then start=1; "
+                    f"else start={offset + 1}; fi; "
+                    f"tail -c +$start {remote_log} 2>/dev/null || true; "
+                    f"printf '\\n__KOUBO_LOG_META__%s|' \"$size\"; "
+                    f"(pgrep -f {process_pattern} >/dev/null && echo YES || echo NO)"
+                )
+                rc, output = _colab_exec(command, timeout=20, profile=profile)
+                body, marker, meta = output.rpartition("__KOUBO_LOG_META__")
+                if rc == 0 and marker:
+                    size_text, _, running_text = meta.strip().partition("|")
+                    try:
+                        new_offset = int(size_text)
+                    except ValueError:
+                        new_offset = offset
+                    if new_offset < offset:
+                        offset = 0
+                    if new_offset > offset:
+                        for line in body.replace("\r", "\n").splitlines():
+                            if line.strip():
+                                plog(f"[Colab 安装][{cfg['name']}] {line}")
+                        offset = new_offset
+                    stopped_checks = 0 if running_text.strip().endswith("YES") else stopped_checks + 1
+                    if running_text.strip().endswith("YES"):
+                        _COLAB_ENGINE_STARTING.pop(engine, None)
+                else:
+                    plog(f"[Colab 安装日志暂不可用][{cfg['name']}] 正在自动重试")
+                    stopped_checks = 0
+                time.sleep(2)
+            plog(f"[Colab 安装][{cfg['name']}] 安装进程已结束")
+        finally:
+            _COLAB_ENGINE_STARTING.pop(engine, None)
+            _COLAB_INSTALL_LOG_BRIDGES.discard(bridge_key)
+
+    threading.Thread(
+        target=run,
+        name=f"colab-install-log-{engine}",
+        daemon=True,
+    ).start()
 
 
 @app.get("/api/colab/profiles")
@@ -2940,7 +3866,8 @@ def api_colab_oauth_start():
     if old and old.poll() is None:
         old.terminate()
     token_path = _colab_oauth_token_path(profile)
-    token_path.unlink(missing_ok=True)  # “授权”也可用于安全地切换/重新授权账号
+    # Never delete a working token merely because the user opened the OAuth
+    # dialog. A failed/cancelled authorization must leave existing access intact.
     try:
         proc = subprocess.Popen(
             _colab_base_args(profile) + ["whoami"],
@@ -3063,10 +3990,14 @@ def api_colab_profiles_save():
 @app.post("/api/colab/session/start")
 def api_colab_session_start():
     profile = _active_colab_profile()
+    plog(f"[Colab 会话] 1/3 校验授权 profile={profile['id']} gpu={profile['gpu']}")
+    if profile["auth"] == "oauth2" and not _colab_oauth_token_path(profile).is_file():
+        return jsonify({"error": "当前 Google 账号尚未授权", "code": "colab_auth_required"}), 401
     if profile["auth"] == "adc" and not pathlib.Path(profile["credentials_path"]).is_file():
         return jsonify({"error": "当前账号的 ADC 凭据文件不存在"}), 400
     args = _colab_base_args(profile) + ["new", "-s", profile["session"], "--gpu", profile["gpu"]]
     try:
+        plog(f"[Colab 会话] 2/3 请求创建 session={profile['session']}")
         r = subprocess.run(args, capture_output=True, text=True, timeout=180,
                            env=_colab_env(profile))
         if r.returncode:
@@ -3104,6 +4035,7 @@ def api_colab_session_start():
         if current is not None:
             current["started_at"] = time.time()
             save_global_cfg(cfg)
+        plog(f"[Colab 会话] 3/3 启动成功 session={profile['session']} gpu={profile['gpu']}")
         return jsonify({"ok": True, "session": profile["session"], "gpu": profile["gpu"],
                         "output": (r.stdout or "").strip()[-500:]})
     except subprocess.TimeoutExpired:
@@ -3122,8 +4054,10 @@ def api_colab_session_start():
 @app.post("/api/colab/session/stop")
 def api_colab_session_stop():
     profile = _active_colab_profile()
+    resolved_session = _colab_resolve_session(profile, force=True)
     try:
-        r = subprocess.run(_colab_base_args(profile) + ["stop", "-s", profile["session"]],
+        plog(f"[Colab 会话] 1/2 请求停止 session={resolved_session}")
+        r = subprocess.run(_colab_base_args(profile) + ["stop", "-s", resolved_session],
                            capture_output=True, text=True, timeout=60, env=_colab_env(profile))
         if r.returncode:
             return jsonify({"error": (r.stderr or r.stdout)[-800:]}), 500
@@ -3132,8 +4066,10 @@ def api_colab_session_stop():
         if current is not None:
             current.pop("started_at", None)
             save_global_cfg(cfg)
+        plog(f"[Colab 会话] 2/2 已停止 session={resolved_session}")
         return jsonify({"ok": True})
     except Exception as exc:
+        plog(f"[Colab 会话停止失败] session={profile['session']} error={type(exc).__name__}: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -3141,31 +4077,59 @@ def api_colab_session_stop():
 def api_colab_session_status():
     """返回当前配置档的会话状态与运行时长，不暴露会话 token。"""
     profile = _active_colab_profile()
+    credentials_ready = (
+        _colab_oauth_token_path(profile).is_file()
+        if profile["auth"] == "oauth2"
+        else bool(profile["credentials_path"]) and pathlib.Path(profile["credentials_path"]).is_file()
+    )
     state_path = pathlib.Path(profile["session_config"])
     try:
         sessions = json.loads(state_path.read_text()) if state_path.exists() else {}
         session = sessions.get(profile["session"])
     except Exception:
         session = None
+    resolved_session = profile["session"]
+    if credentials_ready and not session:
+        resolved_session = _colab_resolve_session(profile, force=True)
+        if resolved_session != profile["session"]:
+            session = {"accelerator": profile["gpu"], "variant": "GPU"}
     account_email = ""
-    try:
-        who = subprocess.run(_colab_base_args(profile) + ["whoami"], capture_output=True,
-                             text=True, timeout=30, env=_colab_env(profile))
-        for line in (who.stdout or who.stderr).splitlines():
-            if line.startswith("Email:"):
-                account_email = line.split(":", 1)[1].strip()
-                break
-    except Exception:
-        pass
+    if credentials_ready:
+        try:
+            who = subprocess.run(_colab_base_args(profile) + ["whoami"], capture_output=True,
+                                 text=True, timeout=10, env=_colab_env(profile))
+            for line in (who.stdout or who.stderr).splitlines():
+                if line.startswith("Email:"):
+                    account_email = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
     common = {
-        "session": profile["session"],
+        "profile_id": profile["id"],
+        "session": resolved_session,
         "gpu": profile["gpu"],
-        "account_email": account_email,
+        "account_email": account_email or profile.get("email") or "",
+        "credentials_ready": credentials_ready,
         "plan": None,
         "compute_units": None,
         "manage_url": "https://colab.research.google.com/signup",
     }
-    if not session:
+    expected_email = profile.get("email", "").strip().lower()
+    actual_email = account_email.strip().lower()
+    if expected_email and actual_email and expected_email != actual_email:
+        plog(
+            f"[Colab 账号不匹配] profile={profile['id']} "
+            f"expected={expected_email} actual={actual_email}"
+        )
+        return jsonify({
+            "running": False,
+            "account_mismatch": True,
+            "expected_email": profile.get("email", ""),
+            **common,
+        })
+    # A session JSON file is only a local cache. Without this profile's own
+    # credentials it may be stale and must never be presented as a live session.
+    if not credentials_ready or not session:
         return jsonify({"running": False, **common})
     endpoint = session.get("endpoint", "")
     started_at = None
@@ -3244,6 +4208,267 @@ if _BGM_SEED.exists():
             _sh.copy(_sf, _df)
 
 
+@app.get("/api/cicy-gpu/regions")
+def cicy_gpu_regions():
+    try:
+        status, result = _cicy_gateway_request("GET", "/api/koubo/regions")
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
+@app.get("/api/cicy-gpu/billing")
+def cicy_gpu_billing():
+    try:
+        status, result = _cicy_gateway_request("GET", "/api/koubo/billing")
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
+@app.get("/api/cicy-gpu/balance")
+def cicy_gpu_balance():
+    try:
+        status, result = _cicy_gateway_request("GET", "/api/balance")
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
+@app.post("/api/cicy-gpu/references/prepare")
+def cicy_gpu_prepare_reference():
+    payload = request.get_json(silent=True) or {}
+    ref_id = str(payload.get("ref_id") or "")
+    region_id = str(payload.get("region_id") or "cn-hangzhou")
+    stt_provider = str(payload.get("stt_provider") or "groq")
+    if ref_id and ref_id.startswith("voice-sample-") and (ROOT / "assets" / ref_id).is_file():
+        ref = ROOT / "assets" / ref_id
+    else:
+        samples = sorted((ROOT / "assets").glob("voice-sample-*.wav"))
+        if not samples:
+            return jsonify({"error": "没有参考音色,请先选择/上传一段人声样本"}), 400
+        ref = samples[-1]
+    try:
+        plog(f"[CiCy GPU 配音] 1/6 参考音频转写 · file={ref.name} bytes={ref.stat().st_size}")
+        reference_text = _transcribe(str(ref), stt_provider)
+    except GroqTranscriptionError as exc:
+        return jsonify({"error": str(exc), "code": "groq_stt_failed"}), 502
+    if not reference_text:
+        return jsonify({"error": f"参考音频转写失败（{stt_provider}）"}), 400
+    plog(f"[CiCy GPU 配音] 2/6 获取 OSS 上传签名 · region={region_id}")
+    status, signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
+        "region_id": region_id,
+        "purpose": "reference",
+        "content_type": "audio/wav",
+        "extension": "wav",
+    })
+    if status >= 300:
+        return jsonify({"error": signed.get("error") or "OSS 上传签名失败"}), status
+    payload_bytes = ref.read_bytes()
+    plog(f"[CiCy GPU 配音] 3/6 上传参考音频 · bytes={len(payload_bytes)}")
+    opener = urllib.request.build_opener()
+    upload = urllib.request.Request(
+        signed["upload_url"], data=payload_bytes,
+        headers={"Content-Type": "audio/wav", "User-Agent": "cicy-koubo/0.1.8"},
+        method="PUT",
+    )
+    try:
+        upload_started = time.monotonic()
+        with opener.open(upload, timeout=30) as response:
+            plog(f"[CiCy GPU 配音] 4/6 OSS 上传完成 · HTTP {response.status} · {time.monotonic()-upload_started:.2f}s")
+    except urllib.error.URLError as exc:
+        return jsonify({"error": f"OSS 上传失败：{exc.reason}"}), 502
+    prepared_id = "ref_" + uuid.uuid4().hex
+    _CICY_GPU_PREPARED_REFERENCES[prepared_id] = {
+        "signed": signed,
+        "reference_text": reference_text,
+        "expires_at": time.time() + 12 * 60,
+    }
+    return jsonify({"success": True, "prepared_reference_id": prepared_id})
+
+
+@app.route("/api/gpu-provider", methods=["GET", "POST"])
+def gpu_provider():
+    global GPU_MODE
+    cfg = load_global_cfg()
+    gpu = cfg.setdefault("koubo", {}).setdefault("gpu", {})
+    available = ["cicy_gpu", "colab"]
+    if _platform.system() != "Darwin" and _get_gpu_memory_mb() >= 8192:
+        available.append("local")
+    if request.method == "GET":
+        return jsonify({
+            "provider": gpu.get("provider") or GPU_MODE,
+            "region_id": gpu.get("region_id") or "cn-hongkong",
+            "available_providers": available,
+            "local_provider_label": "WSL2 Docker + NVIDIA GPU" if _is_wsl() else "本地 NVIDIA Docker",
+        })
+    payload = request.get_json(silent=True) or {}
+    provider = str(payload.get("provider") or "")
+    if provider not in available:
+        return jsonify({"success": False, "error": "invalid_gpu_provider"}), 400
+    gpu["provider"] = provider
+    GPU_MODE = "colab_cli" if provider == "colab" else provider
+    try:
+        status._cache = None
+    except Exception:
+        pass
+    if payload.get("region_id"):
+        gpu["region_id"] = str(payload["region_id"])
+    save_global_cfg(cfg)
+    return jsonify({
+        "success": True,
+        "provider": provider,
+        "region_id": gpu.get("region_id") or "cn-hongkong",
+        "restart_required": False,
+    })
+
+
+@app.get("/api/local-gpu/status")
+def local_gpu_status_api():
+    return jsonify(_local_gpu_docker_status())
+
+
+@app.post("/api/local-gpu/install")
+def local_gpu_install_api():
+    if not _sht.which("docker"):
+        return jsonify({"success": False, "error": "Docker CLI 或 docker.sock 不可用"}), 503
+    root = _local_gpu_install_root()
+    plog(f"[本地 GPU 安装] 1/3 选择最大可用磁盘目录 {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    config_path = root / "config.json"
+    if not config_path.exists():
+        config_path.write_text(json.dumps({
+            "root": str(root), "image": "cicy-koubo-gpu:2026.07.29-api",
+            "port": 8771, "token": secrets.token_urlsafe(32),
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=2), encoding="utf-8")
+        config_path.chmod(0o600)
+    image = "cicy-koubo-gpu:2026.07.29-api"
+    plog(f"[本地 GPU 安装] 2/3 检查镜像 {image}")
+    check = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    if check.returncode:
+        pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True, timeout=1800)
+        if pull.returncode:
+            return jsonify({"success": False, "error": (pull.stderr or "GPU 镜像下载失败")[-500:]}), 502
+    plog("[本地 GPU 安装] 3/3 安装完成")
+    return jsonify({"success": True, **_local_gpu_docker_status()})
+
+
+@app.post("/api/local-gpu/start")
+def local_gpu_start_api():
+    state = _local_gpu_docker_status()
+    if not state["installed"]:
+        return jsonify({"success": False, "error": "请先安装本地 GPU"}), 409
+    _, token = _local_gpu_conf()
+    image = "cicy-koubo-gpu:2026.07.29-api"
+    plog("[本地 GPU 启动] 1/4 验证 NVIDIA Container Runtime")
+    probe = subprocess.run(
+        ["docker", "run", "--rm", "--gpus", "all", "--entrypoint", "sh", image,
+         "-lc", "command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if probe.returncode:
+        return jsonify({"success": False, "error": "NVIDIA GPU 或 Container Runtime 不可用"}), 503
+    subprocess.run(["docker", "rm", "-f", "cicy-koubo-gpu"], capture_output=True)
+    plog("[本地 GPU 启动] 2/4 清理旧容器并创建私有网络")
+    subprocess.run(["docker", "network", "create", "cicy-koubo-local"], capture_output=True)
+    subprocess.run(["docker", "network", "connect", "cicy-koubo-local",
+                    os.environ.get("HOSTNAME", "")], capture_output=True)
+    plog("[本地 GPU 启动] 3/4 启动 GPU API，端口 8771")
+    run_result = subprocess.run([
+        "docker", "run", "-d", "--name", "cicy-koubo-gpu", "--restart", "unless-stopped",
+        "--network", "cicy-koubo-local", "--gpus", "all",
+        "-p", "127.0.0.1:8771:8771", "-e", "KOUBO_API_PORT=8771",
+        "-e", f"CICY_KOUBO_ACCESS_TOKEN={token}",
+        "-v", f"{state['root']}/state:/var/lib/cicy-koubo-api", image,
+    ], capture_output=True, text=True, timeout=120)
+    if run_result.returncode:
+        plog(f"[本地 GPU 启动失败] {run_result.stderr[-500:]}")
+        return jsonify({"success": False, "error": run_result.stderr[-500:]}), 502
+    plog("[本地 GPU 启动] 4/4 容器已启动，等待健康检查")
+    return jsonify({"success": True, **_local_gpu_docker_status()})
+
+
+@app.post("/api/local-gpu/stop")
+def local_gpu_stop_api():
+    plog("[本地 GPU 停止] 1/2 请求停止容器")
+    subprocess.run(["docker", "stop", "cicy-koubo-gpu"], capture_output=True, timeout=60)
+    plog("[本地 GPU 停止] 2/2 容器已停止，数据保留")
+    return jsonify({"success": True, **_local_gpu_docker_status()})
+
+
+@app.post("/api/cicy-gpu/jobs")
+def cicy_gpu_create_job():
+    payload = request.get_json(silent=True) or {}
+    region_id = str(payload.get("region_id") or "")
+    instance_type = str(payload.get("instance_type") or "")
+    if not region_id:
+        return jsonify({"success": False, "error": "region_id_required"}), 400
+    if not instance_type:
+        return jsonify({"success": False, "error": "instance_type_required"}), 400
+    client_request_id = str(payload.get("client_request_id") or uuid.uuid4())
+    try:
+        status, result = _cicy_gateway_request(
+            "POST", "/api/koubo/jobs",
+            {
+                "region_id": region_id,
+                "instance_type": instance_type,
+                "client_request_id": client_request_id,
+                "input": payload.get("input") or {},
+            },
+            idempotency_key=client_request_id,
+        )
+        job_id = str(result.get("job_id") or (result.get("job") or {}).get("id") or "")
+        authorization = result.pop("authorization_token", "")
+        if status < 300 and job_id:
+            _CICY_GPU_SESSIONS[job_id] = {
+                "authorization_token": authorization,
+                "expires_at": result.get("authorization_expires_at", ""),
+                "region_id": region_id,
+                "instance_type": instance_type,
+            }
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
+@app.get("/api/cicy-gpu/jobs/<job_id>")
+def cicy_gpu_job(job_id):
+    global _CICY_GPU_ACTIVE_JOB_ID
+    try:
+        safe_job_id = urllib.parse.quote(job_id, safe="")
+        status, result = _cicy_gateway_request("GET", f"/api/koubo/jobs/{safe_job_id}")
+        job = result.get("job") or {}
+        authorization = str(result.pop("authorization_token", "") or "")
+        if status < 300 and job.get("endpoint") and authorization:
+            _CICY_GPU_SESSIONS[job_id] = {
+                "authorization_token": authorization,
+                "expires_at": job.get("authorization_expires_at", ""),
+                "region_id": job.get("region_id") or "cn-hangzhou",
+                "instance_type": job.get("instance_type") or "",
+                "endpoint": job["endpoint"],
+            }
+            _CICY_GPU_ACTIVE_JOB_ID = job_id
+        result["local_authorization_loaded"] = job_id in _CICY_GPU_SESSIONS
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
+@app.post("/api/cicy-gpu/jobs/<job_id>/cancel")
+def cicy_gpu_cancel_job(job_id):
+    try:
+        safe_job_id = urllib.parse.quote(job_id, safe="")
+        status, result = _cicy_gateway_request(
+            "POST", f"/api/koubo/jobs/{safe_job_id}/cancel", {},
+        )
+        if status < 300:
+            _CICY_GPU_SESSIONS.pop(job_id, None)
+        return jsonify(result), status
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
+
 @app.get("/api/system")
 def api_system():
     import shutil
@@ -3252,6 +4477,7 @@ def api_system():
             "ram_gb": 0, "disk_total_gb": 0, "disk_free_gb": 0,
             "python_version": "", "cuda_version": "", "ffmpeg_version": "",
             "gpu_mode": GPU_MODE,
+            "local_gpu_managed": GPU_MODE == "local" and not LOCAL_GPU,
             "is_colab": pathlib.Path("/content").exists(),
             "colab_cli_installed": False, "colab_cli_version": ""}
     try:
@@ -3377,17 +4603,21 @@ def install_ffmpeg():
 def install_colab_cli():
     """安装官方 google-colab-cli；优先使用隔离的 uv tool。"""
     try:
+        plog("[Colab CLI 安装] 1/3 选择隔离安装工具")
         if _sht.which("uv"):
             cmd = ["uv", "tool", "install", "--force", "google-colab-cli"]
         else:
             cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade", "google-colab-cli"]
+        plog(f"[Colab CLI 安装] 2/3 执行 {' '.join(cmd[:3])}")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode == 0:
             colab_bin = _sht.which("colab") or str(pathlib.Path.home() / ".local/bin/colab")
             vr = subprocess.run([colab_bin, "version"], capture_output=True, text=True, timeout=15)
             version = (vr.stdout or vr.stderr).strip().splitlines()[-1] if (vr.stdout or vr.stderr).strip() else "installed"
+            plog(f"[Colab CLI 安装] 3/3 安装并验证成功 version={version}")
             return jsonify({"ok": True, "version": version})
         else:
+            plog(f"[Colab CLI 安装失败] {(r.stderr or r.stdout)[-800:]}")
             return jsonify({"error": (r.stderr or r.stdout)[-800:],
                             "command": " ".join(cmd[:3])}), 500
     except Exception as e:
@@ -3453,8 +4683,20 @@ def api_engines():
                             version_info[k.strip()] = v.strip()
                 except Exception:
                     pass
-        installing = remote_status.get(key, {}).get("installing", False) if is_remote else _is_installing(key)
-        has_script = (pathlib.Path(cfg["dir"]) / "provision.sh").exists()
+        starting_at = _COLAB_ENGINE_STARTING.get(key, 0)
+        starting = bool(starting_at and time.time() - starting_at < 300)
+        installing = (
+            remote_status.get(key, {}).get("installing", False) or starting
+            if is_remote else _is_installing(key)
+        )
+        if is_remote and installing and not cfg.get("builtin", False):
+            _start_colab_install_log_bridge(key, _active_colab_profile())
+        # In Colab mode the source script lives in this app and is uploaded on
+        # demand. Checking /content on the local Mac incorrectly reports every
+        # remote engine as “missing install script”.
+        bundled_script = SRC_DIR.parent / "scripts/provision" / key / "provision.sh"
+        deployed_script = pathlib.Path(cfg["dir"]) / "provision.sh"
+        has_script = cfg.get("builtin", False) or bundled_script.is_file() or deployed_script.is_file()
         out.append({"key": key, "name": cfg["name"],
                     "installed": installed, "installing": installing,
                     "version_info": version_info, "has_script": has_script,
@@ -3575,13 +4817,39 @@ def api_engine_install(engine):
         return jsonify({"error": f"{cfg['name']} 安装脚本目录不存在: {src_dir}"}), 404
     # colab cli 模式: 上传脚本到远程再执行
     if GPU_MODE == "colab_cli":
+        profile = _active_colab_profile()
+        task_key = (profile["id"], profile["session"], engine)
+        with _COLAB_ENGINE_INSTALL_LOCK:
+            if task_key in _COLAB_ENGINE_INSTALL_INFLIGHT:
+                return jsonify({"ok": True, "already_running": True, "engine": engine}), 202
+            _COLAB_ENGINE_INSTALL_INFLIGHT.add(task_key)
+            _COLAB_ENGINE_STARTING[engine] = time.time()
         remote_dir = cfg["dir"]
         remote_log = f"{remote_dir}/provision.log"
+        check_rc, check_out = _colab_exec(
+            f"if test -f {shlex.quote(cfg['ready'])}; then echo READY; fi; "
+            f"if pgrep -f {shlex.quote(f'{remote_dir}/[p]rovision.sh')} >/dev/null; "
+            f"then echo RUNNING; fi",
+            timeout=20,
+            profile=profile,
+        )
+        if "READY" in check_out:
+            _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_STARTING.pop(engine, None)
+            return jsonify({"ok": True, "already_installed": True, "engine": engine})
+        if "RUNNING" in check_out:
+            _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_STARTING.pop(engine, None)
+            _start_colab_install_log_bridge(engine, profile)
+            return jsonify({"ok": True, "already_running": True, "engine": engine}), 202
+        plog(f"[Colab 安装][{cfg['name']}] 1/3 创建远程目录")
         mkdir_rc, mkdir_out = _colab_exec(
             f"mkdir -p {shlex.quote(remote_dir)}",
             timeout=30,
         )
         if mkdir_rc != 0:
+            _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_STARTING.pop(engine, None)
             return jsonify({
                 "error": f"创建 Colab 安装目录失败：{mkdir_out[-300:] or remote_dir}"
             }), 500
@@ -3593,6 +4861,10 @@ def api_engine_install(engine):
         # 上传整个目录
         upload_files = [sf for sf in src_dir.iterdir() if sf.is_file()]
         for index, sf in enumerate(upload_files, 1):
+            plog(
+                f"[Colab 安装][{cfg['name']}] 2/3 上传文件 "
+                f"{index}/{len(upload_files)}: {sf.name}"
+            )
             _colab_exec(
                 f"printf '[%s] 上传文件 {index}/{len(upload_files)}: %s ... ' "
                 f"\"$(date '+%H:%M:%S')\" {shlex.quote(sf.name)} >> {shlex.quote(remote_log)}",
@@ -3605,6 +4877,8 @@ def api_engine_install(engine):
                         f"printf '失败\\n' >> {shlex.quote(remote_log)}",
                         timeout=30,
                     )
+                    _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+                    _COLAB_ENGINE_STARTING.pop(engine, None)
                     return jsonify({"error": f"上传 {sf.name} 到 Colab 失败"}), 500
                 _colab_exec(
                     f"printf '完成\\n' >> {shlex.quote(remote_log)}",
@@ -3612,6 +4886,7 @@ def api_engine_install(engine):
                 )
         # 远程执行 provision.sh
         script = f"{remote_dir}/provision.sh"
+        plog(f"[Colab 安装][{cfg['name']}] 3/3 启动远程安装")
         _colab_exec(
             f"printf '[%s] 文件上传完成，启动安装脚本\\n' "
             f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
@@ -3628,7 +4903,11 @@ def api_engine_install(engine):
                 f"\"$(date '+%H:%M:%S')\" >> {shlex.quote(remote_log)}",
                 timeout=30,
             )
+            _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
+            _COLAB_ENGINE_STARTING.pop(engine, None)
             return jsonify({"error": f"启动 {cfg['name']} 安装失败：{out[-300:]}"}), 500
+        _start_colab_install_log_bridge(engine, profile)
+        _COLAB_ENGINE_INSTALL_INFLIGHT.discard(task_key)
         return jsonify({"ok": True, "started": True, "remote": True, "log_path": f"{remote_dir}/provision.log"})
     # 本机模式
     script = pathlib.Path(cfg["dir"]) / "provision.sh"

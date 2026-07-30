@@ -43,6 +43,7 @@ ap.add_argument("--text", default="", help="要合成的目标文本")
 ap.add_argument("--ref-text-b64", default="", help="ref-text 的 base64(避免引号/编码问题)")
 ap.add_argument("--text-b64", default="", help="text 的 base64")
 ap.add_argument("--speed", type=float, default=1.15, help="语速 0.5-1.5")
+ap.add_argument("--language", default="zh-CN", help="目标语言或中文方言代码")
 ap.add_argument("--whole", action="store_true", help="整段生成(不分句,语气连贯;超长文本可能截断)")
 ap.add_argument("--out", required=True, help="输出 wav 路径")
 a = ap.parse_args()
@@ -58,6 +59,7 @@ log(f"参考音频: {a.ref}")
 log(f"参考转写(ref_text) [{len(a.ref_text)}字]: {a.ref_text!r}")
 log(f"目标文案(text) [{len(a.text)}字]: {a.text!r}")
 log(f"语速: {a.speed}")
+log(f"目标语言: {a.language}")
 
 # 参考音频信息
 try:
@@ -128,11 +130,31 @@ def _fade(x, sr, ms=8):
 
 pause = torch.zeros(1, int(m.sample_rate * 0.15))  # 句间 0.15s 停顿
 chunks = []
+DIALECT_INSTRUCTIONS = {
+    "zh-yue": "请用粤语表达。",
+    "zh-minnan": "请用闽南语表达。",
+    "zh-sichuan": "请用四川话表达。",
+    "zh-dongbei": "请用东北话表达。",
+    "zh-shanghai": "请用上海话表达。",
+    "zh-tianjin": "请用天津话表达。",
+    "zh-shandong": "请用山东话表达。",
+    "zh-shaanxi": "请用陕西话表达。",
+    "zh-shanxi": "请用山西话表达。",
+}
 for idx, seg in enumerate(segments):
     st = time.time()
     seg_len = 0.0
     n_yield = 0
-    for j in m.inference_zero_shot(seg.strip(), a.ref_text, a.ref, stream=False, speed=a.speed):
+    if a.language in DIALECT_INSTRUCTIONS and hasattr(m, "inference_instruct2"):
+        iterator = m.inference_instruct2(
+            seg.strip(), DIALECT_INSTRUCTIONS[a.language], a.ref,
+            stream=False, speed=a.speed,
+        )
+    else:
+        iterator = m.inference_zero_shot(
+            seg.strip(), a.ref_text, a.ref, stream=False, speed=a.speed,
+        )
+    for j in iterator:
         chunks.append(_fade(j["tts_speech"], m.sample_rate))
         seg_len += j["tts_speech"].shape[1] / m.sample_rate
         n_yield += 1
