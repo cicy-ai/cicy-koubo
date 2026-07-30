@@ -131,15 +131,18 @@ def _fade(x, sr, ms=8):
 pause = torch.zeros(1, int(m.sample_rate * 0.15))  # 句间 0.15s 停顿
 chunks = []
 DIALECT_INSTRUCTIONS = {
-    "zh-yue": "请用粤语表达。",
-    "zh-minnan": "请用闽南语表达。",
-    "zh-sichuan": "请用四川话表达。",
-    "zh-dongbei": "请用东北话表达。",
-    "zh-shanghai": "请用上海话表达。",
-    "zh-tianjin": "请用天津话表达。",
-    "zh-shandong": "请用山东话表达。",
-    "zh-shaanxi": "请用陕西话表达。",
-    "zh-shanxi": "请用山西话表达。",
+    # CosyVoice2 instruct2 requires the explicit end-of-prompt token.  Without
+    # it the instruction can leak into the synthesized speech, once per
+    # segment, e.g. “请用闽南语表达” being spoken seven times.
+    "zh-yue": "You are a helpful assistant. 请用粤语表达。<|endofprompt|>",
+    "zh-minnan": "You are a helpful assistant. 请用闽南语表达。<|endofprompt|>",
+    "zh-sichuan": "You are a helpful assistant. 请用四川话表达。<|endofprompt|>",
+    "zh-dongbei": "You are a helpful assistant. 请用东北话表达。<|endofprompt|>",
+    "zh-shanghai": "You are a helpful assistant. 请用上海话表达。<|endofprompt|>",
+    "zh-tianjin": "You are a helpful assistant. 请用天津话表达。<|endofprompt|>",
+    "zh-shandong": "You are a helpful assistant. 请用山东话表达。<|endofprompt|>",
+    "zh-shaanxi": "You are a helpful assistant. 请用陕西话表达。<|endofprompt|>",
+    "zh-shanxi": "You are a helpful assistant. 请用山西话表达。<|endofprompt|>",
 }
 for idx, seg in enumerate(segments):
     st = time.time()
