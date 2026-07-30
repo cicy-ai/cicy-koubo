@@ -1123,7 +1123,7 @@ async function genAudio(){
       toast(`✅ 配音完成 ${d.chars}字 → ${d.duration}s,已入成品库`);loadMediaTab()}
   }catch(e){stage('ttsStage','❌ '+e,true)}
   finally{stopTtsLogMonitor()}
-  b.disabled=false;b.textContent='4. 🎙 生成配音';
+  b.disabled=false;b.textContent='4. 🎙 生成配音';syncGpuActionAvailability();
 }
 async function startTaskLogMonitor(stageId,match){
   let baseline='';
@@ -1160,8 +1160,20 @@ let cicyGpuRequestId=localStorage.getItem(PK+'cicyGpuRequestId')||'';
 let cicyGpuReadyPromise=null;
 let cicyGpuBilling={startedAt:0,endedAt:0,rate:0,actual:null,status:''};
 let cicyGpuBusy=false;
+let cicyGpuApiReady=false;
+function syncGpuActionAvailability(){
+  const cloudMode=$('topGpuMode')?.value==='cicy_gpu';
+  const blocked=cloudMode&&!cicyGpuApiReady;
+  for(const [id,label] of [['btn-tts','请先启动 GPU，等待顶部显示“已就绪”'],['btn-gen','请先启动 GPU，等待顶部显示“已就绪”']]){
+    const button=$(id);
+    if(!button)continue;
+    button.disabled=blocked;
+    button.title=blocked?label:'';
+  }
+}
 function resetCicyGpuUi(){
   cicyGpuControlJob='';cicyGpuRequestId='';cicyGpuReadyPromise=null;cicyGpuBusy=false;
+  cicyGpuApiReady=false;
   cicyGpuBilling={startedAt:0,endedAt:0,rate:0,actual:null,status:''};
   localStorage.removeItem(PK+'cicyGpuControlJob');
   localStorage.removeItem(PK+'cicyGpuRequestId');
@@ -1169,6 +1181,7 @@ function resetCicyGpuUi(){
   if(billing)billing.style.display='none';
   if(destroy){destroy.style.display='none';destroy.disabled=false;destroy.textContent='销毁 GPU'}
   if(start){start.style.display='inline-flex';start.disabled=false;start.textContent='启动 GPU'}
+  syncGpuActionAvailability();
 }
 function parseCloudUtc(value){
   const text=String(value||'').trim();
@@ -1214,6 +1227,8 @@ function updateCicyGpuBilling(job){
 }
 async function restoreCicyGpuState(){
   if(!cicyGpuControlJob){
+    cicyGpuApiReady=false;
+    syncGpuActionAvailability();
     if(cicyGpuBilling.startedAt)resetCicyGpuUi();
     return;
   }
@@ -1233,6 +1248,8 @@ async function restoreCicyGpuState(){
       resetCicyGpuUi();
       return;
     }
+    cicyGpuApiReady=Boolean(job.endpoint&&data.local_authorization_loaded);
+    syncGpuActionAvailability();
     updateCicyGpuBilling(job);
   }catch(error){
     if(label)label.textContent='GPU 状态恢复中，正在重试…';
@@ -1284,6 +1301,8 @@ async function refreshGpuModeHeader(){
     });
     const mode=cfg.provider||'cicy_gpu';
     $('topGpuMode').value=mode;
+    if(mode!=='cicy_gpu')cicyGpuApiReady=false;
+    syncGpuActionAvailability();
     $('gpuAccount').classList.toggle('on',mode==='cicy_gpu');
     $('gpuRuntimeName').textContent=mode==='cicy_gpu'?'CiCy GPU':(mode==='colab'?'Colab GPU':'本地 GPU');
     if(mode!=='cicy_gpu'){
@@ -1575,10 +1594,14 @@ async function ensureCicyGpu(stageId,allowCreate=false,onProgress=null,instanceT
       const j=d.job||{};
       updateCicyGpuBilling(j);
       if(j.endpoint&&d.local_authorization_loaded){
+        cicyGpuApiReady=true;
+        syncGpuActionAvailability();
         reportState('ready',j,true);
         return;
       }
       if(['failed','cancelled','released','settled'].includes(j.status)){
+        cicyGpuApiReady=false;
+        syncGpuActionAvailability();
         cicyGpuControlJob='';
         cicyGpuRequestId='';
         localStorage.removeItem(PK+'cicyGpuControlJob');
@@ -1633,7 +1656,7 @@ async function genVideo(){
     if(d.error){stage('genStage','❌ '+d.error,true);b.disabled=false;b.textContent='5. 🎬 生成视频';return}
     curJob=d.job_id;localStorage.setItem(PK+'curJob',curJob);
     pollJob(d.job_id,b,mode);
-  }catch(e){stage('genStage','❌ '+e,true);b.disabled=false;b.textContent='5. 🎬 生成视频'}
+  }catch(e){stage('genStage','❌ '+e,true);b.disabled=false;b.textContent='5. 🎬 生成视频';syncGpuActionAvailability()}
 }
 function toggleGenMode(){
   const m=$('genMode').value;
@@ -1644,15 +1667,15 @@ function toggleGenMode(){
 async function pollJob(jid,btn,mode){
   try{
     const d=await (await fetch('/api/job/'+jid)).json();
-    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);btn.disabled=false;btn.textContent='5. 🎬 生成视频';return}
+    if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return}
     else if(d.result){
       stage('genStage','');$('genStage').style.display='none';
       $('resultPrev').src='/api/result/'+jid;$('resultPrev').style.display='block';
       $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+jid;
       toast('✅ 成片完成,已入成品库');loadMediaTab();
-      btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
+      btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return;
     }else if(d.error){stage('genStage','❌ '+d.error,true);
-      btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
+      btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return;
     }else{
       const details=(d.log||[]).slice(-5).join('\n');
       stage('genStage',`⏳ ${d.stage}${Number.isFinite(Number(d.progress))?' · '+Number(d.progress)+'%':''}${details?'\n'+details:''}`);
