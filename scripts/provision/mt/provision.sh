@@ -46,7 +46,11 @@ retry() {
 
 rm -f $WORK/READY
 mkdir -p "$PIP_CACHE_DIR" "$HUGGINGFACE_HUB_CACHE"
-GPU=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader) || die "no GPU on this runtime"
+if [ "${CICY_DOCKER_BUILD:-0}" = "1" ]; then
+  GPU="docker-build (GPU validation deferred)"
+else
+  GPU=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader) || die "no GPU on this runtime"
+fi
 log "GPU: $GPU"
 log "下载加速: 共享缓存 + 标准断点续传 + 5 次重试 + 最多 3 路模型并发"
 
@@ -91,8 +95,40 @@ HF=$ENV/bin/huggingface-cli
     --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
 ) & P1=$!
 (
-  [ -f $M/sd-vae/diffusion_pytorch_model.bin ] || retry $HF download stabilityai/sd-vae-ft-mse --local-dir $M/sd-vae \
-    --include "config.json" "diffusion_pytorch_model.bin"
+  [ -f $M/sd-vae/diffusion_pytorch_model.safetensors ] || {
+    retry $HF download stabilityai/sd-vae-ft-mse --local-dir $M/sd-vae \
+      --include "config.json" "diffusion_pytorch_model.safetensors" || true
+    if [ ! -f $M/sd-vae/diffusion_pytorch_model.safetensors ]; then
+      retry $HF download stabilityai/sd-vae-ft-mse --local-dir $M/sd-vae \
+        --include "config.json" "diffusion_pytorch_model.bin"
+      SD_VAE_DIR=$M/sd-vae $PY - <<'PY'
+import os
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+root = Path(os.environ["SD_VAE_DIR"])
+source = root / "diffusion_pytorch_model.bin"
+target = root / "diffusion_pytorch_model.safetensors"
+state = torch.load(source, map_location="cpu")
+if isinstance(state, dict) and isinstance(state.get("state_dict"), dict):
+    state = state["state_dict"]
+if not isinstance(state, dict):
+    raise RuntimeError("unexpected SD-VAE checkpoint format")
+tensors = {
+    str(key): value.detach().contiguous()
+    for key, value in state.items()
+    if isinstance(value, torch.Tensor)
+}
+if not tensors:
+    raise RuntimeError("SD-VAE checkpoint contains no tensors")
+save_file(tensors, target, metadata={"format": "pt"})
+print(f"converted {source.name} -> {target.name}")
+PY
+    fi
+    [ -s $M/sd-vae/diffusion_pytorch_model.safetensors ]
+  }
 ) & P2=$!
 (
   [ -f $M/whisper/pytorch_model.bin ] || retry $HF download openai/whisper-tiny --local-dir $M/whisper \
@@ -130,9 +166,12 @@ $PY -c "import torch, mmpose, diffusers; print('torch', torch.__version__, 'cuda
   || die "sanity import failed"
 
 log "7/7 smoke test (official sample)"
-START=$(date +%s)
-bash $WORK/synthesize.sh > $WORK/smoke.log 2>&1 || { tail -20 $WORK/smoke.log; die "smoke test failed (see $WORK/smoke.log)"; }
-SMOKE=$(( $(date +%s) - START ))
+SMOKE=deferred
+if [ "${CICY_DOCKER_BUILD:-0}" != "1" ]; then
+  START=$(date +%s)
+  bash $WORK/synthesize.sh > $WORK/smoke.log 2>&1 || { tail -20 $WORK/smoke.log; die "smoke test failed (see $WORK/smoke.log)"; }
+  SMOKE=$(( $(date +%s) - START ))
+fi
 
 {
   echo "gpu=$GPU"

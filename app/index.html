@@ -586,7 +586,6 @@ html.modal-open,body.modal-open{overflow:hidden}
 <div class="modal" id="iModal" style="width:min(780px,94vw);height:min(82vh,760px)">
   <div class="settings-head">
     <h3>⚙️ 系统设置 <span style="font-size:12px;color:var(--mut);font-weight:400" id="iTitle">加载中…</span></h3>
-    <button class="btn ghost" id="settingsRefresh" style="padding:6px 10px;font-size:12px" onclick="refreshSystemSettings(true)">↻ 刷新</button>
   </div>
   <div class="settings-summary" id="settingsSummary">
     <div class="health-icon">⏳</div><div><div class="health-title">正在检查运行环境</div><div class="health-detail">请稍候</div></div>
@@ -613,8 +612,7 @@ html.modal-open,body.modal-open{overflow:hidden}
     </section>
     <section class="settings-panel" data-settings-panel="logs">
       <div class="settings-section-head"><div><div class="settings-section-title">实时操作日志</div>
-        <div class="settings-section-desc">安装、启动、停止、上传、配音与出片的完整步骤；每秒更新</div></div>
-        <button class="btn ghost" onclick="refreshOperationLogs(true)">↻ 刷新</button>
+        <div class="settings-section-desc">安装、启动、停止、上传、配音与出片的完整步骤；每秒自动更新</div></div>
       </div>
       <pre class="logbox show" id="operationLog" style="display:block;max-height:56vh;min-height:300px">正在读取日志…</pre>
     </section>
@@ -1654,6 +1652,10 @@ async function genVideo(){
   }
   const b=$('btn-gen');videoRunning=true;b.disabled=true;b.textContent='生成中…';
   stage('genStage','⬆️ 提交任务…');
+  const stopVideoLogMonitor=await startTaskLogMonitor(
+    'genStage',
+    line=>line.includes('[CiCy GPU 出片]')
+  );
   try{
     await ensureCicyGpu('genStage');
     const fd=new FormData();
@@ -1666,10 +1668,11 @@ async function genVideo(){
     fd.append('sharp',$('optSharp').checked?'1':'0');
     fd.append('randstart',$('optRand').checked?'1':'0');
     const d=await (await fetch('/api/generate-video',{method:'POST',body:fd})).json();
+    stopVideoLogMonitor();
     if(d.error){stage('genStage','❌ '+d.error,true);videoRunning=false;b.disabled=false;b.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return}
     curJob=d.job_id;localStorage.setItem(PK+'curJob',curJob);
     pollJob(d.job_id,b,mode);
-  }catch(e){stage('genStage','❌ '+e,true);videoRunning=false;b.disabled=false;b.textContent='5. 🎬 生成视频';syncGpuActionAvailability()}
+  }catch(e){stopVideoLogMonitor();stage('genStage','❌ '+e,true);videoRunning=false;b.disabled=false;b.textContent='5. 🎬 生成视频';syncGpuActionAvailability()}
 }
 function toggleGenMode(){
   const m=$('genMode').value;
@@ -2238,7 +2241,7 @@ function renderSettingsHealth() {
 
 async function refreshSystemSettings(force=false) {
   const btn = $('settingsRefresh');
-  if(force){btn.disabled = true;btn.textContent = '刷新中…'}
+  if(force&&btn){btn.disabled = true;btn.textContent = '刷新中…'}
   // Remote health probes run independently. A slow Colab response must not
   // block local system details, modal interaction, or another status area.
   const healthTask=Promise.allSettled([refreshEngines(force),refreshStatus(force)])
@@ -2308,7 +2311,7 @@ async function refreshSystemSettings(force=false) {
   } catch (e) { $('sysBar').innerHTML = '<span style="color:var(--red)">加载系统信息失败</span>'; }
   renderSettingsHealth();
   healthTask.finally(()=>{
-    if(force){btn.disabled=false;btn.textContent='↻ 刷新'}
+    if(force&&btn){btn.disabled=false;btn.textContent='↻ 刷新'}
   });
 }
 

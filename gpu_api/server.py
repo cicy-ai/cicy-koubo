@@ -28,7 +28,6 @@ COSYVOICE_SCRIPT = pathlib.Path("/content/cosy/cosyvoice_tts.py")
 DIALECT_LANGUAGES = {
     "zh-CN", "zh-yue", "zh-minnan", "zh-sichuan", "zh-dongbei",
     "zh-shanghai", "zh-tianjin", "zh-shandong", "zh-shaanxi", "zh-shanxi",
-    "en", "ko",
 }
 JOB_ID_RE = re.compile(r"^gpu_[0-9a-f]{32}$")
 MAX_UPLOAD_BYTES = int(os.environ.get("KOUBO_MAX_UPLOAD_BYTES", str(5 * 1024**3)))
@@ -197,6 +196,7 @@ class CosyVoiceEngine(Engine):
 
 
 EDGE_VOICES = {
+    "en": "en-US-JennyNeural", "ko": "ko-KR-SunHiNeural",
     "fr": "fr-FR-DeniseNeural", "de": "de-DE-KatjaNeural",
     "es": "es-ES-ElviraNeural", "it": "it-IT-ElsaNeural",
     "vi": "vi-VN-HoaiMyNeural", "id": "id-ID-GadisNeural",
@@ -498,6 +498,17 @@ def _job_runtime_payload(job: Job) -> dict:
                 )
             ][-40:]
     payload["log"] = lines
+    if job.status == "running" and job.kind == "video" and job.stage == "lipsync":
+        progress_rows = re.findall(
+            r"(\d{1,3})%\|[^|]*\|\s*(\d+)/(\d+)",
+            "\n".join(lines),
+        )
+        if progress_rows:
+            percent, completed, total = progress_rows[-1]
+            payload["progress"] = min(99, int(percent))
+            payload["stage"] = f"lipsync_frame_{completed}_of_{total}"
+            payload["frames_completed"] = int(completed)
+            payload["frames_total"] = int(total)
     if job.status == "running" and job.kind == "tts":
         joined = "\n".join(lines)
         total_match = re.findall(r"分句结果:\s*(\d+)\s*段", joined)

@@ -18,6 +18,7 @@ import shlex
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -159,6 +160,8 @@ _CICY_GPU_SESSIONS = {}
 _CICY_GPU_ACTIVE_JOB_ID = ""
 _CICY_GPU_PREPARED_REFERENCES = {}
 _CICY_GPU_RESULT_ASSETS = {}
+_CICY_GPU_VIDEO_LOG_LINES = {}
+_CICY_GPU_VIDEO_LAST_STATE = {}
 
 def _local_gpu_conf():
     """Read the token written by the Windows installer without exposing it."""
@@ -374,6 +377,73 @@ def _cicy_gateway_conf():
     return "", ""
 
 
+def _public_direct_opener():
+    """Direct HTTPS opener isolated from desktop proxy/SSL_CERT_FILE state."""
+    try:
+        import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except (ImportError, OSError):
+        context = ssl.create_default_context()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
+    )
+
+
+def _curl_upload_signed(path, upload_url, content_type, log_prefix, timeout=900):
+    """Upload through curl/proxy and emit progress without exposing signed URL."""
+    config = (
+        f'url = "{upload_url}"\n'
+        f'upload-file = "{path}"\n'
+        f'header = "Content-Type: {content_type}"\n'
+        'header = "Expect:"\n'
+    )
+    started = time.monotonic()
+    last_bucket = -1
+    with tempfile.TemporaryFile(mode="w+b") as progress:
+        process = subprocess.Popen(
+            [
+                "curl", "--fail", "--show-error", "--progress-bar",
+                "--retry", "3", "--retry-all-errors",
+                "--noproxy", "*",
+                "--connect-timeout", "20", "--max-time", str(timeout),
+                "--speed-limit", "1024", "--speed-time", "30",
+                "--config", "-",
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=progress,
+            text=True,
+        )
+        process.stdin.write(config)
+        process.stdin.close()
+        while process.poll() is None:
+            time.sleep(1)
+            progress.flush()
+            progress.seek(0)
+            report = progress.read().decode("utf-8", errors="replace")
+            percentages = re.findall(r"(\d+(?:\.\d+)?)%", report)
+            if percentages:
+                percent = min(100, int(float(percentages[-1])))
+                bucket = percent // 10
+                if bucket > last_bucket:
+                    last_bucket = bucket
+                    sent = round(path.stat().st_size * percent / 100)
+                    plog(
+                        f"{log_prefix} 上传进度 {percent}% · "
+                        f"{sent}/{path.stat().st_size} bytes · "
+                        f"{time.monotonic() - started:.1f}s"
+                    )
+        progress.seek(0)
+        report = progress.read().decode("utf-8", errors="replace")
+    if process.returncode:
+        raise RuntimeError(
+            f"OSS 上传失败（curl {process.returncode}）：{report[-500:]}"
+        )
+    plog(
+        f"{log_prefix} 上传完成 · {path.stat().st_size} bytes · "
+        f"{time.monotonic() - started:.2f}s"
+    )
+
+
 def _cicy_gateway_request(method, path, payload=None, idempotency_key=""):
     base_url, api_key = _cicy_gateway_conf()
     if not base_url or not api_key:
@@ -391,13 +461,15 @@ def _cicy_gateway_request(method, path, payload=None, idempotency_key=""):
         headers["Content-Type"] = "application/json"
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    openers = (
-        ("system", urllib.request.build_opener()),
-        ("direct", urllib.request.build_opener(urllib.request.ProxyHandler({}))),
-    )
+    # The desktop may set SSL_CERT_FILE to a private MITM bundle which does
+    # not contain the public WebPKI chain.  Keep it for the system-proxy
+    # attempt, but use certifi explicitly for the direct fallback.
+    # CiCy Cloud/OSS must bypass the desktop proxy.  The system route can
+    # block well beyond the UI timeout when its injected CA/proxy is stale.
+    openers = (("direct", _public_direct_opener()),)
     last_error = None
     for attempt in range(3):
-        route_name, opener = openers[min(attempt, len(openers) - 1)]
+        route_name, opener = openers[0]
         req = urllib.request.Request(
             base_url + path, data=data, headers=headers, method=method,
         )
@@ -492,6 +564,62 @@ def _cicy_gpu_proxy(path, complete_on_success=False):
         }), 504
 
 
+def _cicy_gpu_video_status(job_id):
+    """Fetch a video job and mirror new remote model output into the UI log."""
+    session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
+    endpoint = str(session.get("endpoint") or "").rstrip("/")
+    authorization = str(session.get("authorization_token") or "")
+    if not endpoint or not authorization:
+        return jsonify({"error": "CiCy GPU 尚未就绪"}), 503
+    safe_id = urllib.parse.quote(job_id, safe="")
+    upstream = urllib.request.Request(
+        endpoint + f"/api/job/{safe_id}",
+        headers={"Authorization": f"Bearer {authorization}", "Accept": "application/json"},
+    )
+    try:
+        with _public_direct_opener().open(upstream, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        seen = _CICY_GPU_VIDEO_LOG_LINES.setdefault(job_id, set())
+        for raw_line in payload.get("log") or []:
+            line = str(raw_line).strip()
+            if line and line not in seen:
+                seen.add(line)
+                plog(f"[CiCy GPU 出片][模型] {line[:1000]}")
+        if payload.get("status") == "running":
+            progress_rows = re.findall(
+                r"(\d{1,3})%\|[^|]*\|\s*(\d+)/(\d+)",
+                "\n".join(str(line) for line in payload.get("log") or []),
+            )
+            if progress_rows:
+                percent, completed, total = progress_rows[-1]
+                payload["progress"] = min(99, int(percent))
+                payload["stage"] = f"lipsync_frame_{completed}_of_{total}"
+                payload["frames_completed"] = int(completed)
+                payload["frames_total"] = int(total)
+        state = (
+            str(payload.get("status") or ""),
+            str(payload.get("stage") or ""),
+            int(payload.get("progress") or 0),
+        )
+        if _CICY_GPU_VIDEO_LAST_STATE.get(job_id) != state:
+            _CICY_GPU_VIDEO_LAST_STATE[job_id] = state
+            plog(
+                f"[CiCy GPU 出片] 远程进度 · status={state[0]} "
+                f"stage={state[1]} progress={state[2]}%"
+            )
+        return jsonify(payload)
+    except urllib.error.HTTPError as exc:
+        return Response(
+            exc.read(), status=exc.code,
+            content_type=exc.headers.get("Content-Type", "application/json"),
+        )
+    except Exception as exc:
+        return jsonify({
+            "error": f"CiCy GPU 状态读取失败：{type(exc).__name__}: {exc}",
+            "code": "cicy_gpu_status_failed",
+        }), 502
+
+
 def _cicy_gpu_tts():
     """Upload the local reference voice, run remote TTS, and keep the result local."""
     session = _CICY_GPU_SESSIONS.get(_CICY_GPU_ACTIVE_JOB_ID) or {}
@@ -523,8 +651,8 @@ def _cicy_gpu_tts():
         "ru": "Русский", "ar": "العربية", "km": "ខ្មែរ", "lo": "ລາວ",
     }
 
-    gpu_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    oss_opener = urllib.request.build_opener()
+    gpu_opener = _public_direct_opener()
+    oss_opener = _public_direct_opener()
     gpu_headers = {
         "Authorization": f"Bearer {authorization}",
         "Content-Type": "application/json",
@@ -534,8 +662,23 @@ def _cicy_gpu_tts():
         health_req = urllib.request.Request(
             endpoint + "/v1/health", headers=gpu_headers,
         )
-        with gpu_opener.open(health_req, timeout=15) as response:
-            health = json.loads(response.read().decode("utf-8"))
+        health = None
+        health_error = None
+        for attempt in range(3):
+            try:
+                with gpu_opener.open(health_req, timeout=15) as response:
+                    health = json.loads(response.read().decode("utf-8"))
+                break
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                health_error = exc
+                plog(
+                    f"[CiCy GPU 配音] 能力检查连接失败，重试 "
+                    f"{attempt + 1}/3 · {type(exc).__name__}"
+                )
+                if attempt < 2:
+                    time.sleep(attempt + 1)
+        if health is None:
+            raise health_error or RuntimeError("GPU 能力检查无响应")
         supported = set(health.get("tts_languages") or [])
         capability = str(health.get("capabilities_version") or "")
         if language not in supported or not capability.startswith("2026.07.30-multilingual-"):
@@ -745,25 +888,33 @@ def _cicy_gpu_video():
     if not audio or not audio.is_file() or not video or not video.is_file():
         return jsonify({"error": "缺少本地底板或配音素材"}), 400
     region = session.get("region_id") or "cn-hangzhou"
+    plog(
+        f"[CiCy GPU 出片] 1/7 素材确认 · "
+        f"video={video.name} {video.stat().st_size} bytes · "
+        f"audio={audio.name} {audio.stat().st_size} bytes"
+    )
     signed_assets = []
-    for purpose, path, content_type, extension in (
+    for asset_index, (purpose, path, content_type, extension) in enumerate((
         ("video", video, "video/mp4", "mp4"),
         ("audio", audio, "audio/wav", "wav"),
-    ):
+    ), start=2):
+        plog(f"[CiCy GPU 出片] {asset_index}/7 获取 {purpose} OSS 签名")
         status, signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
             "region_id": region, "purpose": purpose,
             "content_type": content_type, "extension": extension,
         })
         if status >= 300:
             return jsonify({"error": signed.get("error") or "OSS 上传签名失败"}), status
-        upload = urllib.request.Request(
-            signed["upload_url"], data=path.read_bytes(),
-            headers={"Content-Type": content_type, "User-Agent": "cicy-koubo/0.1.8"},
-            method="PUT",
+        plog(
+            f"[CiCy GPU 出片] {asset_index}/7 {purpose} 签名完成，开始上传 · "
+            f"{path.stat().st_size} bytes"
         )
-        with urllib.request.build_opener().open(upload, timeout=600):
-            pass
+        _curl_upload_signed(
+            path, signed["upload_url"], content_type,
+            f"[CiCy GPU 出片] {asset_index}/7 {purpose}",
+        )
         signed_assets.append(signed)
+    plog("[CiCy GPU 出片] 4/7 获取成片回传签名")
     status, result_signed = _cicy_gateway_request("POST", "/api/koubo/assets/sign", {
         "region_id": region, "purpose": "result",
         "content_type": "video/mp4", "extension": "mp4",
@@ -775,7 +926,7 @@ def _cicy_gpu_video():
         "Content-Type": "application/json",
         "User-Agent": "cicy-koubo/0.1.8",
     }
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = _public_direct_opener()
     payload = {
         "video_url": signed_assets[0]["download_url"],
         "audio_url": signed_assets[1]["download_url"],
@@ -785,23 +936,34 @@ def _cicy_gpu_video():
         "result_download_url": result_signed["download_url"],
     }
     try:
+        plog("[CiCy GPU 出片] 5/7 提交 MuseTalk 远程任务")
         req = urllib.request.Request(
             endpoint + "/v1/video-jobs",
             data=json.dumps(payload).encode(), headers=gpu_headers, method="POST",
         )
         with opener.open(req, timeout=600) as response:
             remote = json.loads(response.read().decode())
-        _CICY_GPU_RESULT_ASSETS[str(remote["id"])] = result_signed
+        remote_job = str(remote.get("id") or remote.get("job_id") or "")
+        if not remote_job:
+            raise RuntimeError("GPU 出片响应缺少任务 ID")
+        plog(f"[CiCy GPU 出片] 6/7 远程任务已创建 · job={remote_job}")
+        _CICY_GPU_RESULT_ASSETS[remote_job] = result_signed
         for signed in signed_assets:
             try:
-                urllib.request.build_opener().open(
+                _public_direct_opener().open(
                     urllib.request.Request(signed["delete_url"], method="DELETE"), timeout=30,
                 ).close()
             except Exception:
                 pass
-        return jsonify({"job_id": remote["id"]}), 202
+        return jsonify({"job_id": remote_job}), 202
     except urllib.error.HTTPError as exc:
         return Response(exc.read(), status=exc.code, content_type="application/json")
+    except Exception as exc:
+        plog(f"[CiCy GPU 出片] ❌ 提交失败 · {type(exc).__name__}: {str(exc)[:500]}")
+        return jsonify({
+            "error": f"CiCy GPU 出片提交失败：{type(exc).__name__}: {exc}",
+            "code": "cicy_gpu_video_submit_failed",
+        }), 502
 
 def _colab_profiles_cfg():
     """读取 Colab CLI 配置档；凭据文件由用户在本机单独准备。"""
@@ -1593,8 +1755,14 @@ def generate_video():
     return jsonify({"job_id": job_id})
 
 
-@app.get("/api/job/<job_id>")
+@app.route("/api/job/<job_id>", methods=["GET", "DELETE"])
 def job_status(job_id):
+    if request.method == "DELETE":
+        if GPU_MODE != "cicy_gpu":
+            return jsonify({"error": "remote cancellation is only available in CiCy GPU mode"}), 400
+        return _cicy_gpu_proxy(
+            f"/v1/jobs/{urllib.parse.quote(job_id, safe='')}",
+        )
     recovered = WORK / job_id / "result.mp4"
     if recovered.is_file():
         return jsonify({
@@ -1604,7 +1772,7 @@ def job_status(job_id):
             "error": None,
         })
     if GPU_MODE == "cicy_gpu":
-        return _cicy_gpu_proxy(f"/api/job/{urllib.parse.quote(job_id, safe='')}")
+        return _cicy_gpu_video_status(job_id)
     j = JOBS.get(job_id)
     if not j:
         return jsonify({"error": "unknown job"}), 404
@@ -1620,9 +1788,7 @@ def result(job_id):
     result_asset = _CICY_GPU_RESULT_ASSETS.get(job_id)
     if result_asset:
         upstream = urllib.request.Request(result_asset["download_url"], method="GET")
-        response = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-        ).open(upstream, timeout=300)
+        response = _public_direct_opener().open(upstream, timeout=300)
 
         def stream_result():
             completed = False
@@ -1637,7 +1803,7 @@ def result(job_id):
                 response.close()
                 if completed:
                     try:
-                        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                        _public_direct_opener().open(
                             urllib.request.Request(result_asset["delete_url"], method="DELETE"),
                             timeout=30,
                         ).close()
@@ -4305,7 +4471,7 @@ def cicy_gpu_prepare_reference():
         return jsonify({"error": signed.get("error") or "OSS 上传签名失败"}), status
     payload_bytes = ref.read_bytes()
     plog(f"[CiCy GPU 配音] 3/6 上传参考音频 · bytes={len(payload_bytes)}")
-    opener = urllib.request.build_opener()
+    opener = _public_direct_opener()
     upload = urllib.request.Request(
         signed["upload_url"], data=payload_bytes,
         headers={"Content-Type": "audio/wav", "User-Agent": "cicy-koubo/0.1.8"},

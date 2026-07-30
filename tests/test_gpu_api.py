@@ -102,6 +102,25 @@ class GpuApiTest(unittest.TestCase):
         self.assertEqual(payload["stage"], "synthesizing_segment_3_of_4")
         self.assertTrue(any("模型就绪" in line for line in payload["log"]))
 
+    def test_video_job_reports_real_frame_progress_and_logs(self):
+        job = self.server.STORE.create("video", "musetalk")
+        job.status = "running"
+        job.stage = "lipsync"
+        job.progress = 25
+        (job.directory / "musetalk.log").write_text(
+            "TensorFlow optional backend warning\n"
+            "60%|██████    | 138/231 [01:02<00:37, 2.49it/s]\n",
+            encoding="utf-8",
+        )
+        payload = self.client.get(
+            f"/v1/jobs/{job.id}", headers=self.auth()
+        ).get_json()
+        self.assertEqual(payload["progress"], 60)
+        self.assertEqual(payload["stage"], "lipsync_frame_138_of_231")
+        self.assertEqual(payload["frames_completed"], 138)
+        self.assertEqual(payload["frames_total"], 231)
+        self.assertIn("TensorFlow optional backend warning", payload["log"])
+
     def test_job_ids_are_validated(self):
         response = self.client.get("/v1/jobs/nope", headers=self.auth())
         self.assertEqual(response.status_code, 400)
