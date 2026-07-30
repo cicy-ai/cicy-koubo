@@ -447,7 +447,7 @@ html.modal-open,body.modal-open{overflow:hidden}
     </div>
     <div class="row"><span class="kv">音量</span><input type="range" id="bgmVol" min="0.05" max="0.8" step="0.05" value="0.2"
       oninput="$('bgmV').textContent=Math.round(this.value*100)+'%'"><b class="kv" id="bgmV">20%</b></div>
-    <button class="btn big" id="btn-edit" onclick="editVideo()">6. ✂️ 剪辑(烧字幕 + 混BGM)</button>
+    <button class="btn big" id="btn-edit" onclick="editVideo()" disabled>6. ✂️ 剪辑(烧字幕 + 混BGM)</button>
     <div class="stage" id="editStage"></div>
     <video class="prev" id="editPrev" controls playsinline></video>
     <div class="row"><button class="btn ghost" style="flex:1" id="btn-edit-dl" onclick="dlEdit()" disabled>⬇ 下载剪辑成片</button></div>
@@ -1619,6 +1619,13 @@ async function ensureCicyGpu(stageId,allowCreate=false,onProgress=null,instanceT
 
 /* ---------- ③ 出片 ---------- */
 let videoBlob=null,curJob=localStorage.getItem(PK+'curJob')||'';
+let hasGeneratedVideo=false;
+function syncEditAvailability(){
+  const button=$('btn-edit');
+  if(!button)return;
+  button.disabled=!hasGeneratedVideo||editRunning;
+  button.title=hasGeneratedVideo?'':'请先完成第 5 步生成视频';
+}
 function previewBase(){
   const v=$('baseSel').value;if(!v)return;
   videoBlob=null;
@@ -1671,6 +1678,7 @@ async function pollJob(jid,btn,mode){
     else if(d.result){
       stage('genStage','');$('genStage').style.display='none';
       $('resultPrev').src='/api/result/'+jid;$('resultPrev').style.display='block';
+      hasGeneratedVideo=true;syncEditAvailability();
       $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+jid;
       toast('✅ 成片完成,已入成品库');loadMediaTab();
       btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return;
@@ -1702,6 +1710,10 @@ async function genSrt(){
   b.disabled=false;b.textContent='按配音生成';
 }
 async function editVideo(){
+  if(!hasGeneratedVideo||!curJob){
+    syncEditAvailability();
+    return toast('请先完成第 5 步生成视频');
+  }
   if(editRunning){
     toast('剪辑正在进行，请勿重复点击');
     return;
@@ -1713,7 +1725,7 @@ async function editVideo(){
   stage('editStage','⏳ 正在烧录…');
   try{
     const fd=new FormData();
-    if(curJob)fd.append('job_id',curJob);  // 无则后端自动取最新原始成片
+    fd.append('job_id',curJob);
     fd.append('text',$('subText').value);
     fd.append('font',$('subFont').value||'heavy');
     fd.append('fontsize',$('subSize').value);fd.append('color',$('subColor').value);
@@ -1734,7 +1746,7 @@ async function editVideo(){
     }
   }catch(e){stage('editStage','❌ '+e,true)}
   editRunning=false;
-  b.disabled=false;b.textContent='6. ✂️ 剪辑(烧字幕 + 混BGM)';
+  b.disabled=false;b.textContent='6. ✂️ 剪辑(烧字幕 + 混BGM)';syncEditAvailability();
 }
 function dlEdit(){if(!editUrl)return;const a=document.createElement('a');
   a.href=editUrl;a.download='edited.mp4';a.click()}
@@ -2974,6 +2986,7 @@ async function installCoreEngines(btn) {
 /* ---------- 启动 ---------- */
 (async function init(){
   persistInit();bindUploads();
+  syncEditAvailability();
   $('ttsLanguage').value=localStorage.getItem(PK+'ttsLanguage')||'zh-CN';
   $('ttsLanguage').addEventListener('change',()=>{
     localStorage.setItem(PK+'ttsLanguage',$('ttsLanguage').value);
@@ -3004,8 +3017,13 @@ async function installCoreEngines(btn) {
   if(curJob){
     const r=await fetch('/api/result/'+curJob,{method:'HEAD'}).catch(()=>null);
     if(r&&r.ok){$('resultPrev').src='/api/result/'+curJob;$('resultPrev').style.display='block';
-      $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+curJob}
+      $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+curJob;
+      hasGeneratedVideo=true;
+    }else{
+      curJob='';localStorage.removeItem(PK+'curJob');
+    }
   }
+  syncEditAvailability();
   previewBase();
   renderTab();loadScriptsTab();loadMediaTab();
   // 视频控件自动隐藏: 悬停显示, 移出 2s 后淡出
