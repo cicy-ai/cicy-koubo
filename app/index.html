@@ -1295,9 +1295,10 @@ async function refreshGpuModeHeader(){
       $('gpuDestroyBtn').style.display=cicyGpuControlJob?'inline-flex':'none';
     }
     const cloudMode=mode==='cicy_gpu';
-    $('lblEngine').style.display=cloudMode?'none':'';
-    $('engine').style.display=cloudMode?'none':'';
+    $('lblEngine').style.display='';
+    $('engine').style.display='';
     $('rowEngineOpts').style.display=cloudMode?'none':'';
+    applyLipsyncEngineSelect({engines:_engineState||[]});
     $('topGpuHint').textContent=mode==='cicy_gpu'
       ?'按分钟计费 · OSS 临时中转 · 本地拉取后即删 · 手动销毁'
       :(mode==='colab'?'使用你的 Google Colab 会话':'使用本机 NVIDIA 显卡，不产生云端费用');
@@ -1652,7 +1653,10 @@ async function pollJob(jid,btn,mode){
       btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
     }else if(d.error){stage('genStage','❌ '+d.error,true);
       btn.disabled=false;btn.textContent='5. 🎬 生成视频';return;
-    }else{stage('genStage','⏳ '+d.stage+(d.log&&d.log.length?' · '+d.log[d.log.length-1].slice(0,60):''))}
+    }else{
+      const details=(d.log||[]).slice(-5).join('\n');
+      stage('genStage',`⏳ ${d.stage}${Number.isFinite(Number(d.progress))?' · '+Number(d.progress)+'%':''}${details?'\n'+details:''}`);
+    }
     setTimeout(()=>pollJob(jid,btn),mode==='simple'?1000:4000);
   }catch(e){setTimeout(()=>pollJob(jid,btn),mode==='simple'?2000:6000)}
 }
@@ -1758,11 +1762,15 @@ async function loadSelects(preferVoiceId=''){
   return {vs,bs,gs};
 }
 function applyLipsyncEngineSelect(es){
-  // 引擎:只显示已安装的口型引擎(排除cosy等非口型引擎)
+  // CiCy GPU 使用镜像内置的远端引擎，不能用本机安装状态过滤。
+  // 实例未启动时 /api/engines 只反映本机，因此显式提供云端能力。
   const LIPSYNC_KEYS=['mt','hg'];
   const engEl=$('engine'), keep=engEl.value;
   engEl.innerHTML='';
-  const ready=(es.engines||[]).filter(e=>e.installed&&LIPSYNC_KEYS.includes(e.key));
+  const provider=$('topGpuMode')?.value||'cicy_gpu';
+  const ready=provider==='cicy_gpu'
+    ?[{key:'mt',name:'MuseTalk（CiCy GPU 内置）',installed:true}]
+    :(es.engines||[]).filter(e=>e.installed&&LIPSYNC_KEYS.includes(e.key));
   if(!ready.length) engEl.innerHTML='<option value="">-- 请先安装引擎 --</option>';
   else ready.forEach(e=>{const o=new Option(e.name,e.key);engEl.appendChild(o);});
   if(keep&&[...engEl.options].some(o=>o.value===keep)) engEl.value=keep;
