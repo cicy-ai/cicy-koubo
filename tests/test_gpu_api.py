@@ -81,6 +81,27 @@ class GpuApiTest(unittest.TestCase):
             response.get_json()["error"], "multilingual_tts_script_missing"
         )
 
+    def test_tts_job_reports_real_segment_progress_and_logs(self):
+        job = self.server.STORE.create("tts", "cosyvoice")
+        job.status = "running"
+        job.stage = "synthesizing"
+        job.progress = 20
+        (job.directory / "cosyvoice.log").write_text(
+            "[02:54:12] 模型就绪(sr=24000),耗时 47.3s\n"
+            "[02:54:12] 分句结果: 4 段\n"
+            "[02:54:46] 段1 合成完成: 7.80s 音频 / 1 次yield / 耗时 34.4s\n"
+            "[02:55:10] 段2 合成完成: 5.20s 音频 / 1 次yield / 耗时 23.1s\n",
+            encoding="utf-8",
+        )
+        payload = self.client.get(
+            f"/v1/jobs/{job.id}", headers=self.auth()
+        ).get_json()
+        self.assertEqual(payload["segments_total"], 4)
+        self.assertEqual(payload["segments_completed"], 2)
+        self.assertEqual(payload["progress"], 60)
+        self.assertEqual(payload["stage"], "synthesizing_segment_3_of_4")
+        self.assertTrue(any("模型就绪" in line for line in payload["log"]))
+
     def test_job_ids_are_validated(self):
         response = self.client.get("/v1/jobs/nope", headers=self.auth())
         self.assertEqual(response.status_code, 400)

@@ -473,10 +473,52 @@ def _job_or_error(job_id: str):
     return job, None
 
 
+def _job_runtime_payload(job: Job) -> dict:
+    payload = job.public()
+    log_name = (
+        "musetalk.log" if job.kind == "video"
+        else ("edge-tts.log" if job.engine == "edge-tts" else "cosyvoice.log")
+    )
+    log_path = job.directory / log_name
+    lines: list[str] = []
+    if log_path.is_file():
+        raw_lines = log_path.read_text(
+            encoding="utf-8", errors="replace",
+        ).replace("\r", "\n").splitlines()
+        if job.kind == "video":
+            lines = [line.strip()[:1000] for line in raw_lines if line.strip()][-40:]
+        else:
+            lines = [
+                line.strip()[:1000] for line in raw_lines
+                if line.strip() and (
+                    re.match(r"^\[\d\d:\d\d:\d\d\]", line.strip())
+                    or " INFO synthesis text " in line
+                    or " INFO yield speech len " in line
+                    or "Downloading Model to directory:" in line
+                )
+            ][-40:]
+    payload["log"] = lines
+    if job.status == "running" and job.kind == "tts":
+        joined = "\n".join(lines)
+        total_match = re.findall(r"分句结果:\s*(\d+)\s*段", joined)
+        completed = len(re.findall(r"段\d+\s+合成完成:", joined))
+        if total_match:
+            total = max(1, int(total_match[-1]))
+            completed = min(completed, total)
+            payload["progress"] = min(95, 25 + round(70 * completed / total))
+            payload["stage"] = (
+                f"synthesizing_segment_{min(completed + 1, total)}_of_{total}"
+                if completed < total else "finalizing_audio"
+            )
+            payload["segments_total"] = total
+            payload["segments_completed"] = completed
+    return payload
+
+
 @app.get("/v1/jobs/<job_id>")
 def get_job(job_id: str):
     job, error = _job_or_error(job_id)
-    return error or jsonify(job.public())
+    return error or jsonify(_job_runtime_payload(job))
 
 
 @app.get("/v1/jobs/<job_id>/result")
@@ -526,16 +568,11 @@ def compat_job(job_id: str):
     job, error = _job_or_error(job_id)
     if error:
         return error
-    log_path = job.directory / (
-        "musetalk.log" if job.kind == "video" else "cosyvoice.log"
-    )
-    log = []
-    if log_path.is_file():
-        log = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
+    runtime = _job_runtime_payload(job)
     return jsonify({
-        "stage": job.stage,
-        "progress": job.progress,
-        "log": log,
+        "stage": runtime["stage"],
+        "progress": runtime["progress"],
+        "log": runtime["log"],
         "result": job.id if job.status == "succeeded" else None,
         "error": job.error or None,
         "status": job.status,
