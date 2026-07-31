@@ -77,7 +77,7 @@ retry "$PIP" install -q \
   "pillow==9.5.0" "protobuf==4.23.4" "typeguard==2.13.3" \
   "trimesh==3.23.5" "pyrender==0.1.45" "pyopengl==3.1.0" \
   "cv2box==0.5.9" "apstone==0.0.8" \
-  pyyaml requests tqdm flask psutil numexpr \
+  "einops==0.6.1" pyyaml requests tqdm flask psutil numexpr \
   || die "HeyGem 兼容依赖安装失败（已重试 5 次）"
 
 log "4/5 模型权重(download.sh)"
@@ -98,6 +98,10 @@ echo "$CHECK_OUT" | grep -q "NOT using the GPU" \
   && die "ONNX CUDA 实际 Session 回退到 CPU"
 echo "$CHECK_OUT" | grep -q "CUDAExecutionProvider" \
   || die "ONNX CUDA 实际 Session 未启用 CUDAExecutionProvider"
+# READY 之前必须走到 HeyGem 的顶层业务模块；仅验证 ONNX 不足以发现
+# DINet 等运行时依赖缺失。
+(cd "$REPO" && "$PY" -c 'import service.trans_dh_service') \
+  || die "HeyGem 业务模块导入自检失败"
 curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/synthesize.sh || die "synthesize wrapper"
 
 cat > $WORK/HG_READY <<EOF
