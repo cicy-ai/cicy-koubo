@@ -50,13 +50,22 @@ PIP=$ENV/bin/pip; PY=$ENV/bin/python
 log "2/5 HeyGem repo"
 [ -d $REPO/.git ] || retry git clone -q --depth 1 --filter=blob:none https://github.com/Holasyb918/HeyGem-Linux-Python-Hack $REPO || die "clone"
 
-log "3/5 requirements(cuda11.8 + onnxruntime-gpu 1.16)"
+log "3/5 requirements(torch2.0.1+cu118 + onnxruntime-gpu 1.16)"
 cd $REPO
-# requirements 钉死的 onnxruntime-gpu==1.9.0 已下架,装到那行整批中断 → 剔掉后再装
-grep -viE "onnxruntime" requirements.txt > /tmp/hg_req.txt
-$PIP install -q -r /tmp/hg_req.txt 2>&1 | tail -3 || echo "requirements 部分失败,继续"
-$PIP install -q "onnxruntime-gpu==1.16.0" typeguard opencv-python-headless \
-  librosa soundfile tqdm flask 2>&1 | tail -1 || true
+# 上游 requirements 固定了已不可用的 cu113 wheel 和已下架的 ORT 1.9。
+# 先剔除这些行，再使用 Colab T4 可用的 cu118 组合；任何必需依赖失败都
+# 必须终止，不能继续写出假 READY。
+grep -viE "^(onnxruntime|torch|torchaudio|torchvision)==" requirements.txt \
+  > /tmp/hg_req.txt
+retry "$PIP" install -q \
+  "torch==2.0.1+cu118" "torchvision==0.15.2+cu118" "torchaudio==2.0.2+cu118" \
+  --index-url https://download.pytorch.org/whl/cu118 \
+  || die "PyTorch cu118 安装失败（已重试 5 次）"
+retry "$PIP" install -q -r /tmp/hg_req.txt \
+  || die "HeyGem requirements 安装失败（已重试 5 次）"
+retry "$PIP" install -q "onnxruntime-gpu==1.16.0" typeguard \
+  opencv-python-headless librosa soundfile tqdm flask \
+  || die "ONNX Runtime 依赖安装失败（已重试 5 次）"
 
 log "4/5 模型权重(download.sh)"
 bash download.sh 2>&1 | tail -5 || die "model download"
@@ -69,7 +78,7 @@ if [ ! -f face_detect_utils/resources/.scrfd10g ]; then
 fi
 
 log "5/5 onnx/cuda 自检 + 合成封装"
-$PY check_env/check_onnx_cuda.py 2>&1 | tail -2 || echo "WARN: onnx cuda 自检未过,首次合成时再定位"
+$PY check_env/check_onnx_cuda.py || die "ONNX CUDA 自检失败"
 curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/synthesize.sh || die "synthesize wrapper"
 
 cat > $WORK/HG_READY <<EOF
