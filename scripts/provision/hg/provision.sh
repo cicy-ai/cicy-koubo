@@ -71,7 +71,7 @@ retry "$PIP" install -q \
   "transformers==4.30.2" "tokenizers==0.13.3" \
   "huggingface-hub==0.16.4" "kornia==0.6.12" \
   "pillow==9.5.0" "protobuf==4.23.4" "typeguard==2.13.3" \
-  "trimesh==3.23.5" "pyrender==0.1.45" "pyopengl==3.1.7" \
+  "trimesh==3.23.5" "pyrender==0.1.45" "pyopengl==3.1.0" \
   "cv2box==0.5.9" "apstone==0.0.8" \
   pyyaml requests tqdm flask psutil numexpr \
   || die "HeyGem 兼容依赖安装失败（已重试 5 次）"
