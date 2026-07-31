@@ -1130,14 +1130,17 @@ def _colab_exec(cmd_str, session=None, timeout=300, profile=None):
     # 写一个 Python 脚本来执行命令并打印输出
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(f"import subprocess,sys,json\n"
-                f"r=subprocess.run({repr(cmd_str)},shell=True,capture_output=True,text=True,timeout={timeout})\n"
+                f"r=subprocess.run({repr(cmd_str)},shell=True,capture_output=True,"
+                f"text=True,encoding='utf-8',errors='replace',timeout={timeout})\n"
                 f"sys.stdout.write(r.stdout)\n"
+                f"sys.stdout.write(r.stderr)\n"
                 f"sys.stdout.write(json.dumps({{'rc':r.returncode}}))\n")
         tmp = f.name
     resolved_session = _colab_resolve_session(profile, session)
     args = _colab_base_args(profile) + ["exec", "-s", resolved_session, "-f", tmp, "--timeout", str(timeout)]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 30,
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout + 30,
                            env=_colab_env(profile))
     except FileNotFoundError:
         try:
@@ -1318,6 +1321,26 @@ def api_ui_log():
     return jsonify({"ok": True})
 
 
+@app.errorhandler(Exception)
+def api_unhandled_error(exc):
+    """Never hide API failures behind Flask's HTML error page."""
+    if not request.path.startswith("/api/"):
+        raise exc
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        status = int(exc.code or 500)
+        message = exc.description or exc.name
+    else:
+        status = 500
+        message = f"{type(exc).__name__}: {exc}"
+    plog(f"[API ERROR] {request.method} {request.path} · HTTP {status} · {message}")
+    return jsonify({
+        "error": message if status < 500 else "服务器内部错误，请查看操作日志",
+        "code": "api_error",
+        "status": status,
+    }), status
+
+
 # 持久化各行指纹，避免重启后重复输出
 _PROV_FP = APP_DIR / "prov_seen.json"
 
@@ -1477,17 +1500,20 @@ def status():
     elif GPU_MODE == "colab_cli":
         active, tnote = _colab_session_active()
         tstate = "ready" if active else "offline"
-        mt_ready = cosy_is_ready = False
+        mt_ready = hg_ready = cosy_is_ready = False
         if active:
             _, ready_out = _colab_exec(
                 "test -f /content/mt/READY && echo __MT_READY__; "
+                "test -f /content/hg/HG_READY && echo __HG_READY__; "
                 "test -f /content/cosy/COSY_READY && echo __COSY_READY__",
                 timeout=30,
             )
             mt_ready = "__MT_READY__" in ready_out
+            hg_ready = "__HG_READY__" in ready_out
             cosy_is_ready = "__COSY_READY__" in ready_out
         audio = "ready" if cosy_is_ready else ("installing" if active else "down")
-        video = "ready" if mt_ready else ("installing" if active else "down")
+        video = "ready" if (mt_ready or hg_ready) else ("installing" if active else "down")
+        video_engines = {"musetalk": mt_ready, "heygem": hg_ready}
     elif GPU_MODE == "local":
         gpu_mb = _get_gpu_memory_mb()
         tstate = "ready" if gpu_mb >= 8192 else "offline"
@@ -1510,6 +1536,7 @@ def status():
         "gpu_mode": GPU_MODE,
         "audio_service": audio,
         "video_service": video,
+        "video_engines": locals().get("video_engines", {}),
         "overall": overall,
     }
     status._cache = (now, payload)
@@ -1629,7 +1656,9 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                     launch, session=colab_session, timeout=30, profile=colab_profile,
                 )
                 if launch_rc != 0:
-                    raise RuntimeError("MuseTalk launch failed via colab CLI: " + launch_out[-200:])
+                    raise RuntimeError(
+                        f"{engine} launch failed via colab CLI: " + launch_out[-200:]
+                    )
                 remote_log_seen = ""
                 rc = 124
                 inference_started = time.monotonic()
@@ -1666,7 +1695,7 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
                         log(f"{engine} GPU 推理结束: rc={rc}, 耗时 {time.monotonic()-inference_started:.1f}s")
                         break
                 if rc != 0:
-                    raise RuntimeError(f"MuseTalk failed via colab CLI (rc={rc})")
+                    raise RuntimeError(f"{engine} failed via colab CLI (rc={rc})")
             else:
                 # 实时日志:stream 行写入 j["log"] 供前端轮询
                 local_cmd = _rewrite_local(SSH + [cmd])
@@ -1752,6 +1781,8 @@ def do_generate(job_id, video_path, audio_path, bbox, opts=None):
 @app.post("/api/generate-video")
 def generate_video():
     requested_mode = request.form.get("mode") or "lipsync"
+    engine = request.form.get("engine") or "musetalk"
+    engine = {"mt": "musetalk", "hg": "heygem"}.get(engine, engine)
     # Base preview is always a local ffmpeg operation. It must never create a
     # cloud/Colab GPU job or depend on a remote runtime.
     if requested_mode != "simple" and GPU_MODE == "cicy_gpu":
@@ -1794,12 +1825,20 @@ def generate_video():
             return jsonify({"error": "没有底板视频:请选择文件,或先通过飞书发一条底板视频"}), 400
     if mode != "simple":  # 仅底板合成是纯本机操作,不需要 GPU
         if GPU_MODE == "colab_cli":
+            ready_file = (
+                "/content/hg/HG_READY"
+                if engine == "heygem"
+                else "/content/mt/READY"
+            )
+            engine_name = "HeyGem" if engine == "heygem" else "MuseTalk"
             ready_rc, ready_out = _colab_exec(
-                "test -f /content/mt/READY && nvidia-smi --query-gpu=name --format=csv,noheader",
+                f"test -f {ready_file} && nvidia-smi --query-gpu=name --format=csv,noheader",
                 timeout=20,
             )
             if ready_rc != 0 or not ready_out.strip():
-                return jsonify({"error": "Colab GPU 或 MuseTalk 未就绪，请先启动会话并安装 MuseTalk"}), 503
+                return jsonify({
+                    "error": f"Colab GPU 或 {engine_name} 未就绪，请先启动会话并安装 {engine_name}"
+                }), 503
         else:
             tstate, _ = tunnel_status()
             if tstate != "ready":
@@ -1825,12 +1864,22 @@ def generate_video():
     else:
         ap = None
     bbox = request.form.get("bbox", "0")
-    engine = request.form.get("engine") or "musetalk"
-    # 兼容前端 engine key
-    engine = {"mt": "musetalk", "hg": "heygem"}.get(engine, engine)
-    if mode != "simple" and engine == "heygem" and \
-            not _ssh_check("test -f /content/hg/HG_READY && echo OK", "OK"):
-        return jsonify({"error": "HeyGem 引擎未安装:在 Colab notebook 里运行「可选:安装 HeyGem」cell(需 ≥16GB 显存)"}), 503
+    if mode != "simple" and engine == "heygem":
+        if GPU_MODE == "colab_cli":
+            hg_rc, hg_out = _colab_exec(
+                "test -f /content/hg/HG_READY && echo OK",
+                timeout=30,
+                profile=_active_colab_profile(),
+            )
+            heygem_ready = hg_rc == 0 and "OK" in hg_out
+        else:
+            heygem_ready = _ssh_check(
+                "test -f /content/hg/HG_READY && echo OK", "OK"
+            )
+        if not heygem_ready:
+            return jsonify({
+                "error": "HeyGem 引擎未就绪，请在系统管理中检查当前 GPU 会话和 HeyGem 状态"
+            }), 503
     opts = {"sharp": request.form.get("sharp") == "1",       # 牙齿高清=成片锐化
             "randstart": request.form.get("randstart") == "1",  # 动作随机=底板随机起点
             "mode": mode, "engine": engine}
@@ -2080,7 +2129,40 @@ def tts():
 def tts_status():
     payload = dict(_TTS_ACTIVE)
     payload.setdefault("active", False)
+    if payload.get("started_at"):
+        payload["elapsed_seconds"] = max(
+            0, int(time.time() - float(payload["started_at"]))
+        )
     return jsonify(payload)
+
+
+@app.get("/api/tasks/active")
+def active_tasks():
+    """Return server-owned task state so a page refresh can reattach safely."""
+    now = time.time()
+    tts_task = dict(_TTS_ACTIVE)
+    tts_task.setdefault("active", False)
+    if tts_task.get("started_at"):
+        tts_task["elapsed_seconds"] = max(
+            0, int(now - float(tts_task["started_at"]))
+        )
+
+    video_task = dict(_VIDEO_ACTIVE)
+    video_task.setdefault("active", False)
+    video_job_id = str(video_task.get("job_id") or "")
+    video_job = JOBS.get(video_job_id) if video_job_id else None
+    if video_task.get("started_at"):
+        video_task["elapsed_seconds"] = max(
+            0, int(now - float(video_task["started_at"]))
+        )
+    if video_job:
+        video_task.update({
+            "stage": video_job.get("stage"),
+            "log": list(video_job.get("log") or [])[-10:],
+            "error": video_job.get("error"),
+            "result": video_job.get("result"),
+        })
+    return jsonify({"tts": tts_task, "video": video_task})
 
 
 def _tts_impl(jid=None):
@@ -4156,19 +4238,30 @@ ENGINES = {
         "ready": "/content/mt/READY",
         "dir": "/content/mt",
         "install_hint": "制作数字人口型视频需要；只做配音时不用安装",
+        "estimated_install_minutes": [12, 20],
+        "estimated_disk_gib": 15,
     },
     "cosy":     {
         "name": "CosyVoice",
         "ready": "/content/cosy/COSY_READY",
         "dir": "/content/cosy",
         "install_hint": "配音和参考音频转写需要；安装后同时提供 Whisper",
+        "estimated_install_minutes": [20, 30],
+        "estimated_disk_gib": 18,
     },
-    "whisper":  {"name": "Whisper",   "ready": "/content/cosy/COSY_READY", "dir": "/content/cosy", "builtin": True},
+    "whisper":  {
+        "name": "Whisper", "ready": "/content/cosy/COSY_READY",
+        "dir": "/content/cosy", "builtin": True,
+        "estimated_install_minutes": [20, 30],
+        "estimated_disk_gib": 0,
+    },
     "hg":       {
         "name": "HeyGem",
         "ready": "/content/hg/HG_READY",
         "dir": "/content/hg",
         "install_hint": "仅选择 HeyGem 数字人时安装；其他流程不用安装",
+        "estimated_install_minutes": [8, 15],
+        "estimated_disk_gib": 8,
     },
 }
 
@@ -4238,7 +4331,7 @@ def _colab_engine_marked_active(engine):
 
 
 def _colab_upload_all_engine_scripts(profile):
-    """Seed every bundled engine script immediately after a new VM starts."""
+    """Clone the public repo once and seed every engine script on a new VM."""
     seed_rc, seed_out = _colab_exec(
         "test -f /content/.koubo_engine_scripts_ready && echo SEEDED",
         timeout=20,
@@ -4247,78 +4340,64 @@ def _colab_upload_all_engine_scripts(profile):
     if seed_rc == 0 and "SEEDED" in seed_out:
         plog("[Colab 会话初始化] 安装脚本已预上传，跳过重复上传")
         return [key for key, cfg in ENGINES.items() if not cfg.get("builtin")]
-    uploaded = []
-    for engine, cfg in ENGINES.items():
-        if cfg.get("builtin"):
-            continue
-        source_dir = SRC_DIR.parent / "scripts/provision" / engine
-        if not source_dir.is_dir():
-            continue
-        remote_dir = cfg["dir"]
-        rc, output = 1, ""
-        for attempt in range(1, 6):
-            rc, output = _colab_exec(
-                f"mkdir -p {shlex.quote(remote_dir)}",
-                timeout=60,
-                profile=profile,
-            )
-            if rc == 0:
-                break
-            plog(
-                f"[Colab 会话初始化] {cfg['name']} 远程目录暂不可用，"
-                f"重试 {attempt}/5"
-            )
-            time.sleep(min(attempt * 3, 10))
-        if rc != 0:
-            raise RuntimeError(f"{cfg['name']} 远程目录创建失败：{output[-200:]}")
-        files = sorted(path for path in source_dir.iterdir() if path.is_file())
-        for path in files:
-            plog(f"[Colab 会话初始化] 上传 {cfg['name']}/{path.name}")
-            if not _colab_upload(
-                path, f"{remote_dir}/{path.name}", profile=profile
-            ):
-                raise RuntimeError(f"{cfg['name']}/{path.name} 上传失败")
-        uploaded.append(engine)
+    plog("[Colab 会话初始化] Clone cicy-ai/cicy-koubo")
+    command = r"""
+set -eu
+rm -rf /content/cicy-koubo-src
+git clone --depth 1 https://github.com/cicy-ai/cicy-koubo.git /content/cicy-koubo-src
+mkdir -p /content/mt /content/cosy /content/hg
+cp -f /content/cicy-koubo-src/scripts/provision/mt/* /content/mt/
+cp -f /content/cicy-koubo-src/scripts/provision/cosy/* /content/cosy/
+cp -f /content/cicy-koubo-src/scripts/provision/hg/* /content/hg/
+chmod +x /content/mt/*.sh /content/cosy/*.sh /content/hg/*.sh
+touch /content/.koubo_engine_scripts_ready
+"""
     rc, output = _colab_exec(
-        "touch /content/.koubo_engine_scripts_ready",
-        timeout=30,
+        command,
+        timeout=180,
         profile=profile,
     )
     if rc != 0:
-        raise RuntimeError(f"安装脚本标记写入失败：{output[-200:]}")
-    return uploaded
+        raise RuntimeError(f"GitHub Clone 或脚本初始化失败：{output[-500:]}")
+    plog("[Colab 会话初始化] Clone 完成，三个引擎脚本已就绪")
+    return [key for key, cfg in ENGINES.items() if not cfg.get("builtin")]
 
 
 def _start_colab_session_bootstrap(profile):
-    """Upload scripts and start core installs with retry, without blocking UI."""
+    """Clone and seed scripts after connection; installation is user-selected."""
     bootstrap_key = (profile["id"], profile["session"])
     if bootstrap_key in _COLAB_SESSION_BOOTSTRAPS:
         return False
     _COLAB_SESSION_BOOTSTRAPS.add(bootstrap_key)
-    # The UI must enter an initializing state as soon as bootstrap begins,
-    # not several minutes later after every script has uploaded.
-    for engine in ("cosy", "mt", "hg"):
-        _COLAB_ENGINE_STARTING[engine] = time.time()
-        _colab_engine_mark_active(engine)
-
     def run():
         try:
             last_error = None
             for attempt in range(1, 6):
                 try:
                     plog(
-                        f"[Colab 会话初始化] {attempt}/5 上传 MuseTalk、"
-                        "CosyVoice、HeyGem 脚本"
+                        f"[Colab 会话初始化] {attempt}/5 Clone 仓库并准备 "
+                        "MuseTalk、CosyVoice、HeyGem"
                     )
                     uploaded = _colab_upload_all_engine_scripts(profile)
-                    started = _colab_start_missing_core_installs(profile)
                     plog(
                         f"[Colab 会话初始化完成] scripts={','.join(uploaded)} "
-                        f"started={','.join(started)}"
+                        "等待用户选择生成引擎"
                     )
                     return
                 except Exception as exc:
                     last_error = exc
+                    error_text = str(exc).lower()
+                    session_missing = (
+                        "session" in error_text and "not found" in error_text
+                    )
+                    if session_missing or any(marker in error_text for marker in (
+                        "404/401", "被回收",
+                    )):
+                        plog(
+                            "[Colab 会话初始化停止] 当前会话已断开或被回收，"
+                            "不再重试远程安装"
+                        )
+                        return
                     plog(
                         f"[Colab 会话初始化重试] attempt={attempt}/5 "
                         f"error={type(exc).__name__}: {exc}"
@@ -4326,12 +4405,6 @@ def _start_colab_session_bootstrap(profile):
                     time.sleep(min(attempt * 5, 20))
             plog(f"[Colab 会话初始化失败] 已重试 5 次：{last_error}")
         finally:
-            # If bootstrap ended before an installer process took ownership,
-            # do not leave a permanent local "installing" marker.
-            for engine in ("cosy", "mt", "hg"):
-                if engine not in _COLAB_ENGINE_ACTIVE:
-                    _COLAB_ENGINE_STARTING.pop(engine, None)
-                    _colab_engine_mark_done(engine)
             _COLAB_SESSION_BOOTSTRAPS.discard(bootstrap_key)
 
     threading.Thread(
@@ -4342,22 +4415,30 @@ def _start_colab_session_bootstrap(profile):
     return True
 
 
-def _colab_start_missing_core_installs(profile):
-    """Start all bundled GPU engines together after their scripts are seeded."""
+def _colab_start_missing_core_installs(profile, engines=("cosy", "mt", "hg")):
+    """Start the selected bundled GPU engines after their scripts are seeded."""
     started = []
-    for engine in ("cosy", "mt", "hg"):
+    for engine in engines:
         cfg = ENGINES[engine]
         ready = shlex.quote(cfg["ready"])
         script = shlex.quote(f"{cfg['dir']}/provision.sh")
         log_path = shlex.quote(f"{cfg['dir']}/provision.log")
-        process_pattern = shlex.quote(f"{cfg['dir']}/[p]rovision.sh")
+        pid_path = shlex.quote(f"{cfg['dir']}/provision.pid")
+        process_alive = (
+            f"pid=$(cat {pid_path} 2>/dev/null || true); "
+            f"test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null"
+        )
+        detached_launch = shlex.quote(
+            f"nohup bash {script} >> {log_path} 2>&1 </dev/null & "
+            f"echo $! > {pid_path}"
+        )
         command = (
             f"if ! test -f {ready} && "
-            f"! pgrep -f {process_pattern} >/dev/null; "
+            f"! ( {process_alive} ); "
             f"then chmod +x {script} && "
-            f"nohup bash {script} >> {log_path} 2>&1 </dev/null & pid=$!; "
+            f"sh -c {detached_launch}; "
             f"sleep 3; "
-            f"if kill -0 $pid 2>/dev/null; then echo STARTED_{engine}:$pid; "
+            f"if ( {process_alive} ); then echo STARTED_{engine}; "
             f"else echo FAILED_{engine}; tail -n 20 {log_path}; exit 1; fi; "
             f"elif test -f {ready}; then echo READY_{engine}; "
             f"else echo RUNNING_{engine}; fi"
@@ -4387,20 +4468,24 @@ def _start_colab_install_log_bridge(engine, profile):
     _COLAB_INSTALL_LOG_BRIDGES.add(bridge_key)
     cfg = ENGINES[engine]
     remote_log = shlex.quote(f"{cfg['dir']}/provision.log")
-    process_pattern = shlex.quote(f"{cfg['dir']}/[p]rovision.sh")
+    pid_path = shlex.quote(f"{cfg['dir']}/provision.pid")
+    process_alive = (
+        f"pid=$(cat {pid_path} 2>/dev/null || true); "
+        f"test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null"
+    )
 
     def run():
         offset = 0
         stopped_checks = 0
         try:
-            while stopped_checks < 10:
+            while stopped_checks < 30:
                 command = (
                     f"size=$(wc -c < {remote_log} 2>/dev/null || echo 0); "
                     f"if [ \"$size\" -lt {offset} ]; then start=1; "
                     f"else start={offset + 1}; fi; "
                     f"tail -c +$start {remote_log} 2>/dev/null || true; "
                     f"printf '\\n__KOUBO_LOG_META__%s|' \"$size\"; "
-                    f"(pgrep -f {process_pattern} >/dev/null && echo YES || echo NO)"
+                    f"(( {process_alive} ) && echo YES || echo NO)"
                 )
                 rc, output = _colab_exec(command, timeout=20, profile=profile)
                 body, marker, meta = output.rpartition("__KOUBO_LOG_META__")
@@ -4428,10 +4513,40 @@ def _start_colab_install_log_bridge(engine, profile):
                         else stopped_checks + 1
                     )
                 else:
-                    plog(f"[Colab 安装日志暂不可用][{cfg['name']}] 正在自动重试")
-                    stopped_checks = 0
+                    lower_output = output.lower()
+                    session_missing = (
+                        "session" in lower_output and "not found" in lower_output
+                    )
+                    if session_missing or "404/401" in lower_output:
+                        plog(
+                            f"[Colab 安装日志暂不可用][{cfg['name']}] "
+                            "远端查询失败，安装进程可能仍在运行，继续重试"
+                        )
+                    else:
+                        plog(f"[Colab 安装日志暂不可用][{cfg['name']}] 正在自动重试")
+                    stopped_checks += 1
                 time.sleep(2)
-            plog(f"[Colab 安装][{cfg['name']}] 安装进程已结束")
+            outcome_rc, outcome = _colab_exec(
+                f"if test -f {shlex.quote(cfg['ready'])}; then echo READY; "
+                f"elif ( {process_alive} ); then echo RUNNING; "
+                f"else echo FAILED; tail -n 20 {remote_log} 2>/dev/null; fi",
+                timeout=20,
+                profile=profile,
+            )
+            if outcome_rc == 0 and outcome.lstrip().startswith("READY"):
+                _colab_engine_mark_ready(engine)
+                plog(f"[Colab 安装][{cfg['name']}] ✅ 安装成功，READY 自检通过")
+            elif outcome_rc == 0 and outcome.lstrip().startswith("RUNNING"):
+                plog(
+                    f"[Colab 安装][{cfg['name']}] 安装仍在远端运行，"
+                    "日志连接暂时中断，稍后继续检查"
+                )
+            else:
+                detail = outcome.partition("\n")[2].strip()
+                plog(
+                    f"[Colab 安装][{cfg['name']}] ❌ 安装失败，未生成 READY"
+                    + (f"：{detail[-1000:]}" if detail else "")
+                )
         finally:
             _COLAB_ENGINE_STARTING.pop(engine, None)
             with _COLAB_ENGINE_INSTALL_LOCK:
@@ -4654,7 +4769,7 @@ def api_colab_session_start():
             current["started_at"] = time.time()
             save_global_cfg(cfg)
         _colab_engine_clear_ready()
-        plog("[Colab 会话] 4/4 后台上传脚本并并发安装 MuseTalk、CosyVoice、HeyGem")
+        plog("[Colab 会话] 4/4 后台 Clone 安装脚本，等待用户选择生成引擎")
         bootstrap_started = _start_colab_session_bootstrap(profile)
         plog(f"[Colab 会话] 3/3 启动成功 session={profile['session']} gpu={profile['gpu']}")
         return jsonify({"ok": True, "session": profile["session"], "gpu": profile["gpu"],
@@ -4702,6 +4817,45 @@ def api_colab_session_bootstrap():
         return jsonify({"error": hint, "code": "colab_session_inactive"}), 409
     started = _start_colab_session_bootstrap(_active_colab_profile())
     return jsonify({"ok": True, "initializing": started})
+
+
+@app.post("/api/colab/engines/install")
+def api_colab_selected_engines_install():
+    data = request.get_json(silent=True) or {}
+    requested = data.get("engines") or []
+    allowed = ("cosy", "mt", "hg")
+    selected = tuple(key for key in allowed if key in requested)
+    if not selected:
+        return jsonify({"error": "请至少选择一个生成引擎"}), 400
+    active, hint = _colab_session_active()
+    if not active:
+        return jsonify({"error": hint, "code": "colab_session_inactive"}), 409
+    profile = _active_colab_profile()
+    # Clone runs immediately after session creation. A fast user may confirm
+    # before it finishes, so wait briefly for the seeded marker.
+    seeded = False
+    for _ in range(60):
+        rc, output = _colab_exec(
+            "test -f /content/.koubo_engine_scripts_ready && echo READY",
+            timeout=20,
+            profile=profile,
+        )
+        if rc == 0 and "READY" in output:
+            seeded = True
+            break
+        time.sleep(2)
+    if not seeded:
+        return jsonify({
+            "error": "安装脚本尚未准备完成，请稍后重试",
+            "code": "colab_scripts_not_seeded",
+        }), 503
+    plog(f"[Colab 引擎选择] 用户确认安装：{','.join(selected)}")
+    started = _colab_start_missing_core_installs(profile, selected)
+    return jsonify({
+        "ok": True,
+        "selected": list(selected),
+        "started": started,
+    }), 202
 
 
 @app.get("/api/colab/session")
@@ -5334,10 +5488,22 @@ def api_engines():
                 with _COLAB_ENGINE_INSTALL_LOCK:
                     _COLAB_ENGINE_ACTIVE.add(key)
                 _colab_engine_mark_active(key)
+            else:
+                # A completed remote probe is authoritative. Never let a
+                # READY cache from an earlier attempt/runtime override a
+                # missing remote READY file.
+                try:
+                    _colab_engine_ready_marker(key).unlink(missing_ok=True)
+                except Exception:
+                    pass
     for key, cfg in ENGINES.items():
         if is_remote:
             rs = remote_status.get(key, {})
-            installed = rs.get("installed", False) or _colab_engine_ready_marker(key).is_file()
+            installed = (
+                bool(rs.get("installed"))
+                if key in remote_status
+                else _colab_engine_ready_marker(key).is_file()
+            )
             version_info = {}
             if installed and rs.get("version_text"):
                 for line in rs["version_text"].splitlines():
@@ -5397,6 +5563,10 @@ def api_engines():
                     ),
                     "remote": is_remote, "builtin": cfg.get("builtin", False),
                     "install_hint": cfg.get("install_hint", ""),
+                    "estimated_install_minutes": cfg.get(
+                        "estimated_install_minutes"
+                    ),
+                    "estimated_disk_gib": cfg.get("estimated_disk_gib"),
                     "note": cfg.get("note", "")})
     return jsonify({"engines": out})
 

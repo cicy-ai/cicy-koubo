@@ -206,6 +206,23 @@ html.modal-open,body.modal-open{overflow:hidden}
 .modal{position:fixed;left:50%;top:12%;transform:translateX(-50%);width:min(680px,92vw);
   background:#fff;border-radius:12px;padding:16px;z-index:61;display:none}
 .modal h3{margin:0 0 10px;font-size:15px}
+#colabEngineModal{gap:12px;padding:22px;border-radius:18px}
+#colabEngineModal h3{font-size:20px;margin:0}
+.colab-engine-lead{color:var(--mut);font-size:13px;line-height:1.6}
+.colab-engine-required,.colab-engine-option{
+  display:flex;align-items:center;gap:12px;padding:14px 16px;border-radius:12px;
+  border:1px solid var(--line);background:#f8fafb
+}
+.colab-engine-required{border-color:#bce8dc;background:#f1fbf7}
+.colab-engine-option{cursor:pointer;transition:.15s;background:#fff}
+.colab-engine-option:hover{border-color:#68cdb4;background:#f7fffc}
+.colab-engine-option:has(input:checked){border-color:var(--teal);background:#edfbf6;box-shadow:0 0 0 2px rgba(20,162,128,.12)}
+.colab-engine-option input{width:18px;height:18px;accent-color:var(--teal);flex:0 0 auto}
+.colab-engine-copy{display:flex;flex-direction:column;gap:3px;line-height:1.4}
+.colab-engine-copy b{font-size:15px}
+.colab-engine-copy small{color:var(--mut);font-size:12px}
+#colabEngineEstimate{margin:0!important;padding:10px 12px;border-radius:10px}
+#colabEngineInstallBtn{width:100%;justify-content:center;padding:11px 16px;font-size:15px}
 
 /* 系统设置 modal */
 #iModal{box-sizing:border-box;flex-direction:column;overflow:hidden}
@@ -454,7 +471,7 @@ html.modal-open,body.modal-open{overflow:hidden}
       <option value="simple">底板测试(本机秒出,不对口型)</option>
     </select>
     <div class="lbl" id="lblEngine">对口型引擎</div>
-    <select id="engine"></select>
+    <select id="engine" onchange="syncSelectedVideoEngineAvailability()"></select>
     <div class="row" id="rowEngineOpts" style="margin-top:10px">
       <label class="switch"><input type="checkbox" id="optSharp" checked>牙齿高清(锐化)</label>
       <label class="switch"><input type="checkbox" id="optRand">动作随机(底板随机起点)</label>
@@ -661,10 +678,8 @@ html.modal-open,body.modal-open{overflow:hidden}
     </section>
     <section class="settings-panel" id="enginesSettingsPanel" data-settings-panel="engines">
       <div class="settings-section-head"><div><div class="settings-section-title" id="engineSectionTitle">生成引擎</div><div class="settings-section-desc" id="engineSectionDesc">配音、数字人与字幕能力的安装状态</div></div></div>
+      <div id="engineColabRuntime" class="settings-note" style="display:none;margin-bottom:10px"></div>
       <div id="engineHint"></div>
-      <div id="coreEngineInstallActions" style="display:none;margin:10px 0 12px">
-        <button class="btn" id="installCoreEnginesBtn" onclick="installCoreEngines(this)">⚡ 并发安装 MuseTalk + CosyVoice + HeyGem</button>
-      </div>
       <div id="engineList"></div>
     </section>
     <section class="settings-panel" data-settings-panel="logs">
@@ -676,6 +691,31 @@ html.modal-open,body.modal-open{overflow:hidden}
   </div>
   <div class="settings-footer">
     <button class="btn ghost" onclick="closeInstallModal()">关闭</button>
+  </div>
+</div>
+
+<!-- Colab 会话连接后的引擎选择 -->
+<div class="mask" id="colabEngineMask"></div>
+<div class="modal" id="colabEngineModal" style="width:min(560px,92vw);flex-direction:column;max-height:82vh;overflow:auto;box-sizing:border-box">
+  <h3>选择要安装的生成引擎</h3>
+  <div class="colab-engine-lead">
+    Colab 会话已连接。CosyVoice 固定安装，再选择一个数字人视频引擎。
+  </div>
+  <div class="colab-engine-required">
+    <span aria-hidden="true">✅</span>
+    <span class="colab-engine-copy"><b>CosyVoice · 固定安装</b><small>配音与 Whisper · 预计 20–30 分钟 · 约 18GB</small></span>
+  </div>
+  <label class="colab-engine-option">
+    <input type="radio" name="colab-video-engine" class="colab-video-engine" value="mt" onchange="updateColabEngineEstimate()">
+    <span class="colab-engine-copy"><b>MuseTalk</b><small>数字人口型视频 · 预计 12–20 分钟 · 约 15GB</small></span>
+  </label>
+  <label class="colab-engine-option">
+    <input type="radio" name="colab-video-engine" class="colab-video-engine" value="hg" onchange="updateColabEngineEstimate()">
+    <span class="colab-engine-copy"><b>HeyGem</b><small>数字人口型视频 · 预计 8–15 分钟 · 约 8GB</small></span>
+  </label>
+  <div class="settings-note" id="colabEngineEstimate" style="margin-top:10px"></div>
+  <div class="row">
+    <button class="btn" id="colabEngineInstallBtn" onclick="installSelectedColabEngines()">开始安装</button>
   </div>
 </div>
 
@@ -880,7 +920,19 @@ function logUiError(message,level='error'){
 }
 function toast(m){const text=String(m);const t=$('toast');t.textContent=text;t.classList.add('show');
   const isError=/失败|错误|异常|超时|断开|不可用|❌|error|failed|timeout/i.test(text);
-  if(isError)logUiError(text);
+  const isWarn=!isError&&/警告|注意|未就绪|未安装|未启动|等待|⚠️/i.test(text);
+  const caller=(new Error().stack||'').split('\n').slice(2,5)
+    .map(line=>line.trim()).join(' <- ').slice(0,500);
+  const context=[
+    `gpu=${$('topGpuMode')?.value||'-'}`,
+    `engine=${$('engine')?.value||'-'}`,
+    `mode=${$('genMode')?.value||'-'}`,
+    `job=${localStorage.getItem(PK+'curJob')||'-'}`,
+  ].join(' ');
+  // Every transient toast is persisted. Include the call site and current
+  // generation context so a screenshot-only failure remains diagnosable.
+  logUiError(`[Toast] ${text} · ${context}${caller?` · caller=${caller}`:''}`,
+    isError?'error':(isWarn?'warn':'info'));
   clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),isError?6500:3200)}
 window.addEventListener('error',e=>logUiError(`未捕获异常: ${e.message||'unknown'} @ ${e.filename||location.pathname}:${e.lineno||0}`));
 window.addEventListener('unhandledrejection',e=>logUiError(`Promise 异常: ${e.reason?.message||String(e.reason||'unknown')}`));
@@ -951,8 +1003,12 @@ function applyGlobalHealth(s){
       s.tunnel==='ready'?'在线':(idle?'未启动':(starting?'启动中':'离线')));
     setPill('au',s.audio_service==='ready'?'ok':((idle||starting)?'wait':'bad'),
       s.audio_service==='ready'?'就绪':(idle?'待启动':(starting?'启动中':'离线')));
-    setPill('vi',s.video_service==='ready'?'ok':((idle||starting)?'wait':'bad'),
-      s.video_service==='ready'?'就绪':(idle?'待启动':(starting?'启动中':'离线')));
+    const selectedVideoEngine=['hg','heygem'].includes($('engine')?.value)?'heygem':'musetalk';
+    const selectedVideoReady=Object.prototype.hasOwnProperty.call(s.video_engines||{},selectedVideoEngine)
+      ? !!s.video_engines[selectedVideoEngine]
+      : s.video_service==='ready';
+    setPill('vi',selectedVideoReady?'ok':((idle||starting)?'wait':'bad'),
+      selectedVideoReady?'就绪':(idle?'待启动':(starting?'启动中':'离线')));
     const cb=$('colabBtn');if(cb)cb.className='btn ghost';
     renderSettingsHealth();
 }
@@ -1405,23 +1461,192 @@ let colabVideoEngineReady=false;
 let localGpuConnected=false;
 let ttsRunning=false,videoRunning=false;
 let ttsServerRecovered=false;
+let recoveredTtsJob='';
+let recoveredVideoJob='';
+let legacyVideoRecovery=false;
+function selectedVideoEngineKey(){
+  return ['hg','heygem'].includes($('engine')?.value)?'hg':'mt';
+}
+function syncSelectedVideoEngineAvailability(){
+  const key=selectedVideoEngineKey();
+  colabVideoEngineReady=!!(_engineState||[]).find(
+    engine=>engine.key===key&&engine.installed&&!engine.installing
+  );
+  syncGpuActionAvailability();
+  if(_globalHealth)applyGlobalHealth(_globalHealth);
+  renderSettingsHealth();
+}
+async function syncLegacyVideoRecovery(){
+  if(!curJob||videoRunning&&!legacyVideoRecovery)return;
+  try{
+    const response=await fetch('/api/job/'+curJob,{cache:'no-store'});
+    if(!response.ok)return;
+    const job=await response.json();
+    if(job?.result){
+      legacyVideoRecovery=false;
+      videoRunning=false;
+      const resultPath='/api/result/'+curJob;
+      const player=$('resultPrev');
+      const alreadyRecovered=player.getAttribute('src')===resultPath
+        &&getComputedStyle(player).display!=='none';
+      if(!alreadyRecovered){
+        player.src=resultPath;
+        player.style.display='block';
+      }
+      $('btn-gen-dl').disabled=false;
+      $('genInfo').textContent='任务 '+curJob;
+      hasGeneratedVideo=true;
+      const button=$('btn-gen');
+      button.disabled=false;button.textContent='5. 🎬 生成视频';
+      if(!alreadyRecovered)stage('genStage','✅ 远端任务已恢复，成片已取回');
+      syncEditAvailability();syncGpuActionAvailability();
+      if(!alreadyRecovered)loadMediaTab();
+      return;
+    }
+    const lines=(job?.log||[]).map(String);
+    const isDecodeMisreport=job?.error==='MuseTalk failed via colab CLI (rc=1)'
+      &&lines.some(line=>line.includes('UnicodeDecodeError'));
+    if(!legacyVideoRecovery&&!isDecodeMisreport)return;
+    legacyVideoRecovery=true;
+    videoRunning=true;
+    const button=$('btn-gen');
+    button.disabled=true;button.textContent='恢复中…';
+    const logs=await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'})
+      .then(r=>r.text()).catch(()=>'');
+    const details=logs.split('\n')
+      .filter(line=>line.includes(`[出片 ${curJob}]`)&&line.includes('[musetalk]'))
+      .slice(-5).join('\n');
+    stage('genStage',`⏳ 远端任务仍在运行，正在自动恢复${details?'\n'+details:''}`);
+    syncGpuActionAvailability();
+  }catch(_){}
+}
+async function restoreActiveTasks(){
+  try{
+    const response=await fetch('/api/tasks/active',{cache:'no-store'});
+    if(!response.ok){
+      await syncLegacyVideoRecovery();
+      return;
+    }
+    const tasks=await response.json();
+    const tts=tasks.tts||{};
+    if(tts.active){
+      recoveredTtsJob=tts.job_id||recoveredTtsJob;
+      ttsServerRecovered=true;
+      ttsRunning=true;
+      const button=$('btn-tts');
+      if(button){button.disabled=true;button.textContent='配音中…'}
+      let details='';
+      if(recoveredTtsJob){
+        const logs=await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'})
+          .then(r=>r.text()).catch(()=>'');
+        details=logs.split('\n')
+          .filter(line=>line.includes(`[配音 ${recoveredTtsJob}]`))
+          .slice(-5).join('\n');
+      }
+      stage('ttsStage',`⏳ 配音处理中 · 已耗时 ${formatRuntime(Number(tts.elapsed_seconds||0))}${details?'\n'+details:''}`);
+    }else if(ttsServerRecovered){
+      ttsServerRecovered=false;
+      ttsRunning=false;
+      const finishedId=recoveredTtsJob;
+      recoveredTtsJob='';
+      const button=$('btn-tts');
+      if(button)button.textContent='4. 🎙 生成配音';
+      if(finishedId){
+        const media=await fetch('/api/media',{cache:'no-store'}).then(r=>r.json()).catch(()=>[]);
+        const voice=media.find(item=>item.id===finishedId&&item.type==='voice');
+        if(voice){
+          setVoice(voice.id,voice.duration,voice.chars);
+          stage('ttsStage',`✅ 配音完成 · ${voice.chars||0}字 · ${voice.duration}s · 已保存到成品库`);
+        }
+      }
+      loadMediaTab();
+    }
+
+    const video=tasks.video||{};
+    if(video.active&&video.job_id){
+      curJob=video.job_id;
+      localStorage.setItem(PK+'curJob',curJob);
+      if(!videoRunning||recoveredVideoJob!==video.job_id){
+        recoveredVideoJob=video.job_id;
+        videoRunning=true;
+        const button=$('btn-gen');
+        button.disabled=true;button.textContent='生成中…';
+        stage('genStage',`⏳ ${video.stage||'处理中'} · 已耗时 ${formatRuntime(Number(video.elapsed_seconds||0))}`);
+        pollJob(video.job_id,button);
+      }
+    }
+    syncGpuActionAvailability();
+  }catch(_){}
+}
+
+async function recoverLegacyVideoJob(){
+  if(curJob)return curJob;
+  try{
+    const logs=await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'}).then(r=>r.text());
+    const ids=[...logs.matchAll(/\[出片 ([0-9a-f]{10})\]/g)].map(match=>match[1]);
+    for(const jobId of [...new Set(ids)].reverse()){
+      const response=await fetch('/api/job/'+jobId,{cache:'no-store'});
+      if(!response.ok)continue;
+      const job=await response.json();
+      if(job?.result){
+        curJob=jobId;
+        localStorage.setItem(PK+'curJob',curJob);
+        return curJob;
+      }
+      if(job&&!job.result&&!job.error&&job.stage){
+        curJob=jobId;
+        localStorage.setItem(PK+'curJob',curJob);
+        return curJob;
+      }
+      const isDecodeMisreport=job?.error==='MuseTalk failed via colab CLI (rc=1)'
+        &&(job?.log||[]).some(line=>String(line).includes('UnicodeDecodeError'));
+      if(isDecodeMisreport){
+        curJob=jobId;
+        legacyVideoRecovery=true;
+        localStorage.setItem(PK+'curJob',curJob);
+        return curJob;
+      }
+    }
+  }catch(_){}
+  return '';
+}
 async function syncTtsServerState(){
   try{
     const response=await fetch('/api/tts/status',{cache:'no-store'});
     if(!response.ok)return;
     const state=await response.json();
-    if(state.active&&!ttsRunning){
+    if(state.active){
+      recoveredTtsJob=state.job_id||recoveredTtsJob;
       ttsServerRecovered=true;
       ttsRunning=true;
       const button=$('btn-tts');
-      if(button)button.textContent='配音中…';
+      if(button){button.disabled=true;button.textContent='配音中…'}
+      let details='';
+      if(recoveredTtsJob){
+        const logs=await fetch('/api/logs?raw=1&t='+Date.now(),{cache:'no-store'})
+          .then(r=>r.text()).catch(()=>'');
+        details=logs.split('\n')
+          .filter(line=>line.includes(`[配音 ${recoveredTtsJob}]`))
+          .slice(-5).join('\n');
+      }
+      stage('ttsStage',`⏳ 配音处理中 · 已耗时 ${formatRuntime(Number(state.elapsed_seconds||0))}${details?'\n'+details:''}`);
       syncGpuActionAvailability();
     }else if(!state.active&&ttsServerRecovered){
       ttsServerRecovered=false;
       ttsRunning=false;
+      const finishedId=recoveredTtsJob;
+      recoveredTtsJob='';
       const button=$('btn-tts');
       if(button)button.textContent='4. 🎙 生成配音';
       syncGpuActionAvailability();
+      if(finishedId){
+        const media=await fetch('/api/media',{cache:'no-store'}).then(r=>r.json()).catch(()=>[]);
+        const voice=media.find(item=>item.id===finishedId&&item.type==='voice');
+        if(voice){
+          setVoice(voice.id,voice.duration,voice.chars);
+          stage('ttsStage',`✅ 配音完成 · ${voice.chars||0}字 · ${voice.duration}s · 已保存到成品库`);
+        }
+      }
       loadMediaTab();
     }
   }catch(_){}
@@ -1438,7 +1663,8 @@ function syncGpuActionAvailability(){
     :(localMode?'请先启动本地 GPU 服务':'请先启动 GPU，等待顶部显示“已就绪”');
   for(const [id,running,engineReady,engineLabel] of [
     ['btn-tts',ttsRunning,colabTtsEngineReady,'CosyVoice 正在安装或尚未安装'],
-    ['btn-gen',videoRunning,colabVideoEngineReady,'MuseTalk 正在安装或尚未安装'],
+    ['btn-gen',videoRunning,colabVideoEngineReady,
+      `${selectedVideoEngineKey()==='hg'?'HeyGem':'MuseTalk'} 正在安装或尚未安装`],
   ]){
     const button=$(id);
     if(!button)continue;
@@ -1623,7 +1849,7 @@ async function refreshGpuModeHeader(){
           engine=>engine.key==='cosy'&&engine.installed&&!engine.installing
         );
         colabVideoEngineReady=!!_engineState.find(
-          engine=>engine.key==='mt'&&engine.installed&&!engine.installing
+          engine=>engine.key===selectedVideoEngineKey()&&engine.installed&&!engine.installing
         );
       }catch(_){
         colabTtsEngineReady=false;
@@ -1669,7 +1895,6 @@ async function changeTopGpuMode(provider){
   if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);
   await refreshGpuModeHeader();
   await syncTtsServerState();
-  setInterval(syncTtsServerState,3000);
   if(provider==='colab')await refreshColabActionAvailability();
   await refreshStatus(true);
   toast(provider==='cicy_gpu'?'已切换到 CiCy GPU':'GPU 模式已立即切换');
@@ -1969,7 +2194,7 @@ function previewBase(){
   if(player.dataset.assetId===v&&player.getAttribute('src'))return;
   videoBlob=null;
   player.dataset.assetId=v;
-  player.src='/api/basevideos/'+encodeURIComponent(v);
+  player.src='/api/basevideos/'+encodeURIComponent(v)+'?v='+Date.now();
   player.style.display='block';
 }
 function bindDrop(dropId,fileId,onFile){
@@ -2010,7 +2235,8 @@ async function genVideo(){
     fd.append('engine',$('engine').value);
     fd.append('sharp',$('optSharp').checked?'1':'0');
     fd.append('randstart',$('optRand').checked?'1':'0');
-    const d=await (await fetch('/api/generate-video',{method:'POST',body:fd})).json();
+    const response=await fetch('/api/generate-video',{method:'POST',body:fd});
+    const d=await readApiJson(response,'提交出片任务');
     stopVideoLogMonitor();
     if(d.error){stage('genStage','❌ '+d.error,true);videoRunning=false;b.disabled=false;b.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return}
     curJob=d.job_id;localStorage.setItem(PK+'curJob',curJob);
@@ -2025,7 +2251,8 @@ function toggleGenMode(){
 }
 async function pollJob(jid,btn,mode){
   try{
-    const d=await (await fetch('/api/job/'+jid)).json();
+    const response=await fetch('/api/job/'+jid,{cache:'no-store'});
+    const d=await readApiJson(response,'查询出片任务');
     if(d.error&&!d.stage){stage('genStage','❌ '+d.error,true);videoRunning=false;btn.disabled=false;btn.textContent='5. 🎬 生成视频';syncGpuActionAvailability();return}
     else if(d.result){
       stage('genStage','');$('genStage').style.display='none';
@@ -2146,6 +2373,18 @@ async function fetchJsonOr(url,fallback){
     return fallback;
   }
 }
+async function readApiJson(response,label='API'){
+  const text=await response.text();
+  try{
+    return text?JSON.parse(text):{};
+  }catch(error){
+    const type=response.headers.get('content-type')||'unknown';
+    const preview=text.replace(/\s+/g,' ').slice(0,300);
+    const detail=`${label} 返回非 JSON · HTTP ${response.status} · ${type} · ${preview||'(空响应)'}`;
+    logUiError(detail);
+    throw new Error(detail);
+  }
+}
 async function loadEngineState(){
   const es=await fetchJsonOr('/api/engines',{engines:[]});
   _engineState=es.engines||[];
@@ -2188,6 +2427,7 @@ function applyLipsyncEngineSelect(es){
   if(!ready.length) engEl.innerHTML='<option value="">-- 请先安装引擎 --</option>';
   else ready.forEach(e=>{const o=new Option(e.name,e.key);engEl.appendChild(o);});
   if(keep&&[...engEl.options].some(o=>o.value===keep)) engEl.value=keep;
+  if(provider==='colab')syncSelectedVideoEngineAvailability();
 }
 function fillSel(id,pairs,keep){
   const el=$(id);el.innerHTML='';
@@ -2520,6 +2760,7 @@ let _globalHealthAt = 0;
 let _engineStateAt = 0;
 let _statusRequest = null;
 let _engineStatusRequest = null;
+let _engineStatusRequestForce = false;
 let _colabRuntimeTimer = null;
 let _colabMetricsTimer = null;
 let _colabControlPending = false;
@@ -2573,6 +2814,10 @@ function switchSettingsTab(tab) {
     const box=$('operationLog');
     requestAnimationFrame(()=>{if(box)box.scrollTop=box.scrollHeight});
   }
+  if(tab==='engines'&&($('topGpuMode')?.value==='colab'||_systemState?.gpu_mode==='colab_cli')){
+    refreshEngines(true);
+    loadColabSessionStatus();
+  }
   document.querySelector('.settings-body')?.classList.toggle('logs-active',tab==='logs');
   localStorage.setItem(PK+'settingsTab', tab);
 }
@@ -2603,10 +2848,11 @@ function renderSettingsHealth() {
     const cp = _colabState?.profiles?.find(p => p.id === _colabState.active);
     if (!cp?.credentials_ready) issues.push('当前 Google 账号未授权');
   }
-  // MuseTalk + CosyVoice are the core pipeline. HeyGem is optional and
-  // Whisper is bundled with CosyVoice, so neither should decide core health.
+  // CosyVoice is required for audio. MuseTalk and HeyGem are alternatives:
+  // only the video engine currently selected by the user is required.
+  const selectedVideoKey = ['hg','heygem'].includes($('engine')?.value) ? 'hg' : 'mt';
   const requiredEngines = (s.gpu_mode === 'cicy_gpu' || s.local_gpu_managed)
-    ? [] : _engineState.filter(e => ['mt','cosy'].includes(e.key));
+    ? [] : _engineState.filter(e => ['cosy',selectedVideoKey].includes(e.key));
   const readyCount = requiredEngines.filter(e => e.installed).length;
   const missingEngines = requiredEngines.filter(e => !e.installed).map(e => e.name);
   if (missingEngines.length) issues.push(`${missingEngines.join('、')} 尚未就绪`);
@@ -2679,7 +2925,10 @@ async function refreshSystemSettings(force=false) {
     if(s.gpu_mode!=='colab_cli')$('colabProfiles').innerHTML='';
     $('enginesSettingsTab').style.display=isCicy?'none':'';
     $('enginesSettingsPanel').style.display=isCicy?'none':'';
-    if(isCicy||isLocalManaged)$('coreEngineInstallActions').style.display='none';
+    if(isCicy||isLocalManaged){
+      const installActions=$('coreEngineInstallActions');
+      if(installActions)installActions.style.display='none';
+    }
     if(isCicy&&document.querySelector('[data-settings-panel="engines"].on'))switchSettingsTab('runtime');
     if(isLocalManaged)await loadLocalGpuSettings();
     $('iTitle').textContent = '· ' + gpuModeLabel + (s.gpu_name ? ' · '+s.gpu_name : '');
@@ -2851,6 +3100,7 @@ function renderColabSessionStatus() {
       : !authorized
       ? '<span style="color:var(--red)">● 未授权，请先点击“授权”</span>'
       : `<span style="color:var(--mut)">● 未运行</span>${d.account_email?' · '+d.account_email:''}`;
+    renderEngineColabRuntime();
     return;
   }
   const elapsed = d.started_at ? Math.max(0, Math.floor(Date.now()/1000 - d.started_at)) : d.runtime_seconds;
@@ -2861,6 +3111,26 @@ function renderColabSessionStatus() {
   el.innerHTML = `<span style="color:var(--green)">● 运行中</span> · ${d.gpu} · 已运行 <b style="color:var(--ink)">${formatRuntime(elapsed)}</b>${gpuDetail}
     <div style="margin-top:3px">${d.account_email||'账号未知'} · 套餐/剩余计算单元：Colab CLI 未提供
     <a href="${d.manage_url}" target="_blank" style="color:var(--teal-d)">查看官方配额</a></div>`;
+  renderEngineColabRuntime();
+}
+
+function renderEngineColabRuntime() {
+  const el=$('engineColabRuntime');
+  if(!el)return;
+  const isColab=$('topGpuMode')?.value==='colab'||_systemState?.gpu_mode==='colab_cli';
+  el.style.display=isColab?'':'none';
+  if(!isColab)return;
+  const d=_colabSessionState;
+  if(!d?.running){
+    el.innerHTML='<span style="color:var(--red)">● Colab 会话未连接</span> · 生成引擎不可用';
+    return;
+  }
+  const elapsed=d.started_at
+    ?Math.max(0,Math.floor(Date.now()/1000-d.started_at))
+    :Number(d.runtime_seconds||0);
+  el.innerHTML=`<span style="color:var(--green)">● Colab ${esc(d.gpu||'GPU')} 运行中</span>
+    · 会话已运行 <b style="color:var(--ink)">${formatRuntime(elapsed)}</b>
+    ${d.account_email?' · '+esc(d.account_email):''}`;
 }
 
 async function loadColabSessionStatus() {
@@ -3018,6 +3288,91 @@ async function setActiveColabProfile(id) {
   }
 }
 
+const COLAB_ENGINE_ESTIMATES={
+  cosy:{name:'CosyVoice',min:20,max:30,disk:18},
+  mt:{name:'MuseTalk',min:12,max:20,disk:15},
+  hg:{name:'HeyGem',min:8,max:15,disk:8}
+};
+
+function selectedColabEngines(){
+  const videoEngine=document.querySelector('.colab-video-engine:checked')?.value||'';
+  return videoEngine?['cosy',videoEngine]:[];
+}
+
+function updateColabEngineEstimate(){
+  const selected=selectedColabEngines();
+  const estimate=$('colabEngineEstimate');
+  const button=$('colabEngineInstallBtn');
+  if(!selected.length){
+    estimate.textContent='请至少选择一个引擎';
+    button.disabled=true;
+    return;
+  }
+  const items=selected.map(key=>COLAB_ENGINE_ESTIMATES[key]);
+  const min=Math.max(...items.map(item=>item.min));
+  const max=Math.max(...items.map(item=>item.max));
+  const disk=items.reduce((total,item)=>total+item.disk,0);
+  estimate.textContent=`将并发安装 ${items.map(item=>item.name).join('、')} · 预计 ${min}–${max} 分钟 · 约 ${disk}GB`;
+  button.disabled=false;
+}
+
+function sizeColabEngineModalToSettings(){
+  const modal=$('colabEngineModal');
+  const settings=$('iModal');
+  if(!modal||!settings||getComputedStyle(settings).display==='none')return;
+  const rect=settings.getBoundingClientRect();
+  Object.assign(modal.style,{
+    left:rect.left+'px',
+    top:rect.top+'px',
+    width:rect.width+'px',
+    height:rect.height+'px',
+    maxHeight:rect.height+'px',
+    transform:'none'
+  });
+}
+
+function openColabEngineModal(){
+  document.querySelectorAll('.colab-video-engine').forEach(input=>{input.checked=false});
+  $('colabEngineMask').style.display='block';
+  $('colabEngineModal').style.display='flex';
+  sizeColabEngineModalToSettings();
+  updateColabEngineEstimate();
+}
+
+function closeColabEngineModal(){
+  $('colabEngineMask').style.display='none';
+  $('colabEngineModal').style.display='none';
+}
+
+async function installSelectedColabEngines(){
+  const selected=selectedColabEngines();
+  if(!selected.length)return updateColabEngineEstimate();
+  const button=$('colabEngineInstallBtn');
+  const old=button.textContent;
+  button.disabled=true;
+  button.textContent='准备安装…';
+  try{
+    const response=await fetch('/api/colab/engines/install',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({engines:selected})
+    });
+    const data=await response.json();
+    if(!response.ok||data.error)throw new Error(data.error||'HTTP '+response.status);
+    closeColabEngineModal();
+    await openInstallModal();
+    switchSettingsTab('logs');
+    await refreshEngines(true);
+    toast(`✅ 已开始安装 ${selected.map(key=>COLAB_ENGINE_ESTIMATES[key].name).join('、')}`);
+  }catch(error){
+    toast('启动安装失败：'+(error?.message||error));
+  }finally{
+    button.disabled=false;
+    button.textContent=old;
+    updateColabEngineEstimate();
+  }
+}
+
 async function controlColabSession(action, btn) {
   if(_colabControlPending)return toast('会话操作正在处理中，请勿重复点击');
   if (!_colabSessionState) return toast('正在检查会话状态，请稍候');
@@ -3047,6 +3402,7 @@ async function controlColabSession(action, btn) {
     toast(action==='start'?'✅ Colab 会话已启动':'✅ Colab 会话已停止');
     await loadColabProfiles();
     await refreshEngines();
+    if(action==='start')openColabEngineModal();
   } catch(e) { toast(`${actionLabel}失败：${e.message}`); }
   finally {
     _colabControlPending=false;
@@ -3100,12 +3456,30 @@ function engineCardHTML(e) {
     verHtml = '<div class="ev">' + Object.entries(e.version_info)
       .map(([k,v]) => k+': '+v).join(' · ') + '</div>';
   }
+  const remoteMetricsPending=e.remote&&!e.builtin
+    &&(e.install_seconds==null||Number(e.disk_bytes||0)<=0);
+  const fixedEstimate=Array.isArray(e.estimated_install_minutes)
+    ? `${Number(e.estimated_install_minutes[0])}–${Number(e.estimated_install_minutes[1])}分钟`
+    : '未知';
   const metricHtml=e.installed
+    ? (remoteMetricsPending
+      ? `<div class="ev" style="margin-top:4px;color:#52616b">
+          ⏱ 安装耗时：约${fixedEstimate}
+          · 💾 磁盘：约${Number(e.estimated_disk_gib||0)}GB
+        </div>`
+      : `<div class="ev" style="margin-top:4px;color:#52616b">
+          ⏱ 安装耗时：${e.install_seconds==null?'未知':formatRuntime(Math.round(e.install_seconds))}
+          · 💾 磁盘：${e.builtin
+            ?'随 CosyVoice（不额外占用）'
+            :fmtGB(Number(e.disk_bytes||0)/1024/1024)}
+        </div>`)
+    : '';
+  const estimate=e.estimated_install_minutes;
+  const estimateHtml=(!e.installed&&Array.isArray(estimate)&&estimate.length===2)
     ? `<div class="ev" style="margin-top:4px;color:#52616b">
-        ⏱ 安装耗时：${e.install_seconds==null?'未知':formatRuntime(Math.round(e.install_seconds))}
-        · 💾 磁盘：${e.builtin
-          ?'随 CosyVoice（不额外占用）'
-          :fmtGB(Number(e.disk_bytes||0)/1024/1024)}
+        ⏱ 预计安装：${Number(estimate[0])}–${Number(estimate[1])}分钟
+        · 💾 预计磁盘：${e.builtin?'随 CosyVoice（不额外占用）':Number(e.estimated_disk_gib||0)+'GB'}
+        ${e.remote?' · 受 Colab 网络影响':''}
       </div>`
     : '';
   const estHtml = (!e.installed && e.install_hint)
@@ -3131,6 +3505,7 @@ function engineCardHTML(e) {
       <div class="en">${e.name} ${badge} ${remoteBadge} ${e.builtin?'(CosyVoice 内置)':(e.has_script?'':'(缺安装脚本)')}</div>
       ${verHtml}
       ${metricHtml}
+      ${estimateHtml}
       ${estHtml}
       ${noteHtml}
     </div>
@@ -3154,7 +3529,14 @@ function updateEngineCard(e) {
 async function fetchEngineStatus(force=false){
   if(!force&&_engineState&&Date.now()-_engineStateAt<15000)
     return {engines:_engineState};
-  if(_engineStatusRequest)return _engineStatusRequest;
+  if(_engineStatusRequest){
+    if(!force||_engineStatusRequestForce)return _engineStatusRequest;
+    // A probe request must never be swallowed by an earlier cached/local
+    // request. Wait for that request to finish, then perform the real probe.
+    try{await _engineStatusRequest}catch(_){}
+    return fetchEngineStatus(true);
+  }
+  _engineStatusRequestForce=force;
   _engineStatusRequest=(async()=>{
   const controller=new AbortController();
   const timeoutId=setTimeout(()=>controller.abort(),35000);
@@ -3165,7 +3547,11 @@ async function fetchEngineStatus(force=false){
     _engineState=data.engines||[];
     _engineStateAt=Date.now();
     return data;
-  }finally{clearTimeout(timeoutId);_engineStatusRequest=null}
+  }finally{
+    clearTimeout(timeoutId);
+    _engineStatusRequest=null;
+    _engineStatusRequestForce=false;
+  }
   })();
   return _engineStatusRequest;
 }
@@ -3180,7 +3566,9 @@ async function refreshEngines(force=false) {
     const d = await fetchEngineStatus(force);
     _engineState = d.engines || [];
     colabTtsEngineReady=!!_engineState.find(e=>e.key==='cosy'&&e.installed&&!e.installing);
-    colabVideoEngineReady=!!_engineState.find(e=>e.key==='mt'&&e.installed&&!e.installing);
+    colabVideoEngineReady=!!_engineState.find(
+      e=>e.key===selectedVideoEngineKey()&&e.installed&&!e.installing
+    );
     syncGpuActionAvailability();
     applyLipsyncEngineSelect(d);
     renderSettingsHealth();
@@ -3226,7 +3614,8 @@ async function refreshEngines(force=false) {
     colabTtsEngineReady=false;
     colabVideoEngineReady=false;
     syncGpuActionAvailability();
-    $('coreEngineInstallActions').style.display='none';
+    const installActions=$('coreEngineInstallActions');
+    if(installActions)installActions.style.display='none';
     $('engineList').innerHTML = `<div class="empty">${e?.name==='AbortError'?'Colab 响应超时，请检查会话后刷新':'加载引擎状态失败：'+esc(e?.message||e)}</div>`;
     renderSettingsHealth();
   }
@@ -3237,7 +3626,9 @@ async function refreshCards() {
     const d = await fetchEngineStatus(true);
     _engineState = d.engines || [];
     colabTtsEngineReady=!!_engineState.find(e=>e.key==='cosy'&&e.installed&&!e.installing);
-    colabVideoEngineReady=!!_engineState.find(e=>e.key==='mt'&&e.installed&&!e.installing);
+    colabVideoEngineReady=!!_engineState.find(
+      e=>e.key===selectedVideoEngineKey()&&e.installed&&!e.installing
+    );
     syncGpuActionAvailability();
     applyLipsyncEngineSelect(d);
     renderSettingsHealth();
@@ -3407,30 +3798,6 @@ async function installEngine(key,btn) {
   finally {if(btn?.isConnected){btn.disabled=false;btn.textContent=oldText}}
 }
 
-async function installCoreEngines(btn) {
-  const core=(_engineState||[]).filter(e=>['mt','cosy','hg'].includes(e.key));
-  if(core.length!==3)return toast('引擎状态尚未确认，请先刷新');
-  if(core.every(e=>e.installed))return toast('MuseTalk、CosyVoice、HeyGem 均已安装，无需重复安装');
-  const old=btn.textContent;btn.disabled=true;btn.textContent='⏳ 正在并发启动…';
-  const keys=['cosy','mt','hg'].filter(key=>!core.find(engine=>engine.key===key)?.installed);
-  keys.forEach(key=>{if(!_openLogs[key])toggleLog(key,true)});
-  try {
-    await Promise.all(keys.map(async key=>{
-      const r=await fetch('/api/engines/'+key+'/install',{method:'POST'});
-      const d=await r.json();
-      if(!r.ok||d.error)throw new Error(`${key}: ${d.error||'HTTP '+r.status}`);
-      return d;
-    }));
-    toast('MuseTalk、CosyVoice、HeyGem 已并发启动');
-    await refreshEngines(true);
-  } catch(e) {
-    toast('安装失败：'+(e?.message||e));
-    await refreshEngines();
-  } finally {
-    btn.disabled=false;btn.textContent=old;
-  }
-}
-
 /* ---------- 启动 ---------- */
 (async function init(){
   persistInit();initSubtitleFontPicker();initSubtitleColorPicker();bindUploads();
@@ -3455,6 +3822,10 @@ async function installCoreEngines(btn) {
     if($('iModal').style.display==='flex')refreshEngines();
   },20000);
   await loadSelects();
+  await restoreActiveTasks();
+  setInterval(restoreActiveTasks,2000);
+  await syncTtsServerState();
+  setInterval(syncTtsServerState,3000);
   // 恢复上次的配音 / 成片(刷新不丢)
   if(voiceId){
     try{const ms=await (await fetch('/api/media')).json();window._media=ms;
@@ -3462,18 +3833,24 @@ async function installCoreEngines(btn) {
       if(m)setVoice(m.id,m.duration,m.chars);else{voiceId='';localStorage.removeItem(PK+'voiceId')}
     }catch(e){}
   }
-  if(curJob){
+  if(!curJob)await recoverLegacyVideoJob();
+  if(curJob&&!videoRunning){
     const r=await fetch('/api/job/'+curJob,{cache:'no-store'}).catch(()=>null);
     const job=r&&r.ok?await r.json().catch(()=>null):null;
     if(job?.result||job?.status==='succeeded'){
       $('resultPrev').src='/api/result/'+curJob;$('resultPrev').style.display='block';
       $('btn-gen-dl').disabled=false;$('genInfo').textContent='任务 '+curJob;
       hasGeneratedVideo=true;
-    }else if(job?.status==='running'||job?.status==='queued'){
+    }else if(
+      job?.status==='running'||job?.status==='queued'
+      ||(job?.stage&&!job?.result&&!job?.error)
+    ){
       videoRunning=true;
       const btn=$('btn-gen');btn.disabled=true;btn.textContent='生成中…';
       pollJob(curJob,btn);
-    }else{
+    }else if(legacyVideoRecovery){
+      await syncLegacyVideoRecovery();
+    }else if(job){
       curJob='';localStorage.removeItem(PK+'curJob');
     }
   }
