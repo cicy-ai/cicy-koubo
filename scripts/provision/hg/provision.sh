@@ -61,7 +61,9 @@ retry "$PIP" install -q \
   "torch==2.0.1+cu118" "torchvision==0.15.2+cu118" "torchaudio==2.0.2+cu118" \
   --index-url https://download.pytorch.org/whl/cu118 \
   || die "PyTorch cu118 安装失败（已重试 5 次）"
-retry "$PIP" install -q -r /tmp/hg_req.txt \
+# 上游某些旧包的 metadata 会传递钉死 onnxruntime-gpu==1.9.0；
+# requirements.txt 已完整列出运行依赖，因此禁止递归解析这些过期约束。
+retry "$PIP" install -q --no-deps -r /tmp/hg_req.txt \
   || die "HeyGem requirements 安装失败（已重试 5 次）"
 retry "$PIP" install -q "onnxruntime-gpu==1.16.0" typeguard \
   opencv-python-headless librosa soundfile tqdm flask \
