@@ -55,7 +55,7 @@ PIP=$ENV/bin/pip; PY=$ENV/bin/python
 log "2/5 HeyGem repo"
 [ -d $REPO/.git ] || retry git clone -q --depth 1 --filter=blob:none https://github.com/Holasyb918/HeyGem-Linux-Python-Hack $REPO || die "clone"
 
-log "3/5 requirements(torch2.0.1+cu118 + onnxruntime-gpu 1.16)"
+log "3/5 requirements(torch2.0.1+cu118 + onnxruntime-gpu 1.19/CUDA12)"
 cd $REPO
 # 上游 requirements 固定了已经下架的 cu113/ORT 1.9 和 Python 3.8
 # 时代的包。不要再读取它；这里维护经过 Colab T4 验证的兼容清单。
@@ -64,7 +64,7 @@ retry "$PIP" install -q \
   --index-url https://download.pytorch.org/whl/cu118 \
   || die "PyTorch cu118 安装失败（已重试 5 次）"
 retry "$PIP" install -q \
-  "numpy==1.24.4" "onnxruntime-gpu==1.16.3" \
+  "numpy==1.24.4" "onnxruntime-gpu==1.19.2" \
   "opencv-python-headless==4.8.1.78" "scipy==1.10.1" \
   "scikit-image==0.21.0" "scikit-learn==1.3.2" \
   "librosa==0.10.1" "soundfile==0.12.1" \
@@ -87,13 +87,19 @@ if [ ! -f face_detect_utils/resources/.scrfd10g ]; then
 fi
 
 log "5/5 onnx/cuda 自检 + 合成封装"
-$PY check_env/check_onnx_cuda.py || die "ONNX CUDA 自检失败"
+CHECK_OUT=$("$PY" check_env/check_onnx_cuda.py 2>&1) \
+  || { echo "$CHECK_OUT"; die "ONNX CUDA 自检进程失败"; }
+echo "$CHECK_OUT"
+echo "$CHECK_OUT" | grep -q "NOT using the GPU" \
+  && die "ONNX CUDA 实际 Session 回退到 CPU"
+echo "$CHECK_OUT" | grep -q "CUDAExecutionProvider" \
+  || die "ONNX CUDA 实际 Session 未启用 CUDAExecutionProvider"
 curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/synthesize.sh || die "synthesize wrapper"
 
 cat > $WORK/HG_READY <<EOF
 provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gpu_mb=$GPU_MB
-python=3.10 onnxruntime-gpu=1.16.3
+python=3.10 onnxruntime-gpu=1.19.2
 note=experimental
 EOF
 log "DONE — HG_READY written"
