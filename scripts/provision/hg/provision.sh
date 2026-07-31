@@ -38,22 +38,26 @@ log "0/5 GPU ${GPU_MB}MiB"
 log "下载加速: 共享缓存 + 断点续传 + 5 次重试 + 4 路并发"
 [ "$GPU_MB" -ge 15000 ] || echo "WARN: 显存 <15GB,HeyGem 可能 OOM"
 
-log "1/5 micromamba + python 3.10"
+log "1/5 micromamba + python 3.8 (upstream binary extension ABI)"
 MM=$WORK/bin/micromamba
 if [ ! -x "$MM" ]; then
   mkdir -p $WORK/bin
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
 fi
 if [ -x "$ENV/bin/python" ] && ! "$ENV/bin/python" -c \
-  'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)'; then
-  log "检测到旧 Python 环境，重建为 3.10"
+  'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 8) else 1)'; then
+  log "检测到不兼容 Python 环境，重建为 3.8"
   rm -rf "$ENV"
 fi
-[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.10 pip || die "env create"
+[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.8 pip || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python
 
 log "2/5 HeyGem repo"
 [ -d $REPO/.git ] || retry git clone -q --depth 1 --filter=blob:none https://github.com/Holasyb918/HeyGem-Linux-Python-Hack $REPO || die "clone"
+# `service/*.cpython-38-*.so` is distributed only for CPython 3.8.
+# Keep the upstream guard and fail installation if the ABI is not loadable.
+git -C "$REPO" checkout -- run.py
+"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 8)'
 
 log "3/5 requirements(torch2.0.1+cu118 + onnxruntime-gpu 1.19/CUDA12)"
 cd $REPO
@@ -64,7 +68,7 @@ retry "$PIP" install -q \
   --index-url https://download.pytorch.org/whl/cu118 \
   || die "PyTorch cu118 安装失败（已重试 5 次）"
 retry "$PIP" install -q \
-  "numpy==1.24.4" "onnxruntime-gpu==1.19.2" \
+  "numpy==1.24.4" "onnxruntime-gpu==1.16.3" \
   "opencv-python-headless==4.8.1.78" "scipy==1.10.1" \
   "scikit-image==0.21.0" "scikit-learn==1.3.2" \
   "librosa==0.10.1" "soundfile==0.12.1" \
@@ -99,7 +103,7 @@ curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/sy
 cat > $WORK/HG_READY <<EOF
 provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gpu_mb=$GPU_MB
-python=3.10 onnxruntime-gpu=1.19.2
+python=3.8 onnxruntime-gpu=1.16.3
 note=experimental
 EOF
 log "DONE — HG_READY written"
