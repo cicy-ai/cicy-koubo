@@ -68,7 +68,7 @@ retry "$PIP" install -q \
   --index-url https://download.pytorch.org/whl/cu118 \
   || die "PyTorch cu118 安装失败（已重试 5 次）"
 retry "$PIP" install -q \
-  "numpy==1.24.4" "onnxruntime-gpu==1.16.3" \
+  "numpy==1.24.4" "onnxruntime-gpu==1.19.2" \
   "opencv-python-headless==4.8.1.78" "scipy==1.10.1" \
   "scikit-image==0.21.0" "scikit-learn==1.3.2" \
   "librosa==0.10.1" "soundfile==0.12.1" \
@@ -103,7 +103,7 @@ curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/sy
 cat > $WORK/HG_READY <<EOF
 provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gpu_mb=$GPU_MB
-python=3.8 onnxruntime-gpu=1.16.3
+python=3.8 onnxruntime-gpu=1.19.2
 note=experimental
 EOF
 log "DONE — HG_READY written"
