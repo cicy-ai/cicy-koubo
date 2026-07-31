@@ -38,13 +38,18 @@ log "0/5 GPU ${GPU_MB}MiB"
 log "下载加速: 共享缓存 + 断点续传 + 5 次重试 + 4 路并发"
 [ "$GPU_MB" -ge 15000 ] || echo "WARN: 显存 <15GB,HeyGem 可能 OOM"
 
-log "1/5 micromamba + python 3.8"
+log "1/5 micromamba + python 3.10"
 MM=$WORK/bin/micromamba
 if [ ! -x "$MM" ]; then
   mkdir -p $WORK/bin
   (cd $WORK && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj bin/micromamba) || die "micromamba"
 fi
-[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.8 pip || die "env create"
+if [ -x "$ENV/bin/python" ] && ! "$ENV/bin/python" -c \
+  'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)'; then
+  log "检测到旧 Python 环境，重建为 3.10"
+  rm -rf "$ENV"
+fi
+[ -x $ENV/bin/python ] || $MM --root-prefix "$MAMBA_ROOT_PREFIX" create -y -q -p $ENV -c conda-forge python=3.10 pip || die "env create"
 PIP=$ENV/bin/pip; PY=$ENV/bin/python
 
 log "2/5 HeyGem repo"
@@ -52,22 +57,24 @@ log "2/5 HeyGem repo"
 
 log "3/5 requirements(torch2.0.1+cu118 + onnxruntime-gpu 1.16)"
 cd $REPO
-# 上游 requirements 固定了已不可用的 cu113 wheel 和已下架的 ORT 1.9。
-# 先剔除这些行，再使用 Colab T4 可用的 cu118 组合；任何必需依赖失败都
-# 必须终止，不能继续写出假 READY。
-grep -viE "^(onnxruntime|torch|torchaudio|torchvision)==" requirements.txt \
-  > /tmp/hg_req.txt
+# 上游 requirements 固定了已经下架的 cu113/ORT 1.9 和 Python 3.8
+# 时代的包。不要再读取它；这里维护经过 Colab T4 验证的兼容清单。
 retry "$PIP" install -q \
   "torch==2.0.1+cu118" "torchvision==0.15.2+cu118" "torchaudio==2.0.2+cu118" \
   --index-url https://download.pytorch.org/whl/cu118 \
   || die "PyTorch cu118 安装失败（已重试 5 次）"
-# 上游某些旧包的 metadata 会传递钉死 onnxruntime-gpu==1.9.0；
-# requirements.txt 已完整列出运行依赖，因此禁止递归解析这些过期约束。
-retry "$PIP" install -q --no-deps -r /tmp/hg_req.txt \
-  || die "HeyGem requirements 安装失败（已重试 5 次）"
-retry "$PIP" install -q "onnxruntime-gpu==1.16.0" typeguard \
-  opencv-python-headless librosa soundfile tqdm flask \
-  || die "ONNX Runtime 依赖安装失败（已重试 5 次）"
+retry "$PIP" install -q \
+  "numpy==1.24.4" "onnxruntime-gpu==1.16.3" \
+  "opencv-python-headless==4.8.1.78" "scipy==1.10.1" \
+  "scikit-image==0.21.0" "scikit-learn==1.3.2" \
+  "librosa==0.10.1" "soundfile==0.12.1" \
+  "transformers==4.30.2" "tokenizers==0.13.3" \
+  "huggingface-hub==0.16.4" "kornia==0.6.12" \
+  "pillow==9.5.0" "protobuf==4.23.4" "typeguard==2.13.3" \
+  "trimesh==3.23.5" "pyrender==0.1.45" "pyopengl==3.1.7" \
+  "cv2box==0.5.9" "apstone==0.0.8" \
+  pyyaml requests tqdm flask psutil numexpr \
+  || die "HeyGem 兼容依赖安装失败（已重试 5 次）"
 
 log "4/5 模型权重(download.sh)"
 bash download.sh 2>&1 | tail -5 || die "model download"
@@ -86,7 +93,7 @@ curl -fsSL $RAW/heygem-synthesize.sh -o $WORK/synthesize.sh && chmod +x $WORK/sy
 cat > $WORK/HG_READY <<EOF
 provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gpu_mb=$GPU_MB
-python=3.8 onnxruntime-gpu=1.16.0
+python=3.10 onnxruntime-gpu=1.16.3
 note=experimental
 EOF
 log "DONE — HG_READY written"
